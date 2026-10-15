@@ -10,7 +10,6 @@ import {
   RefreshCw,
   Plus,
   Download,
-  Globe,
   Camera,
   Trash2,
   SwitchCamera,
@@ -21,6 +20,7 @@ import {
   MonitorCheck,
   CircleAlert,
   Info,
+  KeyRound,
 } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge, EmptyState, StatCard } from '../../components/ui';
@@ -28,7 +28,7 @@ import { cn } from '../../lib/cn';
 import { accountsApi, onAccountsChanged } from './api/accounts';
 import { monitorApi, onRefreshing, onSnapshot } from './api/monitor';
 import type { Refreshing } from './api/monitor';
-import WorkBuddyView from './WorkBuddyView';
+import SecretsPanel from './SecretsPanel';
 import { fmtExpire, fmtTime, fmtUnits } from './format';
 import type { Account, AccountLive, Snapshot } from './types';
 
@@ -464,8 +464,8 @@ export default function ZCodePage() {
   const [checking, setChecking] = useState<Set<number>>(new Set());
   const [switching, setSwitching] = useState<Set<number>>(new Set());
   const [syncingInvite, setSyncingInvite] = useState(false);
-  // 顶层视图切换：zcode=账号管理 / workbuddy=WorkBuddy 多账号
-  const [view, setView] = useState<'zcode' | 'workbuddy'>('zcode');
+  // 顶层视图切换：zcode=账号管理 / secrets=账密与批量登录
+  const [view, setView] = useState<'zcode' | 'secrets'>('zcode');
 
   const refreshAccounts = useCallback(() => {
     accountsApi.list().then(setAccounts).catch((e) => console.error(e));
@@ -648,7 +648,7 @@ export default function ZCodePage() {
     <div className="animate-fade-in">
       <PageHeader
         title="ZCode 账号工作台"
-        desc="ZCode 多账号余额监控 · 一键切换 · 邀请关系分组 · WorkBuddy 多账号"
+        desc="ZCode 多账号余额监控 · 一键切换 · 邀请关系分组"
         actions={
           <>
             <button
@@ -676,7 +676,7 @@ export default function ZCodePage() {
         {(
           [
             { key: 'zcode', label: 'ZCode 账号', icon: Users },
-            { key: 'workbuddy', label: 'WorkBuddy 多账号', icon: Globe },
+            { key: 'secrets', label: '账密 · 批量登录', icon: KeyRound },
           ] as const
         ).map(({ key, label, icon: Icon }) => (
           <button
@@ -694,8 +694,8 @@ export default function ZCodePage() {
         ))}
       </div>
 
-      {view === 'workbuddy' ? (
-        <WorkBuddyView onNotify={setActionError} />
+      {view === 'secrets' ? (
+        <SecretsPanel />
       ) : (
         <>
           {/* 统计卡 */}

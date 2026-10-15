@@ -51,6 +51,12 @@ impl ZcodeState {
         // 迁移目录相对 src-tauri/Cargo.toml
         sqlx::migrate!("src/zcode/migrations").run(&db).await?;
 
+        // 一次性迁移:首次使用时,把旧独立版 zai-claim(com.abellee.zaiclaim)的数据整库搬过来,
+        // 让之前批量导入的账号/账密/WorkBuddy 会话无缝接管。
+        if let Err(e) = migrate_from_legacy_zaiclaim(&db).await {
+            log::warn!("[zcode] 旧版 zai-claim 数据迁移跳过/失败(不影响启动): {e}");
+        }
+
         let http = ZaiClient::new()?;
         let monitor = MonitorHandle::new(db.clone(), http.clone());
         Ok(Self {
@@ -62,4 +68,100 @@ impl ZcodeState {
             batch: Arc::new(BatchLoginHandle::default()),
         })
     }
+}
+
+/// 从旧独立版 zai-claim 数据库迁移数据(幂等:有标记或已有账号则跳过)。
+async fn migrate_from_legacy_zaiclaim(db: &SqlitePool) -> AppResult<()> {
+    use sqlx::Row;
+
+    // 已迁移过或本地已有账号 → 不动
+    let (n_accounts,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM accounts")
+        .fetch_one(db)
+        .await
+        .map_err(|e| AppError::Other(e.to_string()))?;
+    let marked = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM app_kv WHERE key = 'migrated_from_zaiclaim'",
+    )
+    .fetch_one(db)
+    .await
+    .unwrap_or(0);
+    if n_accounts > 0 || marked > 0 {
+        return Ok(());
+    }
+
+    // 定位旧库:%APPDATA%/com.abellee.zaiclaim/zai-claim.db(app_data_dir 的兄弟目录)
+    let Some(appdata) = dirs_data_dir() else {
+        return Ok(());
+    };
+    let legacy = appdata.join("com.abellee.zaiclaim").join("zai-claim.db");
+    if !legacy.is_file() {
+        log::info!("[zcode] 未发现旧版 zai-claim 数据库,跳过迁移");
+        return Ok(());
+    }
+
+    let legacy_sql = format!("'{}'", legacy.to_string_lossy().replace('\'', "''"));
+
+    // 关键:ATTACH 只对单个连接生效,连接池可能换连接 —— 全程用同一个连接执行
+    let mut conn = db
+        .acquire()
+        .await
+        .map_err(|e| AppError::Other(e.to_string()))?;
+
+    sqlx::query(&format!("ATTACH DATABASE {legacy_sql} AS legacy"))
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| AppError::Other(format!("挂载旧库失败: {e}")))?;
+
+    // 逐表搬运(sqlite_master 动态取旧库用户表,列结构同源,逐表容错)
+    let rows = sqlx::query(
+        "SELECT name FROM legacy.sqlite_master \
+         WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name != '_sqlx_migrations'",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| AppError::Other(e.to_string()))?;
+    let mut moved = Vec::new();
+    for r in &rows {
+        let t = r.get::<String, _>("name");
+        // 标识符不能参数化,表名来自旧库 sqlite_master(同源结构),拼进语句
+        let sql = format!(
+            "INSERT OR IGNORE INTO main.\"{t}\" SELECT * FROM legacy.\"{t}\""
+        );
+        match sqlx::query(&sql).execute(&mut *conn).await {
+            Ok(res) => moved.push(format!("{t}({})", res.rows_affected())),
+            Err(e) => log::warn!("[zcode] 表 {t} 迁移失败(跳过): {e}"),
+        }
+    }
+
+    sqlx::query("DETACH DATABASE legacy")
+        .execute(&mut *conn)
+        .await
+        .ok();
+
+    // 写迁移标记(即使本次为空库也标记,避免重复挂载)
+    sqlx::query(
+        "INSERT INTO app_kv (key, value, updated_at) VALUES ('migrated_from_zaiclaim', ?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = ?1, updated_at = ?2",
+    )
+    .bind(format!("done: {}", moved.join(",")))
+    .bind(chrono::Utc::now().timestamp())
+    .execute(&mut *conn)
+    .await
+    .ok();
+
+    log::info!("[zcode] 旧版 zai-claim 数据迁移完成: {}", moved.join(", "));
+    Ok(())
+}
+
+/// 取 %APPDATA% 目录(Windows: Roaming)。
+fn dirs_data_dir() -> Option<std::path::PathBuf> {
+    std::env::var("APPDATA")
+        .map(std::path::PathBuf::from)
+        .ok()
+        .or_else(|| {
+            // 非 Windows 兜底
+            std::env::var("HOME")
+                .ok()
+                .map(|h| std::path::PathBuf::from(h).join(".local/share"))
+        })
 }
