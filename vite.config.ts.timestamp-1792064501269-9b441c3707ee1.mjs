@@ -1,0 +1,25 @@
+// vite.config.ts
+import { defineConfig } from "file:///D:/aiwork-studio/node_modules/.pnpm/vite@5.4.11/node_modules/vite/dist/node/index.js";
+import react from "file:///D:/aiwork-studio/node_modules/.pnpm/@vitejs+plugin-react@4.3.4_vite@5.4.11/node_modules/@vitejs/plugin-react/dist/index.mjs";
+var vite_config_default = defineConfig({
+  plugins: [react()],
+  clearScreen: false,
+  server: {
+    // 端口由 scripts/dev-tauri.mjs 随机挑选（5000-6000）并经 VITE_PORT 传入，
+    // 与 tauri.dev.conf.json 的 devUrl 保持一致；单独跑 `npm run dev` 时回退 5173
+    port: Number(process.env.VITE_PORT) || 5173,
+    strictPort: true,
+    // Rust 构建产物目录不应被 vite 监视，否则编译期锁定的 .exe 会触发 EBUSY 导致 dev 崩溃
+    watch: {
+      ignored: ["**/src-tauri/target/**"]
+    }
+  },
+  build: {
+    target: "esnext",
+    sourcemap: false
+  }
+});
+export {
+  vite_config_default as default
+};
+//# sourceMappingURL=data:application/json;base64,ewogICJ2ZXJzaW9uIjogMywKICAic291cmNlcyI6IFsidml0ZS5jb25maWcudHMiXSwKICAic291cmNlc0NvbnRlbnQiOiBbImNvbnN0IF9fdml0ZV9pbmplY3RlZF9vcmlnaW5hbF9kaXJuYW1lID0gXCJEOlxcXFxhaXdvcmstc3R1ZGlvXCI7Y29uc3QgX192aXRlX2luamVjdGVkX29yaWdpbmFsX2ZpbGVuYW1lID0gXCJEOlxcXFxhaXdvcmstc3R1ZGlvXFxcXHZpdGUuY29uZmlnLnRzXCI7Y29uc3QgX192aXRlX2luamVjdGVkX29yaWdpbmFsX2ltcG9ydF9tZXRhX3VybCA9IFwiZmlsZTovLy9EOi9haXdvcmstc3R1ZGlvL3ZpdGUuY29uZmlnLnRzXCI7aW1wb3J0IHsgZGVmaW5lQ29uZmlnIH0gZnJvbSAndml0ZSc7XHJcbmltcG9ydCByZWFjdCBmcm9tICdAdml0ZWpzL3BsdWdpbi1yZWFjdCc7XHJcblxyXG5leHBvcnQgZGVmYXVsdCBkZWZpbmVDb25maWcoe1xyXG4gIHBsdWdpbnM6IFtyZWFjdCgpXSxcclxuICBjbGVhclNjcmVlbjogZmFsc2UsXHJcbiAgc2VydmVyOiB7XHJcbiAgICAvLyBcdTdBRUZcdTUzRTNcdTc1MzEgc2NyaXB0cy9kZXYtdGF1cmkubWpzIFx1OTY4Rlx1NjczQVx1NjMxMVx1OTAwOVx1RkYwODUwMDAtNjAwMFx1RkYwOVx1NUU3Nlx1N0VDRiBWSVRFX1BPUlQgXHU0RjIwXHU1MTY1XHVGRjBDXHJcbiAgICAvLyBcdTRFMEUgdGF1cmkuZGV2LmNvbmYuanNvbiBcdTc2ODQgZGV2VXJsIFx1NEZERFx1NjMwMVx1NEUwMFx1ODFGNFx1RkYxQlx1NTM1NVx1NzJFQ1x1OEREMSBgbnBtIHJ1biBkZXZgIFx1NjVGNlx1NTZERVx1OTAwMCA1MTczXHJcbiAgICBwb3J0OiBOdW1iZXIocHJvY2Vzcy5lbnYuVklURV9QT1JUKSB8fCA1MTczLFxyXG4gICAgc3RyaWN0UG9ydDogdHJ1ZSxcclxuICAgIC8vIFJ1c3QgXHU2Nzg0XHU1RUZBXHU0RUE3XHU3MjY5XHU3NkVFXHU1RjU1XHU0RTBEXHU1RTk0XHU4OEFCIHZpdGUgXHU3NkQxXHU4OUM2XHVGRjBDXHU1NDI2XHU1MjE5XHU3RjE2XHU4QkQxXHU2NzFGXHU5NTAxXHU1QjlBXHU3Njg0IC5leGUgXHU0RjFBXHU4OUU2XHU1M0QxIEVCVVNZIFx1NUJGQ1x1ODFGNCBkZXYgXHU1RDI5XHU2RTgzXHJcbiAgICB3YXRjaDoge1xyXG4gICAgICBpZ25vcmVkOiBbJyoqL3NyYy10YXVyaS90YXJnZXQvKionXSxcclxuICAgIH0sXHJcbiAgfSxcclxuICBidWlsZDoge1xyXG4gICAgdGFyZ2V0OiAnZXNuZXh0JyxcclxuICAgIHNvdXJjZW1hcDogZmFsc2UsXHJcbiAgfSxcclxufSk7Il0sCiAgIm1hcHBpbmdzIjogIjtBQUFzTyxTQUFTLG9CQUFvQjtBQUNuUSxPQUFPLFdBQVc7QUFFbEIsSUFBTyxzQkFBUSxhQUFhO0FBQUEsRUFDMUIsU0FBUyxDQUFDLE1BQU0sQ0FBQztBQUFBLEVBQ2pCLGFBQWE7QUFBQSxFQUNiLFFBQVE7QUFBQTtBQUFBO0FBQUEsSUFHTixNQUFNLE9BQU8sUUFBUSxJQUFJLFNBQVMsS0FBSztBQUFBLElBQ3ZDLFlBQVk7QUFBQTtBQUFBLElBRVosT0FBTztBQUFBLE1BQ0wsU0FBUyxDQUFDLHdCQUF3QjtBQUFBLElBQ3BDO0FBQUEsRUFDRjtBQUFBLEVBQ0EsT0FBTztBQUFBLElBQ0wsUUFBUTtBQUFBLElBQ1IsV0FBVztBQUFBLEVBQ2I7QUFDRixDQUFDOyIsCiAgIm5hbWVzIjogW10KfQo=

@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>领取限时活动</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: #0f141a; color: #e8ecf1;
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif; font-size: 14px;
+  }
+  .card {
+    width: 400px; padding: 22px 24px; text-align: center;
+    background: #161d26; border: 1px solid #243040; border-radius: 10px;
+  }
+  h2 { margin: 0 0 6px; font-size: 17px; }
+  .acct { margin: 0 0 14px; color: #8b98a5; font-family: Consolas, monospace; font-size: 13px; }
+  #status { margin: 12px 0; min-height: 20px; color: #b8c2cc; word-break: break-all; }
+  #status.ok { color: #6fd08c; }
+  #status.err { color: #f0a0ab; }
+  button {
+    background: #2a5d43; color: #eafff3; border: 1px solid #357a58; border-radius: 6px;
+    padding: 8px 22px; font-size: 14px; cursor: pointer;
+  }
+  button:hover { background: #31714f; }
+  button:disabled { opacity: .5; cursor: default; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>🎁 领取限时活动</h2>
+  <p class="acct" id="acct"></p>
+  <p id="status">正在加载验证码组件…</p>
+  <button id="btn" style="display:none">开始验证并领取</button>
+</div>
+<script src="https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js"></script>
+<script>
+(function () {
+  var q = new URLSearchParams(location.search);
+  var account = q.get("account");
+  var planId = q.get("plan");
+  var statusEl = document.getElementById("status");
+  var acctEl = document.getElementById("acct");
+  var btn = document.getElementById("btn");
+  var captchaCfg = null;
+  var initialized = false;
+
+  function setStatus(text, cls) {
+    statusEl.textContent = text;
+    statusEl.className = cls || "";
+  }
+
+  fetch("/claim-config?account=" + encodeURIComponent(account) + "&plan=" + encodeURIComponent(planId))
+    .then(function (r) { return r.json(); })
+    .then(function (cfg) {
+      if (!cfg.ok) { setStatus("加载失败:" + cfg.error, "err"); return; }
+      acctEl.textContent = "账号:" + cfg.label;
+      captchaCfg = cfg.captcha || {};
+      if (!captchaCfg.sceneId) { setStatus("服务端未返回验证码配置", "err"); return; }
+      setStatus("就绪,点击下方按钮开始");
+      btn.style.display = "";
+    })
+    .catch(function (e) { setStatus("加载失败:" + e, "err"); });
+
+  btn.addEventListener("click", function () {
+    if (initialized) return;
+    initialized = true;
+    btn.disabled = true;
+    setStatus("请在弹出的验证窗口中完成验证…");
+    try {
+      initAliyunCaptcha({
+        SceneId: captchaCfg.sceneId,
+        mode: "popup",
+        prefix: captchaCfg.prefix,
+        region: captchaCfg.region,
+        element: "#captcha-element",
+        button: "#btn",
+        captchaVerifyCallback: function (captchaVerifyParam) {
+          setStatus("验证完成,正在提交领取…");
+          return fetch("/claim-submit", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              account: account,
+              plan_id: planId,
+              captcha_verify_param: captchaVerifyParam,
+              region: captchaCfg.region
+            })
+          })
+            .then(function (r) { return r.json(); })
+            .then(function (res) {
+              window.__claimResult = { ok: !!res.ok, message: res.message };
+              if (res.ok) {
+                setStatus("✅ " + res.message, "ok");
+                return { captchaResult: true };
+              }
+              setStatus("❌ " + res.message + "(可点击按钮重试)", "err");
+              btn.disabled = false;
+              initialized = false;
+              return { captchaResult: false };
+            })
+            .catch(function (e) {
+              window.__claimResult = { ok: false, message: "提交失败:" + e };
+              setStatus("❌ 提交失败:" + e, "err");
+              btn.disabled = false;
+              initialized = false;
+              return { captchaResult: false };
+            });
+        },
+        onCaptchaError: function (err) {
+          setStatus("验证码出错:" + err, "err");
+          btn.disabled = false;
+          initialized = false;
+        }
+      });
+    } catch (e) {
+      setStatus("验证码组件初始化失败:" + e, "err");
+      btn.disabled = false;
+      initialized = false;
+    }
+  });
+})();
+</script>
+</body>
+</html>
