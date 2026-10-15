@@ -86,6 +86,40 @@ fn main() {
         }
     };
 
+    // panic 黑匣子（2026-10-15 切 WorkBuddy 账号闪退排查）：GUI 应用 panic 默认无处输出，
+    // tokio worker 线程 panic 会静默带走整进程且不留 WER 事件 —— 堆栈落盘
+    // logs/panic.log 供事后取证（默认行为保留：消息仍走 eprintln）。
+    {
+        let panic_log_dir = state.data_dir.join("logs");
+        let _ = std::fs::create_dir_all(&panic_log_dir);
+        std::panic::set_hook(Box::new(move |info| {
+            let loc = info
+                .location()
+                .map(|l| format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_else(|| "unknown".into());
+            let msg = match info.payload().downcast_ref::<&str>() {
+                Some(s) => (*s).to_string(),
+                None => match info.payload().downcast_ref::<String>() {
+                    Some(s) => s.clone(),
+                    None => "non-string panic payload".into(),
+                },
+            };
+            let line = format!(
+                "[{}] PANIC at {}\n  message: {}\n  thread: {:?}\n\n",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                loc,
+                msg,
+                std::thread::current().name().unwrap_or("<unnamed>")
+            );
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(panic_log_dir.join("panic.log"))
+                .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+            eprintln!("{}", line);
+        }));
+    }
+
     // CLI 任务模式（D2）：schtasks 计划任务直调主 exe（`--task-run <name>`），
     // 执行完任务即退出；分支在 Builder 之前，天然绕开单实例插件，不启动 GUI。
     // Python 运行时移除后计划任务链依赖此入口（原 python 脚本直调的替代）。
