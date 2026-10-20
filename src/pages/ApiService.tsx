@@ -53,6 +53,7 @@ export default function ApiService() {
   const [tagDefs, setTagDefs] = useState<TagView[]>([]);
   // Trae 池参与调度开关（每池自管开关；默认开 = 历史恒可用行为）
   const [traeEnabled, setTraeEnabled] = useState(true);
+  const [zcodeEnabled, setZcodeEnabled] = useState(true);
   // per-pool 调度参数（Trae 池专属，与 Buddy/Qoder 互不共享）：并发 0 = 不限、池粘性 0 = 关
   const [traeAccountConcurrencyLimit, setTraeAccountConcurrencyLimit] = useState(1);
   const [traePoolStickyTtlSecs, setTraePoolStickyTtlSecs] = useState(300);
@@ -211,6 +212,7 @@ export default function ApiService() {
       setPoolGroups(new Set(pool.group_ids ?? []));
       setPoolTags(new Set(pool.trae_tag_ids ?? []));
       setTraeEnabled(pool.trae_enabled ?? true);
+      setZcodeEnabled(pool.zcode_enabled ?? true);
       // per-pool 调度参数回显（缺省对齐后端 serde default：并发 1 / 池粘性 300s /
       // 会话粘性 1800s / 对冲 8s）
       setTraeAccountConcurrencyLimit(pool.trae_account_concurrency_limit ?? 1);
@@ -309,6 +311,7 @@ export default function ApiService() {
       await withMinDelay(
         api.apiServer.poolSet([...enabledUids], undefined, [...poolGroups], {
           traeEnabled,
+          zcodeEnabled,
           traeTagIds: [...poolTags],
           traeAccountConcurrencyLimit: traeAccountConcurrencyLimit,
           traePoolStickyTtlSecs: traePoolStickyTtlSecs,
@@ -316,7 +319,7 @@ export default function ApiService() {
           traeHedgeThresholdMs,
         }),
       );
-      toast('success', `账号池已更新（Trae 池${traeEnabled ? '启用' : '停用'}，服务运行中即时生效）`);
+      toast('success', `账号池已更新（Trae 池${traeEnabled ? '启用' : '停用'}，ZCode 池${zcodeEnabled ? '启用' : '停用'}，服务运行中即时生效）`);
     } catch (err) {
       toast('error', `保存账号池失败：${String(err)}`);
     } finally {
@@ -717,6 +720,23 @@ export default function ApiService() {
                       <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
                         Trae 目录模型路由到 Trae 账号池，消耗各账号通用积分；
                         关闭后仅 Trae 源模型显式报错，Buddy/Qoder 不受影响
+                      </span>
+                    </span>
+                  </label>
+                  {/* ZCode 上游开关（z.ai GLM 池）：账号源在 ZCode 页维护（导入/切换），
+                      此处只管网关路由开关；关闭后仅 ZCode 源模型显式报错 */}
+                  <label className="flex cursor-pointer items-start gap-2.5 rounded-md px-1.5 py-1.5 transition hover:bg-slate-50 dark:hover:bg-zinc-800/50">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
+                      checked={zcodeEnabled}
+                      onChange={(e) => setZcodeEnabled(e.target.checked)}
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-xs text-slate-700 dark:text-zinc-200">启用 ZCode 上游</span>
+                      <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                        GLM-5.3 / GLM-5.3-Flash 模型可路由 ZCode 账号池（z.ai OAuth 账号，
+                        账号管理在「ZCode」页）；关闭后仅 ZCode 源模型显式报错，其他池不受影响
                       </span>
                     </span>
                   </label>

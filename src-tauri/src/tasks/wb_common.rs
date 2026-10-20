@@ -126,11 +126,21 @@ pub fn token_store_load_secure(data_dir: &std::path::Path) -> Value {
     let Some(tokens) = store.get_mut("tokens").and_then(Value::as_object_mut) else {
         return store;
     };
+    // vault 回填诊断（2026-10-19）：整族账号同时「无凭证」时无法区分
+    // 「vault 里确实没写」与「vault 打不开/键名不匹配」——落一行汇总日志
+    // （只报条数，不含令牌内容），是排查「积分全空白」的唯一线索。
+    let mut vault_hits = 0usize;
+    let mut vault_miss = 0usize;
     for (id, rec) in tokens.iter_mut() {
         let Some(rm) = rec.as_object_mut() else { continue };
-        let Some(sec) = crate::vault::ns_get(data_dir, "wb", id) else { continue };
+        let Some(sec) = crate::vault::ns_get(data_dir, "wb", id) else {
+            vault_miss += 1;
+            continue;
+        };
+        vault_hits += 1;
         let acc = sec.get("access_token").and_then(Value::as_str).unwrap_or("");
         let rt = sec.get("refresh_token").and_then(Value::as_str).unwrap_or("");
+        let _ = (acc, rt);
         let mut has_access_key = false;
         let mut has_refresh_key = false;
         for k in TOKEN_SENSITIVE_KEYS {
@@ -158,6 +168,15 @@ pub fn token_store_load_secure(data_dir: &std::path::Path) -> Value {
         if !rt.is_empty() && !has_refresh_key {
             rm.insert("refresh_token".into(), serde_json::json!(rt));
         }
+    }
+    if vault_miss > 0 || vault_hits > 0 {
+        crate::fs_utils::app_log(
+            data_dir,
+            &format!(
+                "[wb-creds] vault 回填汇总: 命中 {vault_hits} / 未命中 {vault_miss}（总 {} 个 token 记录）",
+                vault_hits + vault_miss
+            ),
+        );
     }
     store
 }
@@ -464,15 +483,22 @@ pub fn get_json(
 }
 
 // ── 区域路由（T4.5/F-36，§5.2）──────────────────────────────────────────────
-// CN：billing/积分 + 活动接口走 www.codebuddy.cn；Global（domain 含 .workbuddy.ai）：
-// 全走 www.workbuddy.ai。plugin 网关（token refresh）固定 codebuddy.cn 不随区域。
+// CN：billing/积分 + 活动接口走 www.codebuddy.cn；Global：全走 www.workbuddy.ai。
+// plugin 网关（token refresh）固定 codebuddy.cn 不随区域。
 
 pub const BILLING_BASE_CN: &str = "https://www.codebuddy.cn";
 pub const BILLING_BASE_GLOBAL: &str = "https://www.workbuddy.ai";
 pub const REFRESH_URL: &str = "https://www.codebuddy.cn/v2/plugin/auth/token/refresh";
 
+/// 海外域族（官方产品配置 externalDomain 实证，见 wb-acc-oversea.json）：
+/// `*.workbuddy.ai` 与 `*.codebuddy.ai` 均属海外区。判定统一走本函数
+/// （与 zcode/modules/workbuddy/service.rs region_of_domain 同口径），
+/// 各处不再自写 `contains(".workbuddy.ai")`——旧口径既漏 `codebuddy.ai`
+/// 域族，又漏不带前导点的裸域形态（如 token store 回填的 `www.workbuddy.ai`），
+/// 导致海外账号被误判为 CN、chat/billing 全打国内网关（海外账号跑不通根因）。
 pub fn is_global_region(domain: &str) -> bool {
-    domain.contains(".workbuddy.ai")
+    let d = domain.to_ascii_lowercase();
+    d.contains("workbuddy.ai") || d.contains("codebuddy.ai")
 }
 
 pub fn region_billing_base(domain: &str) -> &'static str {
@@ -492,6 +518,23 @@ pub fn billing_bases(domain: &str) -> [&'static str; 2] {
         BILLING_BASE_CN
     };
     [main, alt]
+}
+
+/// 账号生效区域域名：token store 记录的 `domain` 字段（OAuth 扫码选区/导入
+/// 显式写入）是唯一可信来源——**不做 auth 文件兜底**：桌面 auth 文件的
+/// `auth.domain` 反映的是客户端产品域而非账号注册区（实测：国内账号在
+/// 海外版客户端登录，auth.domain=www.codebuddy.ai 但套餐/签到/计费全为
+/// 国内生态，按海外路由会把国内号打错网关、免费模型快照被清空）。
+/// 无 domain → 空串（CN 默认，与旧行为一致）。
+pub fn effective_domain(state: &AppState, acct_id: &str, _acct_uid: &str) -> String {
+    let _ = state;
+    load_token_store(state)
+        .get("tokens")
+        .and_then(|t| t.get(acct_id))
+        .and_then(|r| r.get("domain"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 // ── token 刷新（F-09）──────────────────────────────────────────────────────
@@ -566,22 +609,42 @@ pub fn mark_needs_relogin(state: &AppState, acct_id: &str, reason: &str) {
     // 读-改-写互斥：罩住 load→改→save 段，防命令/后台/调度线程旧副本整文档覆盖
     let _guard = state.wb_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = crate::store::docs::wb_pool_load(&store);
-    let mut changed = false;
+    let mut found = false;
+    // 是否「首次」进入失效态：决定是否推送通知（重复标记不重复打扰）
+    let mut first_time = false;
+    let mut nickname = String::new();
     if let Some(arr) = pool.get_mut("accounts").and_then(Value::as_array_mut) {
         for a in arr {
             if a.get("id").and_then(Value::as_str) == Some(acct_id) {
+                found = true;
+                first_time = !a.get("needs_relogin").and_then(Value::as_bool).unwrap_or(false);
+                nickname = a
+                    .get("nickname")
+                    .and_then(Value::as_str)
+                    .unwrap_or(acct_id)
+                    .to_string();
                 a["needs_relogin"] = serde_json::json!(true);
                 a["relogin_reason"] = serde_json::json!(reason);
-                changed = true;
             }
         }
     }
-    if changed {
+    if found {
         let _ = crate::store::docs::wb_pool_save(&store, &pool);
         fs_utils::app_log(
             &state.data_dir,
             &format!("wb: 账号 {acct_id} 已标记需重新登录（{reason}）"),
         );
+        // 恢复指引：唯一有效路径是工具内 OAuth 重扫（号池凭证只由扫码链路写入；
+        // 客户端内登录、保存登录态、扫描本机账号都不会更新它）
+        if first_time {
+            crate::commands::workbuddy::push_notify(
+                None,
+                &state.data_dir,
+                &format!("Buddy 账号「{nickname}」登录态失效"),
+                "凭证已被服务端吊销，签到与模型调用将跳过该账号。请到账号管理页点「OAuth登录」重新扫码恢复。",
+                crate::notify::NotifyEvent::TaskFail,
+            );
+        }
     }
 }
 
@@ -801,6 +864,53 @@ pub fn refresh_token_once_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ==================== 区域判定（修复2） ====================
+
+    /// 海外域族双域判定：workbuddy.ai 与 codebuddy.ai 均为 Global，
+    /// 兼容带点（`.workbuddy.ai`，旧口径唯一覆盖形态）、www 前缀与
+    /// 无点裸域（token store 实存形态，如 `www.codebuddy.ai`）；
+    /// CN 域（.cn 后缀）与空串不得误判。
+    #[test]
+    fn is_global_region_covers_both_ai_domain_families() {
+        // Global 命中形态
+        for d in [
+            ".workbuddy.ai",           // 旧口径唯一形态（回归护栏）
+            "www.workbuddy.ai",        // billing base 常量值
+            "workbuddy.ai",            // 无点裸域
+            "staging.workbuddy.ai",    // officialEndpoints 实存
+            ".codebuddy.ai",
+            "www.codebuddy.ai",        // 桌面 auth 文件实抓（海外登录态）
+            "codebuddy.ai",
+        ] {
+            assert!(is_global_region(d), "{d} 应判为 Global");
+        }
+        // CN 不误判
+        for d in ["", "www.codebuddy.cn", "codebuddy.cn", "workbuddy.cn", "copilot.tencent.com"] {
+            assert!(!is_global_region(d), "{d} 应判为 CN");
+        }
+        // billing 路由随判定切换
+        assert_eq!(region_billing_base("www.codebuddy.ai"), BILLING_BASE_GLOBAL);
+        assert_eq!(region_billing_base("www.codebuddy.cn"), BILLING_BASE_CN);
+    }
+
+    /// token store 记录形态（顶层平铺）与桌面 auth 文件形态（domain 在 `auth`
+    /// 信封内，实测海外登录态 `www.codebuddy.ai`）都能取出 domain——
+    /// 双源兜底（effective_domain）依赖此提取正确性。
+    #[test]
+    fn creds_of_reads_domain_from_both_layouts() {
+        let auth_file: Value = serde_json::json!({
+            "auth": { "accessToken": { "k": "v" }, "domain": "www.codebuddy.ai" },
+            "account": { "uid": "u-1" }
+        });
+        let c = creds_of(&auth_file);
+        assert_eq!(c.domain, "www.codebuddy.ai");
+        assert_eq!(c.uid, "u-1");
+        let flat: Value = serde_json::json!({ "access_token": "t", "domain": "www.workbuddy.ai" });
+        assert_eq!(creds_of(&flat).domain, "www.workbuddy.ai");
+        // 无 domain 字段 → 空串（fail-open 走 CN 默认）
+        assert_eq!(creds_of(&serde_json::json!({ "access_token": "t" })).domain, "");
+    }
 
     // ==================== 客户端指纹伪装（issue #48） ====================
 

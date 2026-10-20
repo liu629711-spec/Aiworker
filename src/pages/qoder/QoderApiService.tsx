@@ -511,7 +511,7 @@ export default function QoderApiService() {
                         checked={qoderSelected.includes(a.id)}
                         onChange={() => toggleQoderUid(a.id)}
                       />
-                      <div className="min-w-0 flex-1 truncate font-medium">{a.nickname || a.id}</div>
+                      <div className="min-w-0 flex-1 break-all font-medium">{a.nickname || a.id}</div>
                       {filteredOut && <Badge tone="slate">筛选外</Badge>}
                       <Badge tone="slate">{a.plan || a.credential_source || '—'}</Badge>
                       {a.needs_relogin && <Badge tone="amber">需重新登录</Badge>}

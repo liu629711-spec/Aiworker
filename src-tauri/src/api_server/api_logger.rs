@@ -216,9 +216,12 @@ impl ApiLogger {
         } else {
             req_body
         };
-        let req_str = String::from_utf8_lossy(req_preview);
-        lines.push(format!("--- Request Body ({} bytes, preview {}B) ---", req_body.len(), req_preview.len()));
-        lines.push(req_str.to_string());
+        // 脱敏（2026-10-19）：请求体可能含 system prompt 里的密钥、用户粘贴的
+        // token。proxy 侧（device_proxy::logger）早有 mask_body 脱敏红线，api log
+        // 侧此前完全没有等价物——开 Debug 日志即明文落盘。复用同一套正则。
+        let req_str = crate::device_proxy::logger::mask_body(&String::from_utf8_lossy(req_preview));
+        lines.push(format!("--- Request Body ({} bytes, preview {}B, masked) ---", req_body.len(), req_preview.len()));
+        lines.push(req_str);
 
         // 响应体（截取前 8KB）
         if let Some(resp) = resp_body {
@@ -227,9 +230,10 @@ impl ApiLogger {
             } else {
                 resp
             };
-            let resp_str = String::from_utf8_lossy(resp_preview);
-            lines.push(format!("--- Response Body ({} bytes, preview {}B) ---", resp.len(), resp_preview.len()));
-            lines.push(resp_str.to_string());
+            // 脱敏：上游错误响应可能回显账号信息/凭证（同请求体口径）
+            let resp_str = crate::device_proxy::logger::mask_body(&String::from_utf8_lossy(resp_preview));
+            lines.push(format!("--- Response Body ({} bytes, preview {}B, masked) ---", resp.len(), resp_preview.len()));
+            lines.push(resp_str);
         }
 
         if let Some(e) = error {

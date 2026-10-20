@@ -58,13 +58,20 @@ pub(crate) fn try_acquire_qoder_round() -> Result<tokio::sync::MutexGuard<'stati
 
 // ── 端点表（R-4/R-7 抓包固化；常量集中可改）────────────────────────────────
 
+/// 单账号本轮端点集：**按账号区域取基址**（2026-10-20 修复）。此前恒用国内
+/// OPEN_API_BASE，海外号（global_region=true）的 dt- 凭证打到国内主机必 401
+/// →「登录态失效且刷新失败」假象（refresh 走对了 openapi.qoder.sh 能刷新，
+/// campaigns/claim 走错主机 → 整号判死）。实测 openapi.qoder.sh 上
+/// /sash/api/v1/me/campaigns 路由存在（401 鉴权口径与 CN 一致）。
 struct QoderUrls {
+    base: String,
     campaigns: String,
 }
 
-fn urls_for() -> QoderUrls {
-    let b = qoder_common::OPEN_API_BASE;
+fn urls_for(global: bool) -> QoderUrls {
+    let b = qoder_common::open_api_base(global);
     QoderUrls {
+        base: b.to_string(),
         campaigns: format!("{b}/sash/api/v1/me/campaigns"),
     }
 }
@@ -372,8 +379,7 @@ fn claim_one(
         .and_then(|v| num_or_none(Some(v)));
     let url = format!(
         "{}/sash/api/v1/me/campaigns/{}/claim",
-        qoder_common::OPEN_API_BASE,
-        campaign_id
+        urls.base, campaign_id
     );
     jitter_sleep();
     let (status, body, raw) = post_empty(agent, &url, headers);
@@ -945,6 +951,7 @@ impl BlindRound {
 fn blind_round(
     agent: &ureq::Agent,
     headers: &[(String, String)],
+    base: &str,
     candidates: &[(String, String)],
     learned: &mut Vec<(String, String)>,
     table: &mut Vec<(String, String)>,
@@ -965,10 +972,7 @@ fn blind_round(
         {
             continue;
         }
-        let url = format!(
-            "{}/sash/api/v1/me/campaigns/{cid}/claim",
-            qoder_common::OPEN_API_BASE
-        );
+        let url = format!("{base}/sash/api/v1/me/campaigns/{cid}/claim");
         jitter_sleep();
         let (status, body, raw) = post_empty(agent, &url, headers);
         let claimed = body
@@ -1054,7 +1058,7 @@ fn known_daily_fallback(
         }
     }
     let tried: Vec<String> = candidates.iter().map(|(cid, _)| cid.clone()).collect();
-    let first = blind_round(agent, headers, &candidates, learned, table);
+    let first = blind_round(agent, headers, &urls.base, &candidates, learned, table);
     // 401 中断：上报 Auth 走账号级凭证刷新自愈（已累计 reward 随行，不重学不重试）
     if first.auth {
         return FallbackOutcome::Auth(first.reward);
@@ -1074,7 +1078,7 @@ fn known_daily_fallback(
     }
     // 重学结果入共享池（跨账号复用；若重试轮再 409 会被 blind_round 剔除）
     merge_learned(learned, retry.clone());
-    let second = blind_round(agent, headers, &retry, learned, table);
+    let second = blind_round(agent, headers, &urls.base, &retry, learned, table);
     let merged = first.merge(second);
     if merged.auth {
         return FallbackOutcome::Auth(merged.reward);
@@ -1191,13 +1195,14 @@ fn process_account(
     if refreshed {
         qoder_common::sync_pool_expiry(state, &aid, &creds);
     }
-    let urls = urls_for();
+    let urls = urls_for(creds.global_region);
     let mut headers = qoder_common::build_auth_headers(&creds);
     // 逐活动明细（F-80-余 v2 档期日历数据源）：auth 401 重试路径继续累计
     let mut campaigns_detail: Option<Vec<Value>> = None;
     // 签到前余额（差值兜底数据源；查询失败不阻塞签到。共享 qoder_credits 解析，
-    // 端点 R-7 固化为 GET /sash/api/v2/me/usage）
-    let pre_balance = super::qoder_credits::fetch_usage_balance(agent, &headers);
+    // 端点 R-7 固化为 GET {base}/sash/api/v2/me/usage——base 随账号区域）
+    let pre_balance =
+        super::qoder_credits::fetch_usage_balance(agent, &headers, &urls.base);
     // 本轮成功领取的活动是否全部为 CREDITS（审查修复：非积分奖励如 BOGO 到账不
     // 体现为余额增长，不能凭「余额未动」判未到账——仅全 CREDITS 时才启用降级；
     // 盲发兜底候选口径强制 CREDITS，天然保持 true）
@@ -1468,7 +1473,9 @@ fn process_account(
         let mut arrived = false;
         for _attempt in 0..3 {
             jitter_sleep();
-            let Some(post) = super::qoder_credits::fetch_usage_balance(agent, &headers) else {
+            let Some(post) =
+                super::qoder_credits::fetch_usage_balance(agent, &headers, &urls.base)
+            else {
                 continue; // 回读失败：本轮作废重试；3 轮全失败则 flat_reads=0 不判负
             };
             let Some(pre) = pre_balance else { break; };
@@ -1748,9 +1755,14 @@ mod tests {
 
     #[test]
     fn urls_cover_sash_endpoints() {
-        let u = urls_for();
+        let u = urls_for(false);
         assert!(u.campaigns.starts_with(qoder_common::OPEN_API_BASE));
         assert!(u.campaigns.contains("/sash/api/v1/me/campaigns"));
+        // 海外号走海外基址（2026-10-20 修复回归：此前恒国内主机，海外凭证必 401）
+        let g = urls_for(true);
+        assert_eq!(g.base, qoder_common::open_api_base(true));
+        assert!(g.campaigns.starts_with(qoder_common::open_api_base(true)));
+        assert!(!g.campaigns.contains("qoder.com.cn"));
     }
 
     /// 兜底常量表 campaignId 路径安全（与 claim_one 同白名单 [A-Za-z0-9_-]）：
@@ -2245,7 +2257,6 @@ mod tests {
     fn probe_sash_campaigns_headers() {
         let state = crate::state::AppState::new().expect("构造 AppState 失败");
         let agent = crate::tasks::http_agent(30);
-        let urls = urls_for();
         let pool = crate::store::docs::qoder_pool_load(&crate::store::db(&state.data_dir));
         let accounts = pool
             .get("accounts")
@@ -2262,12 +2273,14 @@ mod tests {
                 continue;
             }
             println!(
-                "  stored_uid = {}, token_prefix = {}, machine_id = {}, has_machine_token = {}",
+                "  stored_uid = {}, token_prefix = {}, machine_id = {}, has_machine_token = {}, global_region = {}",
                 creds.uid,
                 &creds.access_token[..creds.access_token.len().min(6)],
                 creds.machine_id,
                 !creds.machine_token.is_empty(),
+                creds.global_region,
             );
+            let urls = urls_for(creds.global_region);
             // A 组：工具现状头（build_auth_headers 原样）
             let (st, body, raw) =
                 qoder_common::get_json(&agent, &urls.campaigns, &qoder_common::build_auth_headers(&creds));
@@ -2281,10 +2294,7 @@ mod tests {
             // 已领账号应回放 replayed:true；列表不可见账号若 200+CLAIMED 证明 claim
             // 不受列表过滤约束（兜底直领可行），4xx 则锁定错误体形态
             let (cid, _cname) = KNOWN_DAILY_CAMPAIGNS[0];
-            let c_url = format!(
-                "{}/sash/api/v1/me/campaigns/{cid}/claim",
-                qoder_common::OPEN_API_BASE
-            );
+            let c_url = format!("{}/sash/api/v1/me/campaigns/{cid}/claim", urls.base);
             std::thread::sleep(std::time::Duration::from_millis(1500));
             let (st3, body3, raw3) =
                 post_empty(&agent, &c_url, &qoder_common::build_auth_headers(&creds));

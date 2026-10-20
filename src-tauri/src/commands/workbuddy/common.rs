@@ -91,6 +91,26 @@ pub struct WorkBuddyAccount {
     /// None = 无到期信息或全部包长期有效，键值随每次回写覆盖（不留 stale）
     #[serde(default)]
     pub credits_expire_at: Option<i64>,
+    /// 免费额度剩余（credits_fetch 回写；免费包 = get-user-resource-free-packages
+    /// 来源。None = 无免费包，区别于 0 = 免费包已用尽）
+    #[serde(default)]
+    pub free_remaining: Option<f64>,
+    /// 免费额度总量（同上；None = 无免费包）
+    #[serde(default)]
+    pub free_total: Option<f64>,
+    /// 免费额度下次刷新/重置时刻（Unix 秒）：免费包最早到期时刻——免费额度按包
+    /// 周期发放，到期即刷新；None = 无免费包或无到期信息
+    #[serde(default)]
+    pub free_next_reset_at: Option<i64>,
+    /// 免费模型（目录 rate=0，不消耗积分）清单 + 各模型额度耗尽状态：
+    /// [{id,name,rate,exhausted_at}]——exhausted_at 为最近一次该账号在该模型上
+    /// 命中「模型级额度」错误的时刻（None = 未观测到耗尽）。
+    /// 与 free_remaining 语义不同：后者是免费积分包，本字段是免费模型本身。
+    #[serde(default)]
+    pub free_models: Option<serde_json::Value>,
+    /// 免费模型清单刷新时刻（ISO8601）
+    #[serde(default)]
+    pub free_models_fetched_at: Option<String>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]

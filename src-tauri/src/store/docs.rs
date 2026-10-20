@@ -733,6 +733,56 @@ mod tests {
         assert_eq!(got.cooldowns["u1"].error_type, "SessionDead");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    fn wait_try_lock(g: &std::sync::Mutex<()>) -> bool {
+        for _ in 0..200 {
+            if let Ok(guard) = g.try_lock() {
+                drop(guard);
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// choke-point 锁契约回归（2026-10-20 签到卡死事故）：`*_save` 与 `with_*`
+    /// 内部持非重入 Mutex（ACCOUNT_COOLDOWNS_LOCK / DEVICE_MAP_LOCK）。旧调用点
+    /// 先在外层 lock 再调 save，同线程二次获取即永久自死锁——签到线程停在第 2 个
+    /// 账号，UI 无进度。本测试验证 wrapper 在临界区内确实持锁、退出时确实释放。
+    /// 刻意不跑「外层 lock + save」嵌套实弹：那会真死锁并挂住同进程其它测试。
+    #[test]
+    fn lock_chokepoint_wrappers_acquire_and_release() {
+        let (dir, s) = tmp_store("chokepoint");
+
+        with_account_cooldowns(&s, |_| {
+            // 临界区内本线程已持锁：非重入 Mutex 同线程再获取必失败
+            assert!(
+                ACCOUNT_COOLDOWNS_LOCK.try_lock().is_err(),
+                "wrapper 未在临界区内持有 ACCOUNT_COOLDOWNS_LOCK"
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            wait_try_lock(&ACCOUNT_COOLDOWNS_LOCK),
+            "ACCOUNT_COOLDOWNS_LOCK 未在 wrapper 退出时释放"
+        );
+
+        with_device_map(&s, |_| {
+            assert!(
+                DEVICE_MAP_LOCK.try_lock().is_err(),
+                "wrapper 未在临界区内持有 DEVICE_MAP_LOCK"
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            wait_try_lock(&DEVICE_MAP_LOCK),
+            "DEVICE_MAP_LOCK 未在 wrapper 退出时释放"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 use serde_json::{json, Value};
@@ -740,7 +790,8 @@ use serde_json::{json, Value};
 use super::Store;
 use crate::models::{
     AccountCooldownsFile, AccountsFile, CooldownEntry, CreditRecord, CreditsDailyFile,
-    CreditsFile, DeviceEntry, DeviceMap, GroupsFile, RemainingCreditsFile, RawAccount,
+    CreditsFile, DeviceEntry, DeviceMap, GroupsFile, PoolCooldownSnapshot, RemainingCreditsFile,
+    RawAccount,
 };
 use crate::api_server::api_keys::ApiKeysFile;
 use crate::api_server::custom_models::CustomModelsFile;
@@ -903,13 +954,33 @@ pub fn device_map_load(s: &Store) -> DeviceMap {
         .collect()
 }
 
+/// 持锁保存（choke-point 模式，2026-10-19）：同 account_cooldowns_save，
+/// 锁下沉到 store 层，覆盖 `device_reset` 等漏锁调用方。
 pub fn device_map_save(s: &Store, map: &DeviceMap) -> Result<(), String> {
+    let _guard = DEVICE_MAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let rows: Vec<(String, Value)> = map
         .iter()
         .map(|(uid, e)| serde_json::to_value(e).map(|v| (uid.clone(), v)))
         .collect::<Result<_, _>>()
         .map_err(|e| format!("序列化失败: {e}"))?;
     s.rows_replace("device_map", &rows)
+}
+
+/// 持锁的「读-改-写」原子封装（优先于 load→改→save 三段式）
+pub fn with_device_map<T>(
+    s: &Store,
+    f: impl FnOnce(&mut DeviceMap) -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = DEVICE_MAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = device_map_load(s);
+    let out = f(&mut map)?;
+    let rows: Vec<(String, Value)> = map
+        .iter()
+        .map(|(uid, e)| serde_json::to_value(e).map(|v| (uid.clone(), v)))
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("序列化失败: {e}"))?;
+    s.rows_replace("device_map", &rows)?;
+    Ok(out)
 }
 
 // ── 分组（groups.json → groups + group_members 表）───────────────────────────
@@ -1253,7 +1324,15 @@ pub fn account_cooldowns_load(s: &Store) -> AccountCooldownsFile {
     AccountCooldownsFile { cooldowns, updated_at }
 }
 
+/// 持锁保存（choke-point 模式，2026-10-19）：锁下沉到 store 层，所有调用方
+/// 自动受保护。此前依赖各调用方自觉持锁，`device_proxy::handler::clear_cooldown`
+/// 就漏了——load→save 整表覆盖会抹掉并发写入的新冷却条目（已冷却账号被重新
+/// 探测、对上游连打）。叶子锁：持锁期间不得再获取其他锁。
+/// 注意：进程内锁，对 `--task-run` CLI 子进程无效（跨进程需 SQLite 事务）。
 pub fn account_cooldowns_save(s: &Store, f: &AccountCooldownsFile) -> Result<(), String> {
+    let _guard = ACCOUNT_COOLDOWNS_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let rows: Vec<(String, Value)> = f
         .cooldowns
         .iter()
@@ -1262,6 +1341,80 @@ pub fn account_cooldowns_save(s: &Store, f: &AccountCooldownsFile) -> Result<(),
         .map_err(|e| format!("序列化失败: {e}"))?;
     s.rows_replace("account_cooldowns", &rows)?;
     s.kv_set("account_cooldowns_updated_at", &f.updated_at)
+}
+
+/// 持锁的「读-改-写」原子封装：把 load 与 save 放进同一临界区，彻底消除
+/// 调用方在锁外做整表读改写的窗口。新代码应优先用本函数而非
+/// load→改→save 三段式。
+pub fn with_account_cooldowns<T>(
+    s: &Store,
+    f: impl FnOnce(&mut AccountCooldownsFile) -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = ACCOUNT_COOLDOWNS_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut file = account_cooldowns_load(s);
+    let out = f(&mut file)?;
+    let rows: Vec<(String, Value)> = file
+        .cooldowns
+        .iter()
+        .map(|(uid, e)| serde_json::to_value(e).map(|v| (uid.clone(), v)))
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("序列化失败: {e}"))?;
+    s.rows_replace("account_cooldowns", &rows)?;
+    s.kv_set("account_cooldowns_updated_at", &file.updated_at)?;
+    Ok(out)
+}
+
+// ── 网关三池运行态冷却（P1：pool_cooldowns 表）───────────────────────────────
+// 与 account_cooldowns（Trae 签到/清理链路的软冷却账本）不同，本表面向
+// WB/Qoder/Trae 三池的完整运行态（含 hard_until/cb_trips/rate_trips/按模型冷却）。
+// 写点唯一：网关 flusher 在池脏标置位时整池快照落库（pk = "{pool}:{uid}"），
+// 读点唯一：启动装配时回灌仍在池内账号。叶子锁，不与 account_cooldowns 互锁。
+pub static POOL_COOLDOWNS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn pool_cooldowns_load(s: &Store) -> std::collections::HashMap<String, PoolCooldownSnapshot> {
+    s.rows_all("pool_cooldowns")
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(pk, data)| {
+            serde_json::from_value::<PoolCooldownSnapshot>(data).ok().map(|snap| (pk, snap))
+        })
+        .collect()
+}
+
+/// 按池前缀加载并去除 `"{pool}:"` 前缀，返回 uid → 快照（启动回灌用）
+pub fn pool_cooldowns_load_pool(
+    s: &Store,
+    pool: &str,
+) -> std::collections::HashMap<String, PoolCooldownSnapshot> {
+    let prefix = format!("{pool}:");
+    pool_cooldowns_load(s)
+        .into_iter()
+        .filter_map(|(pk, snap)| pk.strip_prefix(&prefix).map(|uid| (uid.to_string(), snap)))
+        .collect()
+}
+
+/// 整池替换落库（keys 为 "{pool}:{uid}"）。只清本池前缀的行——flusher 串行
+/// 调用三池互不覆盖，且启动回灌不误删其他池持久化数据。
+pub fn pool_cooldowns_save_pool(
+    s: &Store,
+    pool: &str,
+    rows: &[(String, PoolCooldownSnapshot)],
+) -> Result<(), String> {
+    let _guard = POOL_COOLDOWNS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prefix = format!("{pool}:");
+    let mut all: Vec<(String, Value)> = pool_cooldowns_load(s)
+        .into_iter()
+        .filter(|(pk, _)| !pk.starts_with(&prefix))
+        .filter_map(|(pk, snap)| serde_json::to_value(snap).ok().map(|v| (pk, v)))
+        .collect();
+    for (pk, snap) in rows {
+        if let Ok(v) = serde_json::to_value(snap) {
+            all.push((format!("{prefix}{pk}"), v));
+        }
+    }
+    s.rows_replace("pool_cooldowns", &all)
 }
 
 // ── 套餐身份（pay_status.json → pay_status 表）───────────────────────────────
@@ -1375,6 +1528,17 @@ pub fn doubao_pool_save(s: &Store, pool: &crate::commands::doubao::DoubaoAccount
 }
 
 // ── WorkBuddy 账号池（workbuddy_accounts.json → wb_accounts 表，Value 语义）──
+
+/// WB 池整表读-改-写互斥（免费模型耗尽标注新增）：账号池是「整表读-改-写」模型，
+/// 除 AppState.wb_pool_lock（命令/任务层）外，API 路由层（wb_route 的免费模型
+/// 额度耗尽记录）也要写 free_models 字段——路由层拿不到 AppState，故在此提供
+/// 进程级锁（与 qoder_pool_rmw_lock 同模式）。锁序：池锁 → 本锁 → DB 单向。
+pub fn wb_pool_rmw_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 /// 读整池（结构 {accounts: [...]}；账号对象原样保真）
 pub fn wb_pool_load(s: &Store) -> Value {
@@ -1949,6 +2113,18 @@ pub fn doubao_health_save(s: &Store, events: &[Value]) -> Result<(), String> {
 }
 
 // ── Qoder 账号池（F-80 M1；qoder_accounts 表，Value 语义，与 wb_pool 同款）──
+
+/// Qoder 池整表读-改-写互斥（2026-10-16 免费额度标注新增）：账号池是「整表
+/// 读-改-写」模型，除 AppState.qoder_pool_lock（命令/任务层）外，API 路由层
+/// （qoder_route 的免费额度耗尽记录）也要写 free_models 字段——路由层拿不到
+/// AppState，故在此提供进程级锁。锁序与 org_defs_lock 同约定：单向嵌套
+/// 「池锁 → 本锁 → DB」，持本锁期间不回调上层。
+pub fn qoder_pool_rmw_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 /// 读整池（结构 {accounts: [...]}；账号对象原样保真）
 pub fn qoder_pool_load(s: &Store) -> Value {

@@ -448,14 +448,47 @@ pub fn save_current_login(
     let is_doubao = target_app.as_deref() == Some("Doubao");
     let is_qoder = target_app.as_deref() == Some("Qoder");
     let is_qoder_work = target_app.as_deref() == Some("QoderWork");
+    let is_trae = !is_doubao && !is_qoder && !is_qoder_work;
+    // Trae 保存完成后立即从客户端本地文件抓 JWT 回写（2026-10-19）：
+    // 快照只备份客户端文件，凭据回写此前完全依赖「代理捕获」——代理没运行
+    // （端口被占/用户关了代理）时，刚保存的登录态永远不会进 accounts 表，
+    // 表现为「保存成功但该号 401 / 积分空白 / 不进池」（实测 Trae-…1466）。
+    // 这里在快照落盘后主动抓一次，不依赖代理链路。
+    let state_for_capture = state.inner().clone();
+    let uid_for_capture = user_id.clone();
     let app2 = app.clone();
     let uid_for_dc = user_id.clone();
     run_in_background(app2, "save-login-progress", "save-login-done", args, None, Some(Box::new(move |_app, dc_dir| {
         // 保存登录态成功后同样补充 dc id 预留记录（快照刚生成，来源最可靠）
         // 仅 icube 布局（Trae）有意义；豆包快照无 storage.json，跳过；
         // Qoder/QoderWork 无 icube-dc 通道，同样跳过
-        if !is_doubao && !is_qoder && !is_qoder_work {
+        if is_trae {
             let _ = crate::commands::trae_apps::backfill_dc_id_for(dc_dir, &uid_for_dc);
+            // JWT 回写（不依赖代理）：从客户端 profile 解出当前登录凭据并落库
+            match crate::device_proxy::local_capture::capture_from_local(&state_for_capture) {
+                Ok(v) => {
+                    let updated_at = crate::vault::load_accounts(&state_for_capture)
+                        .accounts
+                        .iter()
+                        .find(|a| a.user_id.as_deref() == Some(uid_for_capture.as_str()))
+                        .map(|a| (a.jwt.len(), a.refresh_token.as_deref().unwrap_or("").len()))
+                        .unwrap_or((0, 0));
+                    crate::fs_utils::app_log(
+                        &state_for_capture.data_dir,
+                        &format!(
+                            "保存登录态后本地凭据捕获完成 uid={} captured={} jwt_len={} rt_len={}",
+                            uid_for_capture,
+                            v.get("captured").and_then(|x| x.as_u64()).unwrap_or(0),
+                            updated_at.0,
+                            updated_at.1
+                        ),
+                    );
+                }
+                Err(e) => crate::fs_utils::app_log(
+                    &state_for_capture.data_dir,
+                    &format!("保存登录态后本地凭据捕获失败 uid={uid_for_capture}: {e}"),
+                ),
+            }
         }
     })));
 

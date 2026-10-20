@@ -28,12 +28,13 @@ use crate::tasks::qoder_upstream;
 
 /// 池优先级默认序：显式化现状（Buddy 目录命中即 Buddy）。
 /// Qoder 追加尾部：双源/三源模型的默认命中顺序保持改造前行为
-///（Buddy → Trae），Qoder 池仅在前两者不可用或单源时接管（§9.1 零行为差异）
+///（Buddy → Trae），Qoder 池仅在前两者不可用或单源时接管（§9.1 零行为差异）。
+/// ZCode 追加最尾：GLM 系模型单源池，仅在其他池均不可用或前缀/绑定点名时接管
 pub fn default_priority() -> Vec<String> {
-    vec!["buddy".into(), "trae".into(), "qoder".into()]
+    vec!["buddy".into(), "trae".into(), "qoder".into(), "zcode".into()]
 }
 
-/// 资源池标识（对外统一 `trae` / `buddy` / `qoder`；`custom` 仅供展示/日志，
+/// 资源池标识（对外统一 `trae` / `buddy` / `qoder` / `zcode`；`custom` 仅供展示/日志，
 /// 不参与策略配置——parse("custom") 返回 None）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetPool {
@@ -44,6 +45,9 @@ pub enum TargetPool {
     Custom,
     /// Qoder 上游（p3-3，gateway.qoder.com.cn 推理网关；Qoder 目录命中即源）
     Qoder,
+    /// ZCode 上游（z.ai GLM 系 OAuth 账号池，api.z.ai/api/anthropic；
+    /// zcode 目录命中即源，账号无余额时按 NoHealthy 走冷却换号）
+    ZCode,
 }
 
 impl TargetPool {
@@ -53,6 +57,7 @@ impl TargetPool {
             TargetPool::Buddy => "buddy",
             TargetPool::Custom => "custom",
             TargetPool::Qoder => "qoder",
+            TargetPool::ZCode => "zcode",
         }
     }
 
@@ -61,6 +66,7 @@ impl TargetPool {
             "trae" => Some(TargetPool::Trae),
             "buddy" => Some(TargetPool::Buddy),
             "qoder" => Some(TargetPool::Qoder),
+            "zcode" => Some(TargetPool::ZCode),
             _ => None,
         }
     }
@@ -202,6 +208,9 @@ pub enum DispatchError {
     WbDisabled,
     /// 仅 Qoder 源模型且 qoder_enabled=false（同 WbDisabled 语义镜像）
     QoderDisabled,
+    /// 仅 ZCode 源模型且 zcode_enabled=false（同族镜像；GLM-5.3-FlashX 等
+    /// zcode 独有模型，开关默认开，关闭属用户显式动作）
+    ZCodeDisabled,
     /// 仅 Trae 源模型且 trae_enabled=false（同族镜像；Trae 开关默认开，
     /// 关闭属用户显式动作，与"池耗尽 503"区分开）
     TraeDisabled,
@@ -262,11 +271,14 @@ struct ModelSources {
     /// Qoder 源（p3-3）：Qoder 目录命中（Some(目录归一化 id)）；
     /// upstreamKey/efforts 等请求素材由执行路径经 qoder_upstream::resolve 再查
     qoder: Option<String>,
+    /// ZCode 源（z.ai GLM 池）：zcode 静态目录命中（Some(归一化 id)）；
+    /// 上游端点/请求头固定，执行路径经 zcode_route 按条目取模型名
+    zcode: Option<String>,
 }
 
 impl ModelSources {
     /// 是否多源（≥2 个源存在，忽略开关状态）：跨池回退的前提。
-    /// 命名沿用 is_dual（历史上只有双源）；Qoder 加入后语义泛化为「多源」
+    /// 命名沿用 is_dual（历史上只有双源）；Qoder/ZCode 加入后语义泛化为「多源」
     fn is_dual(&self) -> bool {
         let mut n = 0;
         if self.buddy.is_some() {
@@ -278,11 +290,14 @@ impl ModelSources {
         if self.qoder.is_some() {
             n += 1;
         }
+        if self.zcode.is_some() {
+            n += 1;
+        }
         n >= 2
     }
 
     /// 可用源计数（感知开关状态）：智能调度重排门槛用
-    fn available_count(&self, trae_enabled: bool, wb_enabled: bool, qoder_enabled: bool) -> usize {
+    fn available_count(&self, trae_enabled: bool, wb_enabled: bool, qoder_enabled: bool, zcode_enabled: bool) -> usize {
         let mut n = 0;
         if self.trae && trae_enabled {
             n += 1;
@@ -293,16 +308,20 @@ impl ModelSources {
         if self.qoder.is_some() && qoder_enabled {
             n += 1;
         }
+        if self.zcode.is_some() && zcode_enabled {
+            n += 1;
+        }
         n
     }
 
-    /// 源是否可用（trae/buddy/qoder 各感知自己的池开关；custom 走 resolve_target
+    /// 源是否可用（trae/buddy/qoder/zcode 各感知自己的池开关；custom 走 resolve_target
     /// 顶部短路，不进入源集合判定——恒 false 仅为匹配穷尽）
-    fn available(&self, pool: TargetPool, trae_enabled: bool, wb_enabled: bool, qoder_enabled: bool) -> bool {
+    fn available(&self, pool: TargetPool, trae_enabled: bool, wb_enabled: bool, qoder_enabled: bool, zcode_enabled: bool) -> bool {
         match pool {
             TargetPool::Trae => self.trae && trae_enabled,
             TargetPool::Buddy => self.buddy.is_some() && wb_enabled,
             TargetPool::Qoder => self.qoder.is_some() && qoder_enabled,
+            TargetPool::ZCode => self.zcode.is_some() && zcode_enabled,
             TargetPool::Custom => false,
         }
     }
@@ -445,6 +464,10 @@ pub fn resolve_target(
     // v1 不做路由后缀剥离（-thinking/-max 是 WB/Trae 侧机制），请求素材由执行路径按条目再查
     let qoder_hit = qoder_upstream::resolve(model, qoder_upstream::QoderRegion::Cn)
         .and_then(|entry| entry.get("id").and_then(Value::as_str).map(str::to_string));
+    // ③⁰ ZCode 源判定（z.ai GLM 池）：zcode 静态目录命中即源。判定同样前置于
+    // 后缀剥离段——GLM-5.3 等基名恰在 Trae/Buddy 列表（三池同款模型）时按多源
+    // 处理，但整名仅 zcode 目录命中（如 glm-5.3-flashx）不被 -max 剥离线抢走
+    let zcode_hit = super::zcode_catalog::resolve(model);
     let trae_final = if buddy_hit.is_none() {
         if in_trae(model) {
             // 整名命中：真模型名透传，不做任何后缀剥离
@@ -483,19 +506,24 @@ pub fn resolve_target(
     };
     let canonical = canonical_id(&trae_final.0);
     // Trae 透传语义收窄：Qoder 目录命中的模型不再默认透传 Trae（透传会让
-    // Trae 上游报「模型不存在」；显式在 Trae 列表中的仍按双源处理）
-    let trae_hit = (buddy_hit.is_none() && qoder_hit.is_none())
+    // Trae 上游报「模型不存在」；显式在 Trae 列表中的仍按双源处理）。
+    // ZCode 同款收窄：zcode 目录命中且未显式在 Trae 列表 → 不透传
+    let trae_hit = (buddy_hit.is_none() && qoder_hit.is_none() && zcode_hit.is_none())
         || trae_list.iter().any(|m| canonical_id(&m.id) == canonical);
     let sources = ModelSources {
         buddy: buddy_hit,
         trae: trae_hit,
         trae_final,
         qoder: qoder_hit,
+        zcode: zcode_hit,
     };
 
     let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
     let qoder_enabled = state
         .qoder_enabled
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let zcode_enabled = state
+        .zcode_enabled
         .load(std::sync::atomic::Ordering::Relaxed);
     let trae_enabled = state
         .trae_enabled
@@ -504,17 +532,28 @@ pub fn resolve_target(
     // 仅 Buddy 源模型 + wb_enabled=false → 显式报错（§4.3：保持现有
     // wb_upstream_disabled 语义；"关闭"与"不可用"是两个概念）。
     // 三源扩展（p3-3 审查修复）：Qoder 源可用时 Buddy 关闭不构成"无源可用"，
-    // 不早退、交由下方选池路由 Qoder（与下方镜像判定的 buddy.is_none() 守卫对称）
+    // 不早退、交由下方选池路由 Qoder（与下方镜像判定的 buddy.is_none() 守卫对称）；
+    // ZCode 源同理并入该守卫（四源场景）
     if sources.buddy.is_some()
         && !sources.trae
         && !wb_enabled
         && !(sources.qoder.is_some() && qoder_enabled)
+        && !(sources.zcode.is_some() && zcode_enabled)
     {
         return Err(DispatchError::WbDisabled);
     }
     // 仅 Qoder 源模型 + qoder_enabled=false → 同语义镜像
-    if sources.qoder.is_some() && !sources.trae && sources.buddy.is_none() && !qoder_enabled {
+    if sources.qoder.is_some() && !sources.trae && sources.buddy.is_none() && !qoder_enabled
+        && sources.zcode.is_none()
+    {
         return Err(DispatchError::QoderDisabled);
+    }
+    // 仅 ZCode 源模型 + zcode_enabled=false → 同族镜像（GLM-5.3-FlashX 等
+    // zcode 独有模型；开关默认开，关闭属用户显式动作）
+    if sources.zcode.is_some() && !sources.trae && sources.buddy.is_none() && sources.qoder.is_none()
+        && !zcode_enabled
+    {
+        return Err(DispatchError::ZCodeDisabled);
     }
     // 仅 Trae 源模型 + trae_enabled=false → 同族镜像（Trae 开关默认开，
     // 关闭属用户显式动作，与"池耗尽 503"区分开）
@@ -539,6 +578,15 @@ pub fn resolve_target(
         }
         rk.pool_constraints(pool.as_str()).and_then(|c| c.allowed)
     };
+    // Key 区域约束（2026-10-19 海外池修复）：健康预检按区域作用域判断——
+    // Qoder 模型冷却表键分国内裸名/海外 g: 前缀，账号健康预检同样只数同区号，
+    // 否则国内号会让海外排队请求误判「池健康」（189s 假死的调度侧镜像）
+    let key_region_for = |pool: TargetPool| -> Option<bool> {
+        key_rk
+            .as_ref()?
+            .pool_constraints(pool.as_str())
+            .and_then(|c| c.want_global)
+    };
 
     // 会话池粘性（§4.4 软粘，TTL 60s，内存态不落盘）：命中且池仍可用 → 直接沿用。
     // Key 绑定池优先于粘性：粘性池 ≠ 绑定池时不沿用（重新按候选序选池）
@@ -552,8 +600,8 @@ pub fn resolve_target(
         };
         if let Some(pool) = sticky_pool {
             if bind.map_or(true, |b| pool.as_str() == b)
-                && sources.available(pool, trae_enabled, wb_enabled, qoder_enabled)
-                && pool_healthy(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref())
+                && sources.available(pool, trae_enabled, wb_enabled, qoder_enabled, zcode_enabled)
+                && pool_healthy(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref(), key_region_for(pool))
             {
                 record_sticky(state, sk, pool);
                 return Ok(Resolved {
@@ -574,13 +622,16 @@ pub fn resolve_target(
         // issue #90 修复③a：单池候选（不追加其他池，无跨池回退）
         vec![p]
     } else if let Some(b) = bind {
-        // b 经 parse_bind_pool 归一化，仅可能为 "trae"/"buddy"/"qoder"，无需再 parse
+        // b 经 parse_bind_pool 归一化，仅可能为 trae/buddy/qoder/zcode，无需再 parse
         if b == "trae" {
             vec![TargetPool::Trae, TargetPool::Buddy]
         } else if b == "qoder" {
             // Qoder 绑定（审查修复：原先落 else 被当 Buddy 处理，「Key 绑定池 >
             // 全局策略」对 Qoder 断链——多源模型先打 Buddy，仅回退才到 Qoder）
             vec![TargetPool::Qoder, TargetPool::Buddy, TargetPool::Trae]
+        } else if b == "zcode" {
+            // ZCode 绑定（同构修复）：GLM 三池同款模型先打 ZCode，其余按序回退
+            vec![TargetPool::ZCode, TargetPool::Buddy, TargetPool::Trae]
         } else {
             vec![TargetPool::Buddy, TargetPool::Trae]
         }
@@ -597,7 +648,7 @@ pub fn resolve_target(
     // per_model / 绑定序可能只写了部分池：其余可用源追加尾部，保证多源回退有序
     // （issue #90 修复③a：前缀锁定 = 单池候选，不追加）
     if forced_pool.is_none() {
-        for p in [TargetPool::Buddy, TargetPool::Trae, TargetPool::Qoder] {
+        for p in [TargetPool::Buddy, TargetPool::Trae, TargetPool::Qoder, TargetPool::ZCode] {
             if !order.contains(&p) {
                 order.push(p);
             }
@@ -609,7 +660,7 @@ pub fn resolve_target(
     if forced_pool.is_none() && bind.is_none()
         && policy.strategy == DispatchStrategy::Smart
         && policy.per_model.get(&canonical).is_none()
-        && sources.available_count(trae_enabled, wb_enabled, qoder_enabled) >= 2
+        && sources.available_count(trae_enabled, wb_enabled, qoder_enabled, zcode_enabled) >= 2
     {
         order = smart_pool_order(state, &order, &canonical, &catalog, &sources);
     }
@@ -617,14 +668,14 @@ pub fn resolve_target(
     let preferred = order
         .iter()
         .copied()
-        .find(|p| sources.available(*p, trae_enabled, wb_enabled, qoder_enabled));
+        .find(|p| sources.available(*p, trae_enabled, wb_enabled, qoder_enabled, zcode_enabled));
 
     let mut fallback_from: Option<(TargetPool, FallbackReason)> = None;
     for (i, pool) in order.iter().copied().enumerate() {
-        if !sources.available(pool, trae_enabled, wb_enabled, qoder_enabled) {
+        if !sources.available(pool, trae_enabled, wb_enabled, qoder_enabled, zcode_enabled) {
             continue;
         }
-        match pool_health(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref()) {
+        match pool_health(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref(), key_region_for(pool)) {
             Ok(()) => {
                 // 首个可用池胜出；此前有可用池失败 → 跨池回退 warn 日志（§4.5）。
                 // 源剔除（如 wb_enabled=false）不算回退，不记日志
@@ -659,7 +710,7 @@ pub fn resolve_target(
                 // 单源（或 fallback 关）→ 错误矩阵显式报错（§4.3，不静默换池）
                 let has_next = order[i + 1..]
                     .iter()
-                    .any(|p| sources.available(*p, trae_enabled, wb_enabled, qoder_enabled));
+                    .any(|p| sources.available(*p, trae_enabled, wb_enabled, qoder_enabled, zcode_enabled));
                 let can_fallback = policy.fallback && sources.is_dual() && has_next;
                 if !can_fallback {
                     return Err(match (pool, reason) {
@@ -672,6 +723,7 @@ pub fn resolve_target(
                         (TargetPool::Qoder, FallbackReason::ModelCooldown) => {
                             let secs = super::qoder_route::model_cooling_remaining_secs(
                                 &sources.qoder.clone().unwrap_or_default(),
+                                key_region_for(pool),
                             )
                             .unwrap_or(0) as i64;
                             DispatchError::ModelCooling(secs)
@@ -765,6 +817,9 @@ fn smart_pool_order(
             TargetPool::Trae => (trae_stats, trae_rate),
             TargetPool::Buddy => (wb_stats, buddy_rate),
             TargetPool::Qoder => (qoder_stats, qoder_rate),
+            // ZCode：无余额概念（z.ai 按套餐配额），排序键退 (无到期, 免费, 0 号)，
+            // 实际并列时回退固定优先级序（ZCode 排最尾）
+            TargetPool::ZCode => ((None, 0.0), Some(0.0)),
             TargetPool::Custom => ((None, 0.0), None),
         };
         (
@@ -785,12 +840,15 @@ fn smart_pool_order(
 
 /// 首选池健康检查：Buddy 池额外检查模型级冷却（优先级高于账号级）
 /// `allowed`：Key 绑定的白名单（仅绑定池生效），None = 不感知白名单
+/// `want_global`：Key 区域约束（仅 Qoder 池消费）；None/Some(false) = 国内语义
+#[allow(clippy::too_many_arguments)]
 fn pool_health(
     state: &Arc<ApiSharedState>,
     pool: TargetPool,
     sources: &ModelSources,
     _wb_enabled: bool,
     allowed: Option<&HashSet<String>>,
+    want_global: Option<bool>,
 ) -> Result<(), FallbackReason> {
     match pool {
         TargetPool::Buddy => {
@@ -811,16 +869,38 @@ fn pool_health(
         }
         TargetPool::Qoder => {
             // 模型级冷却预检（审查修复，与 Buddy 同构）：排队/超限类错误后窗口
-            // 内快速回退——多源交由后续池，单源在 resolve_target 显式 429
+            // 内快速回退——多源交由后续池，单源在 resolve_target 显式 429。
+            //
+            // 但模型冷却表不区分「哪个账号被限流」：一支海外号撞 429 就会把
+            // 该区整个模型判死（实测：三个海外号里一个限频，另两个健康，请求
+            // 仍直接 429 终止轮换）。因此仅在目标区域作用域内确无可选账号时才
+            // 信任模型级冷却——账号级轮换本就是更精确的信号，交给执行路径换号。
+            // 区域键（2026-10-19）：海外查 g:{model}，账号健康按同区计数。
             if super::qoder_route::model_cooling_remaining_secs(
                 &sources.qoder.clone().unwrap_or_default(),
+                want_global,
             )
             .is_some()
+                && !state
+                    .qoder_pool
+                    .has_selectable_in_region(allowed, want_global)
             {
                 return Err(FallbackReason::ModelCooldown);
             }
-            // 账号级健康预检
-            if !state.qoder_pool.has_selectable_in(allowed) {
+            // 账号级健康预检（区域作用域：海外 Key 只数海外号）
+            if !state
+                .qoder_pool
+                .has_selectable_in_region(allowed, want_global)
+            {
+                return Err(FallbackReason::NoHealthyAccount);
+            }
+            Ok(())
+        }
+        TargetPool::ZCode => {
+            // ZCode 池健康（与 Qoder 同构，无区域维度）：账号级健康预检。
+            // 无模型级冷却表——1113（无资源包）由执行路径按号记错冷却，
+            // 池内换号重试，全号冷却才显式 429
+            if !state.zcode_pool.has_selectable_in(allowed) {
                 return Err(FallbackReason::NoHealthyAccount);
             }
             Ok(())
@@ -836,8 +916,9 @@ fn pool_healthy(
     sources: &ModelSources,
     wb_enabled: bool,
     allowed: Option<&HashSet<String>>,
+    want_global: Option<bool>,
 ) -> bool {
-    pool_health(state, pool, sources, wb_enabled, allowed).is_ok()
+    pool_health(state, pool, sources, wb_enabled, allowed, want_global).is_ok()
 }
 
 fn final_buddy_model(sources: &ModelSources) -> String {
@@ -855,6 +936,8 @@ fn final_model_for(pool: TargetPool, sources: &ModelSources, request_model: &str
         TargetPool::Trae => sources.trae_final.0.clone(),
         // Qoder：目录归一化 id（去空白形态，执行路径据此 resolve 请求素材）
         TargetPool::Qoder => sources.qoder.clone().unwrap_or_default(),
+        // ZCode：目录归一化 id（glm-5.3 / glm-5.3-flash 等上游模型名）
+        TargetPool::ZCode => sources.zcode.clone().unwrap_or_default(),
         TargetPool::Custom => request_model.to_string(),
     }
 }
@@ -866,6 +949,8 @@ fn effort_for(pool: TargetPool, sources: &ModelSources) -> Option<String> {
         TargetPool::Trae => sources.trae_final.1.clone(),
         // Qoder：v1 无路由级 effort 通道（思考档位由执行路径按目录条目解析）
         TargetPool::Qoder => None,
+        // ZCode：v1 无路由级 effort 通道（GLM thinking 由请求体直传）
+        TargetPool::ZCode => None,
         TargetPool::Custom => None,
     }
 }
@@ -875,7 +960,7 @@ fn effort_for(pool: TargetPool, sources: &ModelSources) -> Option<String> {
 fn max_mode_for(pool: TargetPool, sources: &ModelSources) -> bool {
     match pool {
         TargetPool::Trae => sources.trae_final.2,
-        TargetPool::Buddy | TargetPool::Custom | TargetPool::Qoder => false,
+        TargetPool::Buddy | TargetPool::Custom | TargetPool::Qoder | TargetPool::ZCode => false,
     }
 }
 
@@ -909,6 +994,7 @@ fn pool_sticky_ttl_secs(state: &ApiSharedState, pool: TargetPool) -> u64 {
         TargetPool::Trae | TargetPool::Custom => &state.trae_pool_sticky_ttl_secs,
         TargetPool::Buddy => &state.wb_pool_sticky_ttl_secs,
         TargetPool::Qoder => &state.qoder_pool_sticky_ttl_secs,
+        TargetPool::ZCode => &state.zcode_pool_sticky_ttl_secs,
     };
     cell.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -1026,6 +1112,14 @@ mod tests {
             qoder_sticky_enabled: AtomicBool::new(false),
             qoder_sticky: super::super::wb_sticky::StickyStore::default(),
             trae_sticky: super::super::wb_sticky::StickyStore::default(),
+            // ZCode 池：测试矩阵同样按「启用但空池」构造——GLM-5.3 三池同款
+            // 时优先 Buddy/Trae（与生产默认 priority 一致），zcode 独有模型的
+            // 行为由 zcode_prefix_locks_pool 覆盖
+            zcode_pool: super::super::pool::ApiPool::new(),
+            zcode_enabled: AtomicBool::new(true),
+            zcode_identity: None,
+            zcode_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            zcode_account_concurrency_limit: std::sync::atomic::AtomicU32::new(1),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
         });
         Fixture { dir, state }
@@ -1083,6 +1177,7 @@ mod tests {
                 daily_stats: vec![],
                 allowed_groups: vec![],
                 allowed_tags: vec![],
+                region: String::new(),
             });
             crate::store::docs::api_keys_save(&crate::store::db(&self.dir), &file).unwrap();
         }
@@ -1152,10 +1247,45 @@ mod tests {
             split_pool_prefix(" buddy/ hy4 "),
             Some((TargetPool::Buddy, "hy4"))
         );
+        assert_eq!(
+            split_pool_prefix("ZCode/GLM-5.3"),
+            Some((TargetPool::ZCode, "GLM-5.3"))
+        );
         assert_eq!(split_pool_prefix("custom/m1"), None);
         assert_eq!(split_pool_prefix("openai/gpt-4o"), None);
         assert_eq!(split_pool_prefix("trae/"), None);
         assert_eq!(split_pool_prefix("glm-5.3"), None);
+    }
+
+    /// ZCode 池前缀锁定（zcode/GLM-5.3 → 单池候选，model 归一化为目录 id）
+    #[test]
+    fn zcode_prefix_locks_pool() {
+        let fx = fixture(&["GLM-5.3"], None, None);
+        let r = fx.resolve("zcode/GLM-5.3").unwrap();
+        assert_eq!(r.pool, TargetPool::ZCode);
+        // 目录 id 字面量（执行路径据此构造上游 anthropic 请求）
+        assert_eq!(r.model, "GLM-5.3");
+    }
+
+    /// ZCode 池关闭不破坏三池同款模型路由：GLM-5.3 在 Trae 列表，
+    /// zcode_enabled=false 时仍可透传 Trae（ZCodeDisabled 只拦 zcode 独有模型）
+    #[test]
+    fn zcode_disabled_keeps_shared_models_routable() {
+        let fx = fixture(&["GLM-5.3"], None, None);
+        fx.state
+            .zcode_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let r = fx.resolve("GLM-5.3");
+        assert!(r.is_ok(), "ZCode 关闭不应影响三池同款模型: {:?}", r.err());
+    }
+
+    /// ZCode 池启用时 GLM-5.3 仍是 Buddy/Trae 优先（默认 priority 尾部追加），
+    /// 前缀锁定才强制 ZCode——零行为差异（§9.1 口径对第四池同样成立）
+    #[test]
+    fn zcode_default_priority_stays_last() {
+        let fx = fixture(&["GLM-5.3"], None, None);
+        let r = fx.resolve("GLM-5.3").unwrap();
+        assert_ne!(r.pool, TargetPool::ZCode, "默认策略下 ZCode 不得抢先");
     }
 
     /// 前缀锁定：默认策略 Buddy 优先，`trae/` 前缀强制 Trae 胜出、`buddy/` 维持
@@ -1214,17 +1344,26 @@ mod tests {
     /// 内置 15 模型（含 glm-5.3/kimi-k3），无法构造「基名不在 Buddy 目录」的
     /// Trae-only 前提（issue #31 T3.1 测试专用）
     fn catalog_only(dir: &Path, keep: &str) {
-        crate::store::db(dir)
-            .kv_set(
-                "wb_model_catalog",
-                &json!({
-                    "models": [{"id": keep, "display": keep, "context_length": 128000,
-                                "max_tokens": 64000, "supports_image": false,
-                                "supported_efforts": ["low","medium","high"], "rate": 0.5}],
-                    "builtin_rev": super::super::wb_catalog::BUILTIN_REV
-                }),
-            )
-            .unwrap();
+        // 两区目录同时限定（海外区有 builtin_global 兜底，只写 CN 键会让
+        // 基名经由海外表命中 Buddy 目录，破坏「基名仅 Trae 源」的触发前提）
+        for (key, region) in [
+            ("wb_model_catalog", "cn"),
+            (super::super::wb_catalog::KV_KEY_GLOBAL, "global"),
+        ] {
+            crate::store::db(dir)
+                .kv_set(
+                    key,
+                    &json!({
+                        "models": [{"id": keep, "display": keep, "context_length": 128000,
+                                    "max_tokens": 64000, "supports_image": false,
+                                    "supported_efforts": ["low","medium","high"], "rate": 0.5,
+                                    "region": region}],
+                        "builtin_rev": super::super::wb_catalog::BUILTIN_REV
+                    }),
+                )
+                .unwrap();
+        }
+        super::super::config_cache::invalidate(dir, "wb_model_catalog_merged");
     }
 
     // ---------- 维度一：优先级 ----------
@@ -1366,6 +1505,50 @@ mod tests {
         );
     }
 
+    /// 账号级日限额（WB 6004「将在 … UTC+8 重置」）只冻结该账号：
+    /// 池内其他账号立刻顶上，不再把整个模型冷却 19 小时（用户实测场景回归）。
+    #[test]
+    fn t13b_account_quota_freezes_only_that_account_not_the_model() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        // 两个 Buddy 账号：b1 爆量、b2 健康
+        let accounts: Vec<super::super::pool::WbSyncAccount> = ["b1", "b2"]
+            .iter()
+            .map(|uid| super::super::pool::WbSyncAccount {
+                uid: (*uid).into(),
+                name: (*uid).into(),
+                token: "tk".into(),
+                domain: "d".into(),
+                enterprise_id: String::new(),
+                global_region: false,
+                credits: Some(10.0),
+                credits_expire_at: None,
+                credits_fetched_at: None,
+                needs_relogin: false,
+                group_id: String::new(),
+            })
+            .collect();
+        let enabled: Vec<String> = vec!["b1".into(), "b2".into()];
+        f.state.wb_pool.sync_from_wb(&accounts, &enabled);
+
+        // b1 收到日限额文案（12 小时后重置）
+        let reset = (chrono::Utc::now() + chrono::Duration::hours(12))
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+        let msg = format!("您于 {} UTC+8 触发限额，将在 {} UTC+8 重置",
+            reset.format("%Y-%m-%d %H:%M:%S"), reset.format("%Y-%m-%d %H:%M:%S"));
+        super::super::wb_route::note_account_model_failure(&f.state, "hy4", Some(&msg), Some("b1"));
+
+        // 模型未被全局冷却（旧 bug 会让这里变成 ModelCooling）
+        assert!(
+            super::super::wb_route::model_cooling_remaining(&f.state, "hy4").is_none(),
+            "账号级限额不得升级为模型级冷却"
+        );
+        // b1 被冻结、b2 仍可选 → 调度照常解析到 Buddy 池
+        assert!(f.state.wb_pool.pick_by_uid("b1").is_none(), "爆量账号应被冻结");
+        assert!(f.state.wb_pool.pick_by_uid("b2").is_some(), "另一账号应可顶上");
+        let r = f.resolve("hy4").expect("池内仍有健康账号，不得拒绝请求");
+        assert_eq!(r.pool, TargetPool::Buddy);
+    }
+
     /// 仅 Buddy 源 + 模型级冷却 → 429 语义（ModelCooling）
     #[test]
     fn t13_buddy_only_model_cooldown_errors() {
@@ -1388,6 +1571,26 @@ mod tests {
         let r = f.resolve("glm-5.3").unwrap();
         assert_eq!(r.pool, TargetPool::Trae);
         assert!(f.app_log_contains("reason=model_cooldown"));
+    }
+
+    /// 匿名路径（uid 未归因）+ 日额度文案 → 模型级冷却**封顶**（修复3）：
+    /// 上游「次日重置」精确时刻不得原样进全局模型锁（旧版锁 19h 全池停摆），
+    /// 超出 MODEL_COOLDOWN_MAX_SECS 的部分被钳制到上限内
+    #[test]
+    fn t14b_anonymous_model_cooldown_capped() {
+        let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
+        f.seed_healthy(false);
+        let reset = (chrono::Utc::now() + chrono::Duration::hours(19))
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+        let msg = format!("您于 {} UTC+8 触发限额，将在 {} UTC+8 重置",
+            reset.format("%Y-%m-%d %H:%M:%S"), reset.format("%Y-%m-%d %H:%M:%S"));
+        super::super::wb_route::note_account_model_failure(&f.state, "hy4", Some(&msg), None);
+        let rem = super::super::wb_route::model_cooling_remaining(&f.state, "hy4")
+            .expect("匿名路径应记模型级冷却");
+        assert!(
+            rem <= 600,
+            "匿名路径模型冷却应封顶 600s，实测 {rem}s（日额度精确时刻只允许进账号级冻结）"
+        );
     }
 
     /// 仅 Trae 源 + Trae 池耗尽 → 503 语义
@@ -2017,6 +2220,7 @@ mod tests {
                 credits: None,
                 credits_expire_at: None,
                 credits_fetched_at: None,
+            global_region: false,
             }],
             &["q1".to_string()],
         );

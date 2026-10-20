@@ -13,6 +13,7 @@
 //! 红线：jwt 不进日志/事件（事件仅含 user_id/name/status 等脱敏字段）。
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::time::Duration;
 
 use chrono::TimeZone;
@@ -122,23 +123,25 @@ fn http_post(
 /// （代理捕获/切换流程写入，与新 JWT 的设备指纹校验匹配），缺失时按 uid 确定性派生
 ///（与 python gen=2 同算法）并落盘共享给 device_proxy。
 fn get_device_for(state: &AppState, uid: &str) -> DeviceEntry {
-    // C3（审查）：写回分支整表 load→save 持 DEVICE_MAP_LOCK（叶子锁）——OAuth
-    // 登录回写 writeback_oauth_device 并发时防整表覆盖丢条目（指纹漂移）
-    let _g = crate::store::docs::DEVICE_MAP_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    // SQLite 化（P3）：device_map 表
-    let map = crate::store::docs::device_map_load(&crate::store::db(&state.data_dir));
-    if let Some(e) = map.get(uid) {
-        if !e.device_id.is_empty() {
-            return e.clone();
+    // C3（审查）：写回分支与 OAuth writeback_oauth_device 互斥，防整表覆盖丢条目。
+    //
+    // **自死锁修复（2026-10-20 签到卡死）**：原实现外层先拿 DEVICE_MAP_LOCK，
+    // 再调 device_map_save——save 内部**又**拿同一把非重入 Mutex，同线程二次
+    // lock 永久阻塞。本函数是每个账号签到的必经路径，一旦走「条目缺失→写回」
+    // 分支即整轮卡死（账号 1 命中已有条目所以能过，账号 2 起全挂）。
+    // 改用 store 层的持锁读改写封装，临界区只获取一次。
+    let store = crate::store::db(&state.data_dir);
+    let derived = derive_device(uid);
+    let resolved = crate::store::docs::with_device_map(&store, |map| {
+        if let Some(e) = map.get(uid) {
+            if !e.device_id.is_empty() {
+                return Ok(e.clone());
+            }
         }
-    }
-    let dev = derive_device(uid);
-    let mut updated = map;
-    updated.insert(uid.to_string(), dev.clone());
-    let _ = crate::store::docs::device_map_save(&crate::store::db(&state.data_dir), &updated);
-    dev
+        map.insert(uid.to_string(), derived.clone());
+        Ok(derived.clone())
+    });
+    resolved.unwrap_or(derived)
 }
 
 // ── status 预检 / claim（对齐 python status_check / _signin_request）────────
@@ -314,27 +317,38 @@ fn classify_error(http_status: i32, code: Option<i64>) -> (&'static str, i64) {
 
 /// 写入/更新账号冷却状态到 account_cooldowns.json（语义对齐 python save_cooldown）。
 /// Server/Client 类错误前 2 次仅计数不冷却（until=0），第 3 次起进入冷却。
+///
+/// **自死锁修复（2026-10-20 签到卡死事故）**：原实现在本函数内先拿
+/// `ACCOUNT_COOLDOWNS_LOCK`，再调 `account_cooldowns_save`——而 save 内部
+/// **又**拿同一把 `std::sync::Mutex`（非重入）→ 同一线程第二次 lock 永久阻塞。
+/// 表现：账号 1 已签（走 already 分支不写冷却）→ 账号 2 一旦失败进入本函数即
+/// 死锁 → 其余账号永远 pending，进程无 CPU/无网络/无 panic，整轮永不结束、
+/// 防重入锁永不释放（用户侧「签到不进行下去」）。
+/// 现改用 `with_account_cooldowns`（store 层已提供的持锁读改写原子封装），
+/// 临界区只在一处获取、只在一处释放。
 fn save_cooldown(state: &AppState, uid: &str, error_type: &str, cooldown_seconds: i64, reason: &str) {
-    // C4（审查）：整表 load→save 持 ACCOUNT_COOLDOWNS_LOCK（叶子锁）——与手动
-    // 清理命令/解冻回写并发时防整表覆盖丢冷却条目（已冷却账号被重新探测）
-    let _g = crate::store::docs::ACCOUNT_COOLDOWNS_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    // SQLite 化（P3）：account_cooldowns 表
+    use crate::store::docs::with_account_cooldowns;
     let store = crate::store::db(&state.data_dir);
-    let mut data = crate::store::docs::account_cooldowns_load(&store);
-    if cooldown_seconds == 0 {
-        data.cooldowns.remove(uid);
-        data.updated_at = Some(fs_utils::now_iso());
-        let _ = crate::store::docs::account_cooldowns_save(&store, &data);
-        return;
-    }
-    let entry = if cooldown_seconds == -1 {
-        CooldownEntry { error_type: error_type.into(), until: 9_999_999_999, reason: reason.into(), error_count: 0 }
-    } else if error_type == "Server" || error_type == "Client" {
-        let count = data.cooldowns.get(uid).map(|e| e.error_count).unwrap_or(0) + 1;
-        if count < 3 {
-            CooldownEntry { error_type: error_type.into(), until: 0, reason: reason.into(), error_count: count }
+    let _ = with_account_cooldowns(&store, |data| {
+        if cooldown_seconds == 0 {
+            data.cooldowns.remove(uid);
+            data.updated_at = Some(fs_utils::now_iso());
+            return Ok(());
+        }
+        let entry = if cooldown_seconds == -1 {
+            CooldownEntry { error_type: error_type.into(), until: 9_999_999_999, reason: reason.into(), error_count: 0 }
+        } else if error_type == "Server" || error_type == "Client" {
+            let count = data.cooldowns.get(uid).map(|e| e.error_count).unwrap_or(0) + 1;
+            if count < 3 {
+                CooldownEntry { error_type: error_type.into(), until: 0, reason: reason.into(), error_count: count }
+            } else {
+                CooldownEntry {
+                    error_type: error_type.into(),
+                    until: chrono::Utc::now().timestamp() + cooldown_seconds,
+                    reason: reason.into(),
+                    error_count: 0,
+                }
+            }
         } else {
             CooldownEntry {
                 error_type: error_type.into(),
@@ -342,18 +356,11 @@ fn save_cooldown(state: &AppState, uid: &str, error_type: &str, cooldown_seconds
                 reason: reason.into(),
                 error_count: 0,
             }
-        }
-    } else {
-        CooldownEntry {
-            error_type: error_type.into(),
-            until: chrono::Utc::now().timestamp() + cooldown_seconds,
-            reason: reason.into(),
-            error_count: 0,
-        }
-    };
-    data.cooldowns.insert(uid.to_string(), entry);
-    data.updated_at = Some(fs_utils::now_iso());
-    let _ = crate::store::docs::account_cooldowns_save(&store, &data);
+        };
+        data.cooldowns.insert(uid.to_string(), entry);
+        data.updated_at = Some(fs_utils::now_iso());
+        Ok(())
+    });
 }
 
 /// 清除账号冷却状态（签到成功后调用）
@@ -574,6 +581,13 @@ pub fn run_round(
 
     emit(&json!({"type": "start", "total": accounts.len()}));
 
+    // 签到前置设备保障（2026-10-19 自动 mint）：派生假号被服务端 9074 拒绝，
+    // 一机一号撞车 9095。自动修正——
+    // ① 无 device_map 条目/仍是派生号，且 doctor 设备号池（代理采集）有空闲真实号 → 直接绑定；
+    // ② 池里没号可用 → 触发一次 mint prepare（关客户端→换指纹→清缓存→拉起客户端），
+    //    本轮签到照常跑（该号本轮仍会失败），客户端重启注册出新号后下一轮即用新号。
+    device_preflight(state, accounts, emit);
+
     // 多账号签到间隔（环境配置页可改，默认 3s，0=关闭）：账号间串行等待，
     // 防上游频控；循环开头 i>0 判定——相邻两账号处理开始之间至少隔 gap 秒，
     // 未配置 jwt 的 continue 快速失败分支同样计入间隔，节奏统一
@@ -584,6 +598,13 @@ pub fn run_round(
         }
         let idx = i + 1; // 1-based（前端 next[index-1] 定位行）
         let name = if acc.name.is_empty() { format!("账号{idx}") } else { acc.name.clone() };
+        // 逐账号进度留痕（2026-10-20 卡死事故）：此前只在结果出来时写日志，账号
+        // 卡在中途（等锁/等网络）时 checkin.log 停留在上一个账号，无法判断是
+        // 「还没开始」还是「卡在某账号内部」。开始行 + 结束行配对即可一眼定位。
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!("[签到] 开始第 {idx}/{} 个账号: {name}", accounts.len()),
+        );
 
         // 未配置 jwt：直接失败（对齐 python 分支）
         let jwt = acc.jwt.trim().to_string();
@@ -744,6 +765,178 @@ pub fn run_round(
     let done = json!({"type": "done", "ok": total_ok, "already": already, "failed": failed});
     emit(&done);
     done
+}
+
+// ── 签到前置设备保障（自动 mint，2026-10-19）────────────────────────────────
+
+/// 每账号设备资格检查 + 自动修复。仅记日志与事件，不阻塞签到主流程。
+fn device_preflight(state: &AppState, accounts: &[RawAccount], emit: &mut dyn FnMut(&Value)) {
+    let store = crate::store::db(&state.data_dir);
+    let mut map = crate::store::docs::device_map_load(&store);
+    // 空闲池号
+    let occupied: std::collections::HashSet<String> = map
+        .iter()
+        .filter(|(k, _)| !k.as_str().starts_with("doctor:"))
+        .map(|(_, e)| e.device_id.clone())
+        .collect();
+    let mut free: Vec<String> = map
+        .iter()
+        .filter(|(k, _)| k.as_str().starts_with("doctor:"))
+        .map(|(_, e)| e.device_id.clone())
+        .filter(|d| !d.is_empty() && !occupied.contains(d))
+        .collect();
+    // 客户端本轮注册号（cache2）若未被任何账号占用 → 视为空闲池号
+    if let Some(fresh) = crate::tasks::trae_mint::read_doctor_cached_did() {
+        if !occupied.contains(&fresh) && !free.contains(&fresh) {
+            free.insert(0, fresh);
+        }
+    }
+    let mut fixed = 0usize;
+    let mut needs_mint = false;
+    for acc in accounts {
+        let Some(uid) = acc.user_id.as_deref().filter(|u| !u.is_empty()) else {
+            continue;
+        };
+        let derived = crate::commands::accounts::derive_device(uid);
+        // 先把该账号现状整份拷出，杜绝 get_mut 借用期间扫描 map（E0502）；
+        // 所有写回集中在本轮末尾
+        let Some(cur) = map.get(uid).cloned() else {
+            // 无条目（派生假号风险）→ 直接绑定空闲号或标记需要 mint
+            match free.pop() {
+                Some(did) => {
+                    map.insert(
+                        uid.to_string(),
+                        crate::models::DeviceEntry {
+                            device_id: did.clone(),
+                            market_user_id: None,
+                            session_id: None,
+                            locked: true,
+                        },
+                    );
+                    fixed += 1;
+                    emit(&json!({
+                        "type": "device_preflight", "user_id": uid,
+                        "status": "assigned", "device_id": did,
+                        "message": "自动绑定设备号池空闲号",
+                    }));
+                }
+                None => needs_mint = true,
+            }
+            continue;
+        };
+        let owners: Vec<String> = map
+            .iter()
+            .filter(|(k, e)| !k.as_str().starts_with("doctor:") && e.device_id == cur.device_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let need_reassign = cur.locked
+            || cur.device_id != derived.device_id
+            || (owners.len() > 1 && owners.iter().min().map(|m| m.as_str() != uid).unwrap_or(false));
+        if need_reassign {
+            match free.pop() {
+                Some(did) => {
+                    if let Some(entry) = map.get_mut(uid) {
+                        entry.device_id = did.clone();
+                        entry.locked = true;
+                    }
+                    fixed += 1;
+                    emit(&json!({
+                        "type": "device_preflight", "user_id": uid,
+                        "status": "reassigned", "device_id": did,
+                        "message": "设备号独占化（派生假号/多号共用 → 池内空闲号）",
+                    }));
+                }
+                None => needs_mint = true,
+            }
+        }
+    }
+    if fixed > 0 {
+        let _ = crate::store::docs::device_map_save(&store, &map);
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!("[签到前置] 设备号自动配号完成: 修正 {fixed} 个账号"),
+        );
+    }
+    // 池空且有待修账号 → 自动触发一次 mint prepare（关客户端→换指纹→清缓存→拉起客户端）
+    //
+    // 2026-10-20 事故修复：mint **不在签到线程内同步执行**。prepare 会关客户端、
+    // 改注册表、清三层缓存并重启客户端——重启后的客户端立刻密集发起注册/遥测
+    // （proxy 实测 09:50:48–51 五连捕获），与签到线程共享 DEVICE_MAP_LOCK /
+    // store 连接锁时发生过死等（账号 1 已签后账号 2–5 全部 pending，18 分钟无
+    // 进程无网络无 panic）。改为**异步**：本轮签到照常跑完（该号本轮仍失败），
+    // mint 在后台完成后下一轮自动用新号——不阻塞、不抢锁、语义不变。
+    if needs_mint {
+        let dir = state.data_dir.clone();
+        std::thread::Builder::new()
+            .name("checkin-auto-mint".into())
+            .spawn(move || match auto_mint_prepare(&dir) {
+                Ok(()) => {
+                    crate::fs_utils::app_log(&dir, "[签到前置] 异步自动 mint 完成（下一轮生效）");
+                }
+                Err(e) => {
+                    crate::fs_utils::app_log(&dir, &format!("[签到前置] 自动 mint 失败: {e}"));
+                }
+            })
+            .ok();
+        emit(&json!({
+            "type": "device_preflight", "status": "mint_prepared",
+            "message": "缺少空闲设备号：已后台启动 mint（客户端即将重启注册新号），下一轮签到自动使用",
+        }));
+    }
+}
+
+/// 自动 mint prepare：关 Trae 客户端 → 备份换指纹清缓存 → 重启客户端（注册新号）。
+/// 全程无窗口（CREATE_NO_WINDOW）。collect（读新号+还原+绑定）由下一轮签到前置或
+/// 代理启动时的 auto_assign 完成——彼时 cache2 已写入新号。
+///
+/// 入参用 `data_dir`（而非 `&AppState`）：调用方在**后台线程**执行本函数，不持有
+/// AppState 的 Tauri 句柄——避免跨线程引用 GUI 状态，也便于单测。
+fn auto_mint_prepare(data_dir: &Path) -> Result<(), String> {
+    // 已有未消费轮次：不重复（等待用户重启客户端/下一轮 collect）
+    if crate::tasks::trae_mint::pending_state(data_dir).is_some() {
+        return Ok(());
+    }
+    // 关客户端（graceful，CREATE_NO_WINDOW）
+    let killed = crate::commands::process::graceful_kill_images(&["Trae CN.exe"]);
+    if let Err(e) = killed {
+        crate::fs_utils::app_log(data_dir, &format!("[mint] 关闭客户端失败: {e}"));
+    }
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let st = crate::tasks::trae_mint::prepare(data_dir)?;
+    crate::fs_utils::app_log(
+        data_dir,
+        &format!(
+            "[mint] prepare 完成 backup={}（指纹已换，三层缓存已清）",
+            st.backup_dir
+        ),
+    );
+    // 重启客户端注册新号（无窗口 spawn）
+    start_trae_client_nohide(data_dir)?;
+    Ok(())
+}
+
+/// 拉起 Trae CN 客户端（对齐 switcher proc::start_app 的分离启动 + 无控制台窗口）。
+/// exe 定位复用 switcher locate（settings→候选→lnk→注册表），构造最小 Session。
+fn start_trae_client_nohide(data_dir: &Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    let mut sess = crate::switcher::Session::new(&crate::switcher::RunArgs {
+        action: crate::switcher::Action::KeepAlive,
+        target_app: crate::switcher::TargetApp::Trae,
+        user_id: None,
+        proxy_port: None,
+        include_indexeddb: false,
+        expected_current_uid: String::new(),
+        machine_id_override: None,
+        data_dir: data_dir.to_path_buf(),
+    });
+    let exe = crate::switcher::locate::find_exe(&mut sess)
+        .ok_or_else(|| "未找到 Trae CN.exe（请在设置里指定路径）".to_string())?;
+    std::process::Command::new(&exe)
+        .creation_flags(0x0800_0000 | 0x0000_0008) // CREATE_NO_WINDOW | DETACHED_PROCESS
+        .spawn()
+        .map_err(|e| format!("启动 Trae CN 失败: {e}"))?;
+    crate::fs_utils::app_log(data_dir, "[mint] 客户端已重启（新指纹注册中，约 10 秒）");
+    Ok(())
 }
 
 // ── 单元测试（纯函数层）────────────────────────────────────────────────────

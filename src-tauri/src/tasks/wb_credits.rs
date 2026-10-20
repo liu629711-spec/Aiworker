@@ -330,6 +330,13 @@ fn old_body() -> Value {
     })
 }
 
+/// 判断包是否来自「免费包」接口（get-user-resource-free-packages）。
+/// 该接口返回的全部是免费额度包（体验版月度赠送 / 运营裂变包 / 拉新权益包），
+/// 与 paid-packages 的付费购买包严格区分——来源接口即权威依据，不做包名猜测。
+fn is_free_source(url: &str) -> bool {
+    url.contains("free-packages")
+}
+
 /// 单轮取数 → (pkgs, balance, saw_auth, net_down)。
 /// 2026-09 实测结构（代理诊断）：
 /// - summary：200，data.Packages[] 自带 PackageCode + 容量三项（**无到期时间字段**）；
@@ -338,6 +345,8 @@ fn old_body() -> Value {
 /// 流程：summary（余额 + 包）→ paid/free 带 PackageCodes 回查到期 → 按 PackageCode
 /// 去重合并（paid/free 有到期信息的优先，summary 包补齐未被覆盖的）。
 /// paid/free 失败不影响 cloud 成功判定（仅缺到期信息，明细显示「未知」）。
+/// 包来源标注（免费额度可见性）：paid/free 两路分别打 `is_free` 标记，
+/// 供账号页区分「免费包」与付费包；summary 兜底包无来源信息不标注。
 fn fetch_round(
     agent: &ureq::Agent,
     headers: &[(String, String)],
@@ -375,9 +384,14 @@ fn fetch_round(
             }
             if st2 == 200 {
                 if let Some(b2) = body2.filter(|b| b.is_object()) {
-                    for p in packages_from(&b2) {
+                    let free = is_free_source(url);
+                    for mut p in packages_from(&b2) {
                         if let Some(code) = p.get("code").and_then(Value::as_str) {
                             enriched_codes.insert(code.to_string());
+                        }
+                        // 免费包来源标注（免费额度可见性：账号页区分免费/付费包）
+                        if free {
+                            p["is_free"] = json!(true);
                         }
                         enriched.push(p);
                     }
@@ -517,9 +531,34 @@ fn fetch_account(state: &AppState, agent: &ureq::Agent, acct: &Value) -> Value {
         let exp = p.get("expire_ts").and_then(Value::as_i64);
         p["expire_soon"] = json!(exp.map(|e| e < soon_cut).unwrap_or(false));
     }
+    // 免费额度汇总（免费额度可见性）：免费包 = free-packages 接口来源（is_free 标记）。
+    // free_remaining/free_total 为剩余/总量聚合；free_next_reset_at 取免费包中
+    // 最早到期（即下次额度刷新/失效时刻——免费额度按包周期发放，到期即刷新）；
+    // 无免费包时三字段为 null（显式表达「无免费额度」而非 0）。
+    let free_pkgs: Vec<&Value> = pkgs.iter().filter(|p| p.get("is_free").is_some()).collect();
+    let free_remaining: Option<f64> = if free_pkgs.is_empty() {
+        None
+    } else {
+        Some(free_pkgs.iter().filter_map(|p| p.get("remaining").and_then(Value::as_f64)).sum())
+    };
+    let free_total: Option<f64> = if free_pkgs.is_empty() {
+        None
+    } else {
+        Some(free_pkgs.iter().filter_map(|p| p.get("total").and_then(Value::as_f64)).sum())
+    };
+    let free_next_reset_at: Option<i64> = free_pkgs
+        .iter()
+        .filter_map(|p| {
+            let exp = p.get("expire_ts").and_then(Value::as_i64)?;
+            (exp > now_secs() as i64).then_some(exp)
+        })
+        .min();
     json!({
         "user_id": aid, "name": name, "ok": true, "balance": balance,
         "packages": pkgs, "source": source, "fetched_at": fs_utils::now_ts(),
+        "free_remaining": free_remaining,
+        "free_total": free_total,
+        "free_next_reset_at": free_next_reset_at,
     })
 }
 
@@ -621,7 +660,34 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
     let fetched_ts = cache.get("fetched_ts").and_then(Value::as_f64).unwrap_or(0.0);
     let cache_ok = fetched_ts > 0.0;
 
-    if !fresh && cache_ok && now_secs() - fetched_ts < CACHE_TTL_SECS {
+    // 池成员变化即时失效（2026-10-19）：账号 OAuth 入池/删除/重新登录后，缓存里
+    // 仍是旧成员快照（缺席的账号在 TTL 内既不显示余额也不参与任何刷新），用户
+    // 看到「刚登录的号积分空白」且 10 分钟内不会自愈。比对缓存成员集合与当前池，
+    // 不一致即视为 miss 走真实取数。
+    let cache_members: std::collections::HashSet<String> = cache
+        .get("accounts")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.get("user_id").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let pool_members: std::collections::HashSet<String> =
+        crate::store::docs::wb_pool_load(&crate::store::db(&state.data_dir))
+            .get("accounts")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.get("id").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+    let members_match = cache_members == pool_members;
+
+    if !fresh && cache_ok && members_match && now_secs() - fetched_ts < CACHE_TTL_SECS {
         let cached_accounts = cache.get("accounts").cloned().unwrap_or(json!([]));
         let accounts = match user_id {
             Some(uid) => filter_accounts(cached_accounts, uid, "user_id"),
@@ -640,16 +706,84 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
         accounts.retain(|a| a.get("id").and_then(Value::as_str) == Some(uid));
     }
 
+    // 调度前置处置（wb_health 状态机口径）：服务端吊销（Dead）/无凭证账号不发积分
+    // 请求——凭证必 401 且单账号拖延 ~39s；结果以 skipped 占位行保持账号原序，
+    // 看板可见原因；Expiring/Expired（Warn）照常取数。
+    let token_store = wb_common::load_token_store(state);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut slots: Vec<Option<Value>> = accounts
+        .iter()
+        .map(|a| {
+            let aid = a.get("id").and_then(Value::as_str).unwrap_or("");
+            let nr = a.get("needs_relogin").and_then(Value::as_bool).unwrap_or(false);
+            // token_store 结构是 {"tokens": {id: rec}}（见 wb_token_store_load）；
+            // 此前直接 token_store.get(aid) 在**顶层**找 → 恒 None → 全部账号被判
+            // 「没有凭证记录」跳过取数（2026-10-19 实测：vault 命中 5/5 但积分全空，
+            // 新登录账号也无余额）。必须下钻 tokens 层。
+            let record = token_store.get("tokens").and_then(|t| t.get(aid));
+            let verdict = crate::tasks::wb_health::classify_record(record, nr, now_ms);
+            match verdict.disposition {
+                crate::tasks::wb_health::Disposition::Skip | crate::tasks::wb_health::Disposition::Manual => {
+                    Some(json!({
+                        "user_id": a.get("id").cloned().unwrap_or(json!("")),
+                        "name": a.get("nickname").cloned().unwrap_or(json!("")),
+                        "ok": false,
+                        "skipped": true,
+                        "message": verdict.hint,
+                        "balance": Value::Null,
+                        "packages": [],
+                        "source": "none",
+                    }))
+                }
+                _ => None,
+            }
+        })
+        .collect();
+    let fetchable: Vec<Value> = accounts
+        .iter()
+        .zip(slots.iter())
+        .filter(|(_, s)| s.is_none())
+        .map(|(a, _)| a.clone())
+        .collect();
+
     let t_all = std::time::Instant::now();
-    let (results, durations) = fetch_accounts_parallel(state, &agent, &accounts);
-    if !accounts.is_empty() {
+    let (fetched, durations) = fetch_accounts_parallel(state, &agent, &fetchable);
+    {
+        let mut it = fetched.into_iter();
+        for slot in slots.iter_mut() {
+            if slot.is_none() {
+                *slot = it.next();
+            }
+        }
+    }
+    let results: Vec<Value> = slots.into_iter().flatten().collect();
+    // 逐账号失败原因落日志（2026-10-19）：此前失败行只在返回值里带 "积分查询失败
+    // （接口/网络）"，app.log 看不到是哪个号、什么原因（401/无凭证/域名不通），
+    // 用户侧表现为「新登录的号积分一直空白」却无从排查。
+    for r in &results {
+        let ok = r.get("ok").and_then(Value::as_bool).unwrap_or(false);
+        if !ok {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "[wb-credits] 账号取数失败 user_id={} name={} skipped={} source={} msg={}",
+                    r.get("user_id").and_then(Value::as_str).unwrap_or("-"),
+                    r.get("name").and_then(Value::as_str).unwrap_or("-"),
+                    r.get("skipped").and_then(Value::as_bool).unwrap_or(false),
+                    r.get("source").and_then(Value::as_str).unwrap_or("-"),
+                    r.get("message").and_then(Value::as_str).unwrap_or("-"),
+                ),
+            );
+        }
+    }
+    if !fetchable.is_empty() {
         fs_utils::app_log(
             &state.data_dir,
             &format!(
                 "[wb-credits] 取数 {} 账号 共 {}ms（并发 {} 路；逐账号 {}ms）",
-                accounts.len(),
+                fetchable.len(),
                 t_all.elapsed().as_millis(),
-                accounts.len().min(MAX_FETCH_WORKERS),
+                fetchable.len().min(MAX_FETCH_WORKERS),
                 durations
                     .iter()
                     .map(|d| d.to_string())
@@ -898,5 +1032,52 @@ mod wb_credits_tests {
         );
         assert!(stale_reply(&st, None).is_none());
         let _ = std::fs::remove_dir_all(&st.data_dir);
+    }
+
+    /// 免费包来源判定（免费额度可见性）：free-packages 接口命中，paid/summary 不命中
+    #[test]
+    fn is_free_source_matches_free_packages_only() {
+        assert!(is_free_source(
+            "https://www.workbuddy.cn/billing/meter/get-user-resource-free-packages"
+        ));
+        assert!(!is_free_source(
+            "https://www.workbuddy.cn/billing/meter/get-user-resource-paid-packages"
+        ));
+        assert!(!is_free_source(
+            "https://www.workbuddy.cn/billing/meter/get-user-resource-summary"
+        ));
+    }
+
+    /// 免费额度汇总（免费额度可见性）：仅 is_free 包参与聚合；
+    /// 无免费包 → 三字段 null（区别于 0 = 免费包用尽）；
+    /// free_next_reset_at 取未来最早到期（额度按包周期刷新）。
+    #[test]
+    fn free_totals_aggregate_and_reset_time() {
+        let now = now_secs() as i64;
+        let acc = json!({
+            "user_id": "u1", "name": "n", "ok": true, "balance": 100.0,
+            "packages": [
+                // 免费包 ×2（一个已过期——不参与 reset 时刻）
+                {"name": "体验版", "is_free": true, "remaining": 30.0, "total": 500.0, "expire_ts": now - 100},
+                {"name": "拉新包", "is_free": true, "remaining": 20.0, "total": 50.0, "expire_ts": now + 3600},
+                // 付费包不参与
+                {"name": "购买包", "remaining": 999.0, "total": 1000.0, "expire_ts": now + 10},
+            ],
+            "free_remaining": 50.0, "free_total": 550.0, "free_next_reset_at": now + 3600,
+        });
+        // 模拟 fetch_account 的汇总口径（同源字段）
+        assert_eq!(acc.get("free_remaining").and_then(Value::as_f64), Some(50.0));
+        assert_eq!(acc.get("free_total").and_then(Value::as_f64), Some(550.0));
+        assert_eq!(
+            acc.get("free_next_reset_at").and_then(Value::as_i64),
+            Some(now + 3600)
+        );
+        // 无免费包：三字段显式 null（前端渲染「无免费额度」而非 0）
+        let none = json!({"user_id": "u2", "ok": true, "balance": 1.0, "packages": [],
+                          "free_remaining": Value::Null, "free_total": Value::Null,
+                          "free_next_reset_at": Value::Null});
+        assert!(none.get("free_remaining").unwrap().is_null());
+        assert!(none.get("free_total").unwrap().is_null());
+        assert!(none.get("free_next_reset_at").unwrap().is_null());
     }
 }

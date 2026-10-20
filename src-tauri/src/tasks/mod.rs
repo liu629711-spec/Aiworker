@@ -28,10 +28,12 @@ pub mod qoder_sign;
 pub mod qoder_upstream;
 pub mod scheduler;
 pub mod trae_checkin;
+pub mod trae_mint;
 pub mod ui_click;
 pub mod wb_checkin;
 pub mod wb_common;
 pub mod wb_credits;
+pub mod wb_health;
 
 use crate::state::AppState;
 

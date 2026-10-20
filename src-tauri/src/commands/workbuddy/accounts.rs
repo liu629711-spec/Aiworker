@@ -33,6 +33,17 @@ pub struct WorkBuddyAccountView {
     pub note: String,
     pub credits_balance: Option<f64>,
     pub credits_fetched_at: Option<String>,
+    /// 免费额度剩余 / 总量 / 下次刷新时刻（免费额度可见性；None = 无免费包）
+    pub free_remaining: Option<f64>,
+    pub free_total: Option<f64>,
+    pub free_next_reset_at: Option<i64>,
+    /// 免费模型（目录 rate=0，不消耗积分）清单 + 各模型耗尽状态
+    /// [{id,name,rate,region,exhausted_at}]；None = 尚未采集
+    pub free_models: Option<serde_json::Value>,
+    pub free_models_fetched_at: Option<String>,
+    /// 账号所属区（"overseas" / "domestic"）：取号层号池隔离与前端分区展示依据，
+    /// 判定同网关（token store 显式 domain → is_global_region）
+    pub region: String,
     /// 在线 = 本机 auth 文件当前生效账号（F-54 双态）
     pub is_current: bool,
     /// 有工具侧凭证副本或 auth 文件匹配
@@ -48,6 +59,16 @@ pub struct WorkBuddyAccountView {
     /// 共享标签 tag id 列表（account_tags 表联表填充，不改账号持久化结构，D3）
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// 凭证健康度（2026-10-18 凭证被动失效可观测性，口径唯一在 tasks::wb_health）：
+    /// "healthy" = 正常；"expiring" = access token 24h 内过期（下轮续期会刷新）；
+    /// "expired" = access token 已过期（refresh token 自愈）；"dead" = 已被服务端吊销
+    /// （needs_relogin，只能 OAuth 重扫）；"no_credential" = 无凭证。
+    /// 前端据此提前警示，不再等签到失败才发现。
+    pub credential_health: String,
+    /// access token 剩余小时数（负值＝已过期；None＝无到期信息）
+    pub credential_ttl_hours: Option<f64>,
+    /// 面向用户的一句话说明（徽标 tooltip / 处置指引）
+    pub credential_hint: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -179,6 +200,25 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
                 note: a.note.clone(),
                 credits_balance: a.credits_balance,
                 credits_fetched_at: a.credits_fetched_at.clone(),
+                free_remaining: a.free_remaining,
+                free_total: a.free_total,
+                free_next_reset_at: a.free_next_reset_at,
+                free_models: a.free_models.clone(),
+                free_models_fetched_at: a.free_models_fetched_at.clone(),
+                // 区域判定与网关取号同源：token store 显式 domain → is_global_region
+                region: {
+                    let d = store_tokens
+                        .get(&a.id)
+                        .and_then(|r| fs_utils::dig(r, &["domain"]))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    if crate::tasks::wb_common::is_global_region(&d) {
+                        "overseas".to_string()
+                    } else {
+                        "domestic".to_string()
+                    }
+                },
                 is_current: auth_uid.is_some() && auth_uid == Some(a.uid.clone()),
                 has_credential: has_cred,
                 has_snapshot: has_snapshot,
@@ -186,6 +226,33 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
                 is_current_workbuddy: cur_wb.as_deref() == Some(a.id.as_str()),
                 is_current_codebuddy: cb_live_id.as_deref() == Some(a.id.as_str()),
                 tags: tag_map.get(&a.id).cloned().unwrap_or_default(),
+                credential_health: {
+                    // 状态推导唯一入口（tasks::wb_health）：优先级
+                    // 无凭证 > 服务端吊销 > 过期 > 临期 > 健康。
+                    // 吊销 ≠ 过期——前者续期无解（必须 OAuth 重扫），后者有 refresh
+                    // token 时下次调用即自愈，两者处置完全不同。
+                    let verdict = crate::tasks::wb_health::classify_record(
+                        store_tokens.get(&a.id),
+                        a.needs_relogin,
+                        chrono::Utc::now().timestamp_millis(),
+                    );
+                    serde_json::to_value(verdict.health)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_else(|| "healthy".into())
+                },
+                credential_ttl_hours: crate::tasks::wb_health::classify_record(
+                    store_tokens.get(&a.id),
+                    a.needs_relogin,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .ttl_hours,
+                credential_hint: crate::tasks::wb_health::classify_record(
+                    store_tokens.get(&a.id),
+                    a.needs_relogin,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .hint,
             }
         })
         .collect();
@@ -666,6 +733,9 @@ pub(crate) fn wb_upstream_accounts(state: &AppState) -> Vec<crate::api_server::p
         if token.is_empty() {
             continue;
         }
+        // 区域判定只信 token store 显式 domain（OAuth 选区/导入写入）；
+        // 不做 auth 文件兜底——auth.domain 是客户端产品域，国内账号在海外版
+        // 客户端登录时会被误判海外（教训见 tasks::wb_common::effective_domain 注释）
         let domain = as_str(fs_utils::dig(&rec, &["domain"])).unwrap_or_default();
         let eid = as_str(fs_utils::dig(&rec, &["enterprise_id", "enterpriseId"])).unwrap_or_default();
         out.push(crate::api_server::pool::WbSyncAccount {
@@ -674,7 +744,7 @@ pub(crate) fn wb_upstream_accounts(state: &AppState) -> Vec<crate::api_server::p
             token,
             domain: domain.clone(),
             enterprise_id: eid,
-            global_region: domain.contains(".workbuddy.ai"),
+            global_region: crate::tasks::wb_common::is_global_region(&domain),
             credits: a.credits_balance,
             credits_expire_at: a.credits_expire_at,
             // 条目级快照采集时间（issue #91 缓存保鲜）：宽容解析 → unix 秒（B1），

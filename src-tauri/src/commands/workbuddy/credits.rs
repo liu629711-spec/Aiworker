@@ -10,7 +10,7 @@ use crate::commands::usage_history::{UsageSessionView, UsageSessionsResult};
 use crate::fs_utils;
 use crate::state::AppState;
 
-use super::common::{as_str, auth_file_path_of, load_pool, save_pool};
+use super::common::{as_str, auth_file_path_of, load_pool, save_pool, WorkBuddyAccount};
 
 // ── M5 积分（F-20/F-22，python 三件套 + 缓存）──────────────────────────────
 
@@ -146,7 +146,43 @@ fn write_back_pool_balances(state: &AppState, parsed: &Value) {
                 // 最早积分包到期（issue #28 API 网关调度口径，Buddy 不分包类型）：
                 // 仅成功取数的账号回写
                 a.credits_expire_at = earliest_pack_expire(acc, now_ts);
+                // 免费额度三元组（免费额度可见性）：无免费包时 sources 显式 null
+                //（区别于 0 = 免费包已用尽）
+                a.free_remaining = acc.get("free_remaining").and_then(|v| v.as_f64());
+                a.free_total = acc.get("free_total").and_then(|v| v.as_f64());
+                a.free_next_reset_at = acc.get("free_next_reset_at").and_then(|v| v.as_i64());
             }
+        }
+        // 免费模型清单回写（免费额度可见性，账号级同源）：**按账号区域**取各自
+        // 目录的 rate=0 快照（分区目录，修复「海外号显示国内免费模型」）——
+        // 区域判定只信 token store 显式 domain（OAuth 选区/导入写入），
+        // auth 文件 domain 是客户端产品域不采信（教训见 effective_domain 注释）。
+        // 保留既有 exhausted_at（额度错误码驱动的耗尽标注）——刷新不抹掉耗尽历史。
+        let store: serde_json::Value = crate::tasks::wb_common::load_token_store(state);
+        let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
+        let region_free = |a: &WorkBuddyAccount| -> Vec<Value> {
+            let domain = tokens
+                .get(&a.id)
+                .and_then(|r| fs_utils::dig(r, &["domain"]))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            crate::api_server::wb_catalog::free_models_for(&state.data_dir, crate::tasks::wb_common::is_global_region(domain))
+        };
+        let now_iso = fs_utils::now_iso();
+        for a in pool.accounts.iter_mut() {
+            let free_models = region_free(a);
+            // 区域目录为空（如海外目录尚未首次刷新）时写空快照——显式「无」
+            // 优于残留另一区域的错误清单（merge 空 fresh 即清空）
+            // 既有快照（Option<Value>）：取数组部分参与合并，非数组视作空
+            let prev: Vec<Value> = a
+                .free_models
+                .as_ref()
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+            a.free_models =
+                Some(Value::Array(crate::tasks::qoder_upstream::merge_free_models(&prev, &free_models)));
+            a.free_models_fetched_at = Some(now_iso.clone());
         }
         if let Err(e) = save_pool(state, &pool) {
             // 缓存级回填失败不中断主流程，但落日志不静默（对齐代码库写失败落 app_log 惯例）
@@ -231,7 +267,9 @@ fn backfill_edition_from_payment_type(state: &AppState) -> usize {
             continue;
         };
         let domain = as_str(fs_utils::dig(rec, &["domain"])).unwrap_or_default();
-        let base = if domain.contains("workbuddy.ai") {
+        // 区域判定统一走 is_global_region（修复：旧 contains(".workbuddy.ai") 漏
+        // codebuddy.ai 域族与无点裸域 → 海外号误判 CN 打国内网关）
+        let base = if crate::tasks::wb_common::is_global_region(&domain) {
             "https://www.workbuddy.ai"
         } else {
             "https://www.workbuddy.cn"
@@ -722,6 +760,14 @@ pub(crate) fn workbuddy_usage_official_impl(
         .or_else(|| tokens.keys().find_map(|k| pick(k)))
         .ok_or("无可用账号凭证（请先在账号管理导入/扫码入池并续期）")?;
     let (acct_id, token, domain) = chosen;
+    // domain 兜底（修复1）：token store 无 domain 的存量账号，按桌面 auth 文件
+    // 当前登录态（uid 匹配才采信）兜底区域域名，避免海外号误走 CN billing 域
+    let domain = if domain.is_empty() {
+        let uid = pool.accounts.iter().find(|a| a.id == acct_id).map(|a| a.uid.as_str()).unwrap_or("");
+        crate::tasks::wb_common::effective_domain(&state, &acct_id, uid)
+    } else {
+        domain
+    };
 
     // 缓存命中条件（审查 P1）：状态存在 + 10min 内 + 缓存 account_id 与本次解析账号一致；
     // 不一致或旧缓存缺 account_id 一律视为未命中，重新按当前账号拉取。
@@ -788,9 +834,9 @@ fn usage_official_fetch(
     token: &str,
     domain: &str,
 ) -> Result<(serde_json::Value, Vec<WbSessionRow>), String> {
-    // 区域路由（T4.5/F-36，§5.2）：Global 账号（domain 含 workbuddy.ai）billing
-    // 全走 www.workbuddy.ai；CN 账号维持既有 workbuddy.cn 网关。
-    let base = if domain.contains("workbuddy.ai") {
+    // 区域路由（T4.5/F-36，§5.2）：Global 账号 billing 全走 www.workbuddy.ai；
+    // CN 账号维持既有 workbuddy.cn 网关。判定统一走 is_global_region（修复2）。
+    let base = if crate::tasks::wb_common::is_global_region(domain) {
         "https://www.workbuddy.ai".to_string()
     } else if domain.is_empty() {
         "https://www.workbuddy.cn".to_string()
@@ -1041,17 +1087,39 @@ pub(crate) fn workbuddy_usage_official_all_impl(
     let pool = load_pool(state);
     let mut list: Vec<(String, String, String)> = Vec::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // domain 兜底（修复1）：凭证记录缺 domain 时按桌面 auth 文件登录态兜底
+    // （uid 匹配才采信），海外存量账号 billing 不再误走 CN 域
+    let domain_of = |id: &str, rec_domain: String| -> String {
+        if !rec_domain.is_empty() {
+            return rec_domain;
+        }
+        let uid = pool
+            .accounts
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.uid.clone())
+            .or_else(|| {
+                tokens
+                    .get(id)
+                    .and_then(|r| as_str(fs_utils::dig(r, &["uid"])))
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_default();
+        crate::tasks::wb_common::effective_domain(state, id, &uid)
+    };
     for a in &pool.accounts {
-        if let Some(t) = pick(&a.id) {
+        if let Some((id, token, d)) = pick(&a.id) {
+            let d = domain_of(&id, d);
             if seen_ids.insert(a.id.clone()) {
-                list.push(t);
+                list.push((id, token, d));
             }
         }
     }
     for id in tokens.keys() {
-        if let Some(t) = pick(id) {
+        if let Some((id, token, d)) = pick(id) {
+            let d = domain_of(&id, d);
             if seen_ids.insert(id.clone()) {
-                list.push(t);
+                list.push((id, token, d));
             }
         }
     }
@@ -1409,9 +1477,17 @@ pub fn workbuddy_activity_info(
             "banners": banners, "errors": [], "fetched_at_ms": chrono::Utc::now().timestamp_millis(),
         }));
     };
+    // domain 兜底（修复1）：凭证记录缺 domain 时按桌面 auth 文件登录态兜底
+    // （uid 匹配才采信），海外存量账号 activity/billing 不再误走 CN 域
+    let domain = if domain.is_empty() {
+        let uid = pool.accounts.iter().find(|a| a.id == acct_id).map(|a| a.uid.as_str()).unwrap_or("");
+        crate::tasks::wb_common::effective_domain(&state, &acct_id, uid)
+    } else {
+        domain
+    };
 
-    // 区域路由（F-36，§5.2）：billing/activity 随账号 domain
-    let base = if domain.contains("workbuddy.ai") {
+    // 区域路由（F-36，§5.2）：billing/activity 随账号 domain（判定统一走 is_global_region，修复2）
+    let base = if crate::tasks::wb_common::is_global_region(&domain) {
         "https://www.workbuddy.ai".to_string()
     } else {
         "https://www.workbuddy.cn".to_string()

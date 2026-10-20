@@ -26,6 +26,11 @@ use crate::fs_utils;
 /// 授权页基址（需求方实测样例：qoder.cn/device/selectAccounts）
 pub const DEVICE_AUTH_BASE: &str = "https://qoder.cn/device/selectAccounts";
 
+/// 海外区授权页基址（2026-10-17 实测：`qoder.com/device/selectAccounts` 返回
+/// 200，与 CN 页同路径；注意授权页域是 qoder.com —— qoder.sh 主站直连不通，
+/// 仅 api3.qoder.sh / openapi.qoder.sh 等 API 子域可达）。
+pub const DEVICE_AUTH_BASE_GLOBAL: &str = "https://qoder.com/device/selectAccounts";
+
 /// 授权页 client_id（官方注册常量，新版 Qoder CN 客户端 `authClientIds.prod`）。
 /// 实测 2026-10-02：随机生成 client_id 会被授权页判「参数无效」；社区实现
 /// （10router/cockpit-tools）则完全省略该参数，两者均为可行方案。
@@ -48,22 +53,32 @@ pub struct DeviceFlow {
     pub client_id: Option<String>,
     /// 授权页完整 URL（challenge = BASE64URL(SHA256(verifier))，S256）
     pub auth_url: String,
+    /// 账号所属区（false=国内 / true=海外）：轮询基址随区（openapi.qoder.com.cn
+    /// vs openapi.qoder.sh）；凭证落库时随行盖章（global_region）
+    pub global: bool,
 }
 
 impl DeviceFlow {
     /// 常规模式：携带官方注册固定 client_id（与真实客户端跳转逐字一致）
     pub fn new() -> Self {
-        Self::build(true)
+        Self::build(true, false)
     }
 
     /// 兼容模式：不带 client_id（2026-10-02 审查预案落地）——官方常量一旦被
     /// Qoder 轮换导致授权页「参数无效」，改用本模式即可恢复（前端在授权超时后
     /// 自动切换到本模式重试）。
     pub fn new_compat() -> Self {
-        Self::build(false)
+        Self::build(false, false)
     }
 
-    fn build(with_client_id: bool) -> Self {
+    /// 区域化构造（2026-10-17 海外接入）：`global=true` 走 qoder.com 授权页 +
+    /// openapi.qoder.sh 轮询。海外区**不带 client_id**（全球客户端注册常量未
+    /// 实测获取，社区实现的免 client_id 形态两区通用）。
+    pub fn new_region(global: bool, compat: bool) -> Self {
+        Self::build(!compat && !global, global)
+    }
+
+    fn build(with_client_id: bool, global: bool) -> Self {
         // verifier：双 uuid v4 拼接 = 64 hex 字符（抓包样本同为 64 字符长度量级）
         let verifier = format!(
             "{}{}",
@@ -77,13 +92,14 @@ impl DeviceFlow {
         // challenge：BASE64URL_NO_PAD(SHA256(verifier))（PKCE S256）
         let digest = Sha256::digest(verifier.as_bytes());
         let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+        let base = if global { DEVICE_AUTH_BASE_GLOBAL } else { DEVICE_AUTH_BASE };
         let mut url = format!(
-            "{DEVICE_AUTH_BASE}?challenge={challenge}&challenge_method=S256&nonce={nonce}&machine_id={machine_id}"
+            "{base}?challenge={challenge}&challenge_method=S256&nonce={nonce}&machine_id={machine_id}"
         );
         if let Some(cid) = &client_id {
             url.push_str(&format!("&client_id={cid}"));
         }
-        Self { nonce, verifier, machine_id, client_id, auth_url: url }
+        Self { nonce, verifier, machine_id, client_id, auth_url: url, global }
     }
 }
 
@@ -98,7 +114,7 @@ impl Default for DeviceFlow {
 pub fn poll_once(agent: &ureq::Agent, flow: &DeviceFlow) -> (u16, Option<Value>) {
     let url = format!(
         "{}/api/v1/deviceToken/poll?nonce={}&verifier={}&challenge_method=S256",
-        qoder_common::OPEN_API_BASE,
+        qoder_common::open_api_base(flow.global),
         flow.nonce,
         urlencode(&flow.verifier)
     );

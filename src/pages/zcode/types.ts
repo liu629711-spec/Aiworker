@@ -120,37 +120,3 @@ export interface BatchDone {
   ok: number;
   fail: number;
 }
-
-/* ===== WorkBuddy 多账号(国内/海外) ===== */
-
-/** 从会话文件明文字段解析出的登录信息 */
-export interface WbSessionMeta {
-  uid: string;
-  uin: string | null;
-  domain: string | null;
-  /** domestic=国内(www.workbuddy.cn) / overseas=海外(www.workbuddy.ai) */
-  region: "domestic" | "overseas";
-}
-
-/** 已捕获的 WorkBuddy 账号(一份官方会话文件快照) */
-export interface WbAccount {
-  id: number;
-  uid: string;
-  label: string | null;
-  uin: string | null;
-  region: string;
-  domain: string | null;
-  captured_at: number;
-  is_current: boolean;
-}
-
-/** WorkBuddy 当前状态(serde flatten:登录时 meta 字段平铺在顶层) */
-export interface WbStatus {
-  logged_in: boolean;
-  running: boolean;
-  exe_found: string | null;
-  uid?: string;
-  uin?: string | null;
-  domain?: string | null;
-  region?: "domestic" | "overseas";
-}

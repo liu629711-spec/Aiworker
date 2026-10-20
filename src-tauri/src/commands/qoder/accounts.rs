@@ -29,6 +29,10 @@ pub struct QoderAccountView {
     pub note: String,
     pub credits_balance: Option<f64>,
     pub credits_fetched_at: Option<String>,
+    /// 免费档模型清单 + 额度耗尽状态（免费额度可见性；None = 尚未采集）
+    pub free_models: Option<serde_json::Value>,
+    /// 免费额度信息刷新时刻（ISO8601）
+    pub free_models_fetched_at: Option<String>,
     /// token store 中有可用凭证
     pub has_credential: bool,
     /// token 种类徽标：pat | client | unknown（脱敏，不含 token 本体）
@@ -40,6 +44,8 @@ pub struct QoderAccountView {
     /// 共享标签 tag id 列表（account_tags 表联表填充，不改账号持久化结构，D3）
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// 账号所属区："cn"（含存量空值）| "global"——前端区域徽标 + 免费档分区展示
+    pub region: String,
 }
 
 fn account_tags_for(state: &AppState, id: &str) -> Vec<String> {
@@ -79,6 +85,8 @@ fn view_of(a: &QoderAccount, tokens: &Value, tags: Vec<String>) -> QoderAccountV
         note: a.note.clone(),
         credits_balance: a.credits_balance,
         credits_fetched_at: a.credits_fetched_at.clone(),
+        free_models: a.free_models.clone(),
+        free_models_fetched_at: a.free_models_fetched_at.clone(),
         has_credential: has_token,
         token_kind: kind,
         fingerprint: a
@@ -89,6 +97,9 @@ fn view_of(a: &QoderAccount, tokens: &Value, tags: Vec<String>) -> QoderAccountV
             .map(|p| p.machine_id.chars().take(8).collect::<String>()),
         device_profile: a.device_profile.clone(),
         tags,
+        // 存量账号无 region 字段（空串）按国内处理——区域语义唯一权威是
+        // 登录入口盖章，空值恒等价 "cn"
+        region: if a.region.is_empty() { "cn".to_string() } else { a.region.clone() },
     }
 }
 

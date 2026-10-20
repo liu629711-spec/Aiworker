@@ -250,10 +250,10 @@ export default function CustomModelsPanel({
                       {m.name}
                       {m.vendor && <Badge tone="slate" className="ml-1.5 !px-1.5 !text-[10px]">{m.vendor}</Badge>}
                     </div>
-                    {m.note && <div className="mt-0.5 max-w-48 truncate text-[11px] text-slate-400" title={m.note}>{m.note}</div>}
+                    {m.note && <div className="mt-0.5 max-w-xs break-words text-[11px] text-slate-400">{m.note}</div>}
                   </td>
-                  <td className="max-w-56 truncate py-2 pr-4 font-mono text-xs text-slate-500 dark:text-zinc-400" title={m.base_url}>
-                    {m.base_url}
+                  <td className="py-2 pr-4 font-mono text-xs text-slate-500 dark:text-zinc-400">
+                    <span className="break-all">{m.base_url}</span>
                   </td>
                   <td className="py-2 pr-4 font-mono text-xs text-slate-500 dark:text-zinc-400">
                     {m.api_key ? maskApiKey(m.api_key) : '—'}

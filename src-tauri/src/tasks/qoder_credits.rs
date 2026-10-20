@@ -392,8 +392,14 @@ fn parse_big_model(b: &Value, plan_expires_at: &str) -> BigModelParsed {
 }
 
 /// 当前余额（签到奖励差值兜底数据源）：plan + addon remaining 之和；失败 None。
-pub fn fetch_usage_balance(agent: &ureq::Agent, headers: &[(String, String)]) -> Option<f64> {
-    let url = format!("{}/sash/api/v2/me/usage", qoder_common::OPEN_API_BASE);
+/// `base` 为账号区域对应的 openapi 基址（海外号必打 openapi.qoder.sh——
+/// 2026-10-20 修复：原硬编码国内主机，海外号回读恒失败/判负）。
+pub fn fetch_usage_balance(
+    agent: &ureq::Agent,
+    headers: &[(String, String)],
+    base: &str,
+) -> Option<f64> {
+    let url = format!("{base}/sash/api/v2/me/usage");
     let (status, body, _raw) = qoder_common::get_json(agent, &url, headers);
     if status != 200 {
         return None;
@@ -439,7 +445,9 @@ fn fetch_account(
         return row;
     }
     let headers = qoder_common::build_auth_headers(&creds);
-    let url = format!("{}/sash/api/v2/me/usage", qoder_common::OPEN_API_BASE);
+    // openapi 基址按账号区域（海外账号打 openapi.qoder.sh，2026-10-17 分区接入）
+    let base = qoder_common::open_api_base(creds.global_region);
+    let url = format!("{base}/sash/api/v2/me/usage");
     let (status, body, _raw) = qoder_common::get_json(agent, &url, &headers);
     if status != 200 {
         // P3：结构化状态码随行——401 自愈判定不再依赖 message 文本匹配（message
@@ -484,7 +492,14 @@ fn fetch_account(
     let mut tried: Vec<String> = Vec::new();
     let fail_cached = per_pack_fail_hit(&aid);
     if !fail_cached {
-        for host in [qoder_common::WEB_BASE, qoder_common::OPEN_API_BASE] {
+        // 逐包明细端点按区取主机：海外账号仅探测海外 openapi（WEB_BASE 为国内
+        // 官网域，海外无已验证对应物）
+        let big_hosts: Vec<&str> = if creds.global_region {
+            vec![qoder_common::open_api_base(true)]
+        } else {
+            vec![qoder_common::WEB_BASE, qoder_common::OPEN_API_BASE]
+        };
+        for host in big_hosts {
             let big_url = format!("{host}/api/v2/me/usages/big_model_credits");
             let (bs, bb, _) = qoder_common::get_json(agent, &big_url, &headers);
             if bs == 200 {
@@ -745,6 +760,23 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
             // 最早积分包到期（issue #102 网关智能调度数据源；None = 响应未携带，
             // 键值随每次回写覆盖不留 stale）
             a["credits_expire_at"] = row.get("credits_expire_at").cloned().unwrap_or(Value::Null);
+            // 免费档模型清单 + 刷新时间（免费额度可见性）：目录 rate=0 的模型快照，
+            // 与余额同链路刷新（同源目录，账号间无差异）。刷新时刻 = 订阅周期
+            // 重置（nextResetAt）——上游按周期发放免费额度，无该字段时沿用
+            // credits_expire_at（最早积分包到期）。
+            let free_models = crate::tasks::qoder_upstream::free_tier_models();
+            if !free_models.is_empty() {
+                // 保留既有 exhausted_at 标注（额度错误码驱动记录，见 qoder_route），
+                // 目录刷新只换 id/name/rate/region——避免刷新即抹掉耗尽历史
+                let prev: Vec<Value> = a
+                    .get("free_models")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let merged = crate::tasks::qoder_upstream::merge_free_models(&prev, &free_models);
+                a["free_models"] = json!(merged);
+                a["free_models_fetched_at"] = json!(fs_utils::now_iso());
+            }
             // 套餐档位回填（v3.7.x）：行内 plan_tier 非空且与池内不同才更新（幂等，
             // 顺带把存量账号空套餐补齐、旧值如 "Pro Trial" 归一为展示名）
             if let Some(tier) = row

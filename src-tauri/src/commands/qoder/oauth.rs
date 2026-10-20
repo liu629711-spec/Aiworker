@@ -80,17 +80,21 @@ fn emit_done(app: &AppHandle, data_dir: &Path, ok: bool, id: &str, nickname: &st
 /// 验证可用）。官方常量被 Qoder 轮换导致授权页「参数无效」时，前端在授权超时后
 /// 自动改用本模式重试。
 #[tauri::command(async)]
-pub fn qoder_oauth_login(app: AppHandle, state: State<AppState>, compat: Option<bool>) -> Result<(), String> {
+pub fn qoder_oauth_login(
+    app: AppHandle,
+    state: State<AppState>,
+    compat: Option<bool>,
+    region: Option<String>,
+) -> Result<(), String> {
     if OAUTH_RUNNING.swap(true, Ordering::SeqCst) {
         return Err("已有 OAuth 登录在执行中，请等待完成".into());
     }
+    // 区域参数（2026-10-17 海外接入）：None/"cn" = 国内（qoder.cn 授权页），
+    // "global"/"overseas" = 海外（qoder.com 授权页 + openapi.qoder.sh 轮询）
+    let global = matches!(region.as_deref(), Some("global") | Some("overseas"));
     // 复位取消标志（上一轮会话的取消请求不应影响本次登录）
     OAUTH_CANCEL.store(false, Ordering::SeqCst);
-    let flow = if compat.unwrap_or(false) {
-        qoder_oauth::DeviceFlow::new_compat()
-    } else {
-        qoder_oauth::DeviceFlow::new()
-    };
+    let flow = qoder_oauth::DeviceFlow::new_region(global, compat.unwrap_or(false));
     let auth_url = flow.auth_url.clone();
     emit_progress(&app, "init", "正在打开 Qoder 授权页…", Some(&auth_url));
     if let Err(e) = open_in_browser(&auth_url) {
@@ -151,7 +155,7 @@ pub fn qoder_oauth_login(app: AppHandle, state: State<AppState>, compat: Option<
                         //（userinfo/plan 拉取）与 vault 落库，慢网下 30s+ 无事件会被
                         // 用户当作卡死而反复重试/取消——先报「已授权」再导入
                         emit_progress(&app2, "importing", "授权成功，正在导入账号凭证…", None);
-                        match import_device_creds(&state2, creds, &uid) {
+                        match import_device_creds(&state2, creds, &uid, flow.global) {
                             Ok((id, nickname)) => {
                                 fs_utils::app_log(&state2.data_dir, &format!("qoder OAuth 登录成功: {id}"));
                                 // 网关池热重载：重登清除 needs_relogin / 新账号入池后
@@ -214,17 +218,22 @@ pub fn qoder_oauth_cancel() -> Result<(), String> {
 /// 设备流凭证入库：幂等入池（uid 优先匹配，防重复）+ token store + userinfo/plan 回填。
 /// 返回 (id, 展示名)。命中已有账号保留原 id（I10：换发派生 id 漂移会使
 /// 快照/分组/外部引用悬空，对照蓝本 merge_auth_entry 的取舍）。
+/// `global`：账号所属区——userinfo/plan 探测基址随区，落库时随行盖章
+/// （token store `global_region` + 池行 `region`，网关取号/刷新/积分全链路依据）。
 fn import_device_creds(
     state: &AppState,
     mut creds: qoder_common::QoderCreds,
     uid: &str,
+    global: bool,
 ) -> Result<(String, String), String> {
     let id = account_id_of(&creds.access_token);
+    creds.global_region = global;
     // userinfo/plan 回填（失败容错：dt- 对 openapi 端点的可用性随客户端一致）
     let agent = http_agent(15);
     let probe = qoder_common::QoderCreds {
         access_token: creds.access_token.clone(),
         kind: "client".into(),
+        global_region: global,
         ..Default::default()
     };
     let (info_uid, nickname) = qoder_common::fetch_userinfo(&agent, &probe);
@@ -269,6 +278,9 @@ fn import_device_creds(
             }
             a.needs_relogin = false;
             a.relogin_reason = String::new();
+            // 区域盖章（2026-10-17 海外接入）：账号入池即固化所属区；已有账号
+            // 重登时同步刷新（登录入口的区域就是账号区域的权威来源）
+            a.region = if global { "global".into() } else { "cn".into() };
             // 指纹回填（幂等：已有稳定绑定不覆盖，§5.10）
             if a.device_profile.is_none() {
                 a.device_profile = Some(crate::tasks::qoder_device::QoderDeviceProfile::generate());
@@ -281,6 +293,7 @@ fn import_device_creds(
                 nickname: display.clone(),
                 plan: tier,
                 credential_source: "client".into(),
+                region: if global { "global".into() } else { "cn".into() },
                 // 入池即生成稳定指纹（§5.10：一次生成永不轮换）
                 device_profile: Some(crate::tasks::qoder_device::QoderDeviceProfile::generate()),
                 ..Default::default()

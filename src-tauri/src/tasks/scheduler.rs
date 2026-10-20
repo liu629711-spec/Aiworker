@@ -63,8 +63,12 @@ const TASKS: &[SchedTask] = &[
     // WorkBuddy 每日成长（任务配置页）：默认 09:00 可改（settings.wb_growth_hhmm）；
     // 成长三开关驱动（旅行/盲盒/任务），全关时空轮无副作用
     SchedTask { key: "wb-growth", name: "WorkBuddy 每日成长", hhmm: "09:00", kind: "fix" },
-    // F-09 兜底续期：lazy 24h（到期前 24h 内才真正刷新），每天跑一次是安全超集
-    SchedTask { key: "wb-renew", name: "WorkBuddy token 兜底续期", hhmm: "10:30", kind: "fix" },
+    // F-09 兜底续期：2026-10-18 由「每日 10:30 / lazy 24h」改为每 6 小时 / lazy 12h。
+    // 动机：service 端会在**别处登录**时吊销旧 refresh token，原先最长 24h 的
+    // 刷新窗口意味着凭证可以“哑火”一整天而工具无感知（实测 2026-10-17 两账号
+    // 在签到时才暴露）。6h 轮换 + 12h 门槛把无感知窗口压到半天内；新轮换出的
+    // refresh token 也会更及时落库。
+    SchedTask { key: "wb-renew", name: "WorkBuddy token 兜底续期", hhmm: "10:30", kind: "refresh" },
     SchedTask { key: "doubao-keepalive", name: "豆包会话每日续期", hhmm: "09:20", kind: "fix" },
     SchedTask { key: "doubao-quota", name: "豆包会员额度每日巡检", hhmm: "09:30", kind: "fix" },
     // F-80 Qoder 每日签到：默认 10:15 单次覆盖「0 点签到」与「10:00 登录奖励」双活动
@@ -497,8 +501,10 @@ fn run_task(
         }
         // Trae JWT 定时续期（issue #27）：与 `--task-run trae-renew` 同款（lazy 48h 惰性门）
         "trae-renew" => crate::commands::accounts::renew_due_accounts_impl(st),
-        // WorkBuddy token 兜底续期：与 `--task-run wb-renew` 同款（lazy 24h）
-        "wb-renew" => Ok(super::wb_checkin::run_renew_only(st, 24)),
+        // WorkBuddy token 兜底续期：lazy 12h（2026-10-18 收紧，原 24h）——access
+        // token 剩 <12h 即主动轮换，压缩「长窗口内 refresh token 被服务端吊销」
+        // 的暴露面；单纯过期可自愈（refresh token 尚存时刷新即换新）。
+        "wb-renew" => Ok(super::wb_checkin::run_renew_only(st, 12)),
         // F-80 Qoder 每日签到：与 `--task-run qoder-checkin` 同款；抢轮次锁与 UI 路径互斥
         "qoder-checkin" => {
             // 抢不到轮次锁（UI 路径正在签到）= 幂等跳过而非失败：返 Err 会被调度器记

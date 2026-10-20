@@ -21,6 +21,7 @@ import {
   CircleAlert,
   Info,
   KeyRound,
+  Globe,
 } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge, EmptyState, StatCard } from '../../components/ui';
@@ -29,6 +30,8 @@ import { accountsApi, onAccountsChanged } from './api/accounts';
 import { monitorApi, onRefreshing, onSnapshot } from './api/monitor';
 import type { Refreshing } from './api/monitor';
 import SecretsPanel from './SecretsPanel';
+import WbOverseasPanel from './WbOverseasPanel';
+import OverseasPoolPanel from './OverseasPoolPanel';
 import { fmtExpire, fmtTime, fmtUnits } from './format';
 import type { Account, AccountLive, Snapshot } from './types';
 
@@ -465,7 +468,7 @@ export default function ZCodePage() {
   const [switching, setSwitching] = useState<Set<number>>(new Set());
   const [syncingInvite, setSyncingInvite] = useState(false);
   // 顶层视图切换：zcode=账号管理 / secrets=账密与批量登录
-  const [view, setView] = useState<'zcode' | 'secrets'>('zcode');
+  const [view, setView] = useState<'zcode' | 'secrets' | 'wb' | 'overseas'>('zcode');
 
   const refreshAccounts = useCallback(() => {
     accountsApi.list().then(setAccounts).catch((e) => console.error(e));
@@ -677,6 +680,8 @@ export default function ZCodePage() {
           [
             { key: 'zcode', label: 'ZCode 账号', icon: Users },
             { key: 'secrets', label: '账密 · 批量登录', icon: KeyRound },
+            { key: 'wb', label: 'Buddy 海外', icon: Globe },
+            { key: 'overseas', label: '海外号池', icon: KeyRound },
           ] as const
         ).map(({ key, label, icon: Icon }) => (
           <button
@@ -696,6 +701,10 @@ export default function ZCodePage() {
 
       {view === 'secrets' ? (
         <SecretsPanel />
+      ) : view === 'wb' ? (
+        <WbOverseasPanel />
+      ) : view === 'overseas' ? (
+        <OverseasPoolPanel />
       ) : (
         <>
           {/* 统计卡 */}

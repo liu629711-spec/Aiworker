@@ -1,3 +1,4 @@
+use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
 use tauri::{Manager, State};
@@ -187,19 +188,31 @@ pub async fn do_start(
     pool.set_strategy(strategy);
     let wb_pool = ApiPool::new();
     let qoder_pool = ApiPool::new();
-    // 冷却/禁用标记落 app.log（F-80）：三池注入 (data_dir, 池标签)，
+    let zcode_pool = ApiPool::new();
+    // 冷却/禁用标记落 app.log（F-80）：四池注入 (data_dir, 池标签)，
     // note_error 打冷却/禁用时同步写 `account cooldown: pool=…` 便于排查跨池回退链路
     pool.set_log_ctx(&state.data_dir, "trae");
     wb_pool.set_log_ctx(&state.data_dir, "buddy");
     qoder_pool.set_log_ctx(&state.data_dir, "qoder");
+    zcode_pool.set_log_ctx(&state.data_dir, "zcode");
     // 账号保留剩余积分（issue #91）：调度策略统一配置，启动时三池应用
     //（credits=0 时无过滤；Qoder 池 credits 恒 None 不受影响，保持口径一致仍设置）
     let reserve_credits = crate::api_server::dispatch::load_policy(&state.data_dir).reserve_credits;
     pool.set_reserve_credits(reserve_credits);
     wb_pool.set_reserve_credits(reserve_credits);
     qoder_pool.set_reserve_credits(reserve_credits);
-    let (pool_count, wb_uids_len, wb_accounts_total, qoder_count) =
-        apply_pool_snapshot(state, &pool, &wb_pool, &qoder_pool);
+    zcode_pool.set_reserve_credits(reserve_credits);
+    let (pool_count, wb_uids_len, wb_accounts_total, qoder_count, zcode_count) =
+        apply_pool_snapshot(state, &pool, &wb_pool, &qoder_pool, &zcode_pool);
+
+    // P1：回灌上进程的运行态冷却（pool_cooldowns 表），仅在新建池装配后一次。
+    // max 合并只延长不缩短，与 sync_from_accounts 已从 account_cooldowns 灌入的
+    // Trae until 兼容；不进 apply_pool_snapshot——热重载走增量合并已保留运行态，
+    // 重复回灌会与并发请求的冷却变更竞态。
+    pool.restore_cooldowns_from_store();
+    wb_pool.restore_cooldowns_from_store();
+    qoder_pool.restore_cooldowns_from_store();
+    zcode_pool.restore_cooldowns_from_store();
 
     let healthy_count = pool.diagnose().iter().filter(|d| d.reason.starts_with("healthy")).count();
     fs_utils::app_log(
@@ -239,6 +252,17 @@ pub async fn do_start(
             pool_file.qoder_enabled,
             qoder_count,
             qoder_strategy.as_str(),
+        ),
+    );
+
+    // ZCode 池启动概况（z.ai GLM 池）：开关默认开，账号来自 zcode.sqlite
+    // （zcode 域管理，网关只读）；无策略概念（无积分排序），固定先到先服务
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "API服务启动-ZCode上游池: enabled={} accounts={}",
+            pool_file.zcode_enabled,
+            zcode_count,
         ),
     );
 
@@ -376,6 +400,24 @@ pub async fn do_start(
         ),
         qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(pool_file.qoder_sticky_enabled),
         qoder_sticky: crate::api_server::wb_sticky::StickyStore::load_ns(&state.data_dir, "q:"),
+        // ZCode 上游（z.ai GLM OAuth 池）：专用池 + 开关 + identity 回调。
+        // 回调按次读 zcode.sqlite 该账号最新凭证（zai token 无 exp 长期有效，
+        // 无刷新链路；token 被吊销 → Err → 网关侧换号，重新登录在 zcode 域做）
+        zcode_pool: zcode_pool,
+        zcode_enabled: std::sync::atomic::AtomicBool::new(pool_file.zcode_enabled),
+        zcode_identity: Some({
+            let app = app.clone();
+            std::sync::Arc::new(move |acct_id: &str| {
+                let st = app.state::<AppState>();
+                crate::commands::zcode_pool::resolve_credentials(&st, acct_id)
+            })
+        }),
+        zcode_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(
+            pool_file.zcode_pool_sticky_ttl_secs,
+        ),
+        zcode_account_concurrency_limit: std::sync::atomic::AtomicU32::new(
+            pool_file.zcode_account_concurrency_limit,
+        ),
     });
 
     // per-pool 三参数热应用（F-76②/F-77 拆分版）：账号并发上限 / 池粘性 TTL /
@@ -726,14 +768,15 @@ fn merge_pool_expire_times(rc: &RemainingCreditsFile) -> std::collections::HashM
 }
 
 /// 池装配公共逻辑（do_start 构建 / 凭据变更热重载共用）：
-/// 读取 vault 账号 + 池配置 + 分组 + 冷却 + 积分 + 设备映射，全量重建三池内条目。
-/// 返回 (trae 池条目数, wb 白名单长度, wb 账号总数, qoder 池条目数) 供调用方记日志。
+/// 读取 vault 账号 + 池配置 + 分组 + 冷却 + 积分 + 设备映射，全量重建四池内条目。
+/// 返回 (trae 池条目数, wb 白名单长度, wb 账号总数, qoder 池条目数, zcode 池条目数) 供调用方记日志。
 fn apply_pool_snapshot(
     state: &AppState,
     pool: &ApiPool,
     wb_pool: &ApiPool,
     qoder_pool: &ApiPool,
-) -> (usize, usize, usize, usize) {
+    zcode_pool: &ApiPool,
+) -> (usize, usize, usize, usize, usize) {
     let accounts = crate::vault::load_accounts(state);
     let pool_file = load_pool_file(&state.data_dir);
     let groups_file: crate::models::GroupsFile =
@@ -855,12 +898,93 @@ fn apply_pool_snapshot(
                 .credits_fetched_at
                 .as_deref()
                 .and_then(fs_utils::parse_ts_loose),
+            // 账号所属区（2026-10-17 海外接入）：登录入口盖章 → 池条目分区过滤
+            global_region: a.region == "global",
         })
         .collect();
     let qoder_ids: Vec<String> = qoder_sync.iter().map(|a| a.uid.clone()).collect();
     let qoder_uids = effective_qoder_uids(&pool_file, &qoder_ids);
     qoder_pool.sync_from_qoder(&qoder_sync, &qoder_uids);
-    (pool.count(), wb_uids.len(), wb_accounts.len(), qoder_pool.count())
+    // 诊断（2026-10-18 海外池空池排查）：同步后 dump 内存池逐号 region/凭证/启用态
+    {
+        let lines: Vec<String> = qoder_sync
+            .iter()
+            .map(|a| {
+                format!(
+                    "{}(region={},token_len={},in_enabled={})",
+                    &a.uid[..a.uid.len().min(16)],
+                    a.global_region,
+                    a.access_token.len(),
+                    qoder_uids.contains(&a.uid)
+                )
+            })
+            .collect();
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!(
+                "[QODER-SYNC] accounts={} enabled={} :: {}",
+                qoder_sync.len(),
+                qoder_uids.len(),
+                lines.join(" ")
+            ),
+        );
+    }
+    // ZCode 池装配（z.ai GLM 池）：账号源 = zcode.sqlite accounts 表（zcode 域
+    // 管理，网关只读），无分组/标签筛选（v1 全量入池，白名单由 zcode_enabled_uids
+    // 表达）；凭证入池门槛 = zai_access_token 非空（请求期真凭证经 zcode_identity
+    // 回调按次读取最新值，池内快照仅作入池门槛与不可用时的兜底）
+    let zcode_accounts = crate::commands::zcode_pool::list_pool_accounts(state);
+    let zcode_sync: Vec<crate::api_server::pool::ZCodeSyncAccount> = zcode_accounts
+        .iter()
+        .map(|a| crate::api_server::pool::ZCodeSyncAccount {
+            uid: a.uid.clone(),
+            name: a.label.clone(),
+            access_token: a.access_token.clone(),
+            device_mid: a.device_mid.clone(),
+        })
+        .collect();
+    let zcode_ids: Vec<String> = zcode_sync.iter().map(|a| a.uid.clone()).collect();
+    let zcode_uids = effective_zcode_uids(&pool_file, &zcode_ids);
+    zcode_pool.sync_from_zcode(&zcode_sync, &zcode_uids);
+    // 诊断（同 [QODER-SYNC] 模式）：同步后 dump 逐号 token 长度/启用态
+    {
+        let lines: Vec<String> = zcode_sync
+            .iter()
+            .map(|a| {
+                format!(
+                    "{}(token_len={},in_enabled={})",
+                    a.uid,
+                    a.access_token.len(),
+                    zcode_uids.contains(&a.uid)
+                )
+            })
+            .collect();
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!(
+                "[ZCODE-SYNC] accounts={} enabled={} :: {}",
+                zcode_sync.len(),
+                zcode_uids.len(),
+                lines.join(" ")
+            ),
+        );
+    }
+    (pool.count(), wb_uids.len(), wb_accounts.len(), qoder_pool.count(), zcode_pool.count())
+}
+
+/// ZCode 池白名单生效集（对齐 effective_qoder_uids 语义）：配置非空 = 交集过滤，
+/// 空 = 全部含凭证账号入池
+fn effective_zcode_uids(pool_file: &ApiPoolFile, all_ids: &[String]) -> Vec<String> {
+    if pool_file.zcode_enabled_uids.is_empty() {
+        return all_ids.to_vec();
+    }
+    let want: std::collections::HashSet<&str> =
+        pool_file.zcode_enabled_uids.iter().map(|s| s.as_str()).collect();
+    all_ids
+        .iter()
+        .filter(|id| want.contains(id.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// 网关运行中热重载两池（凭据/成员变更联动）：OAuth 重登、refresh_token 刷新、
@@ -874,12 +998,12 @@ pub fn reload_pools_if_running(
 ) {
     let guard = safe_lock(runtime);
     let Some(rt) = guard.as_ref() else { return };
-    let (trae, wb_uids, wb_total, qoder) =
-        apply_pool_snapshot(state, &rt.shared.pool, &rt.shared.wb_pool, &rt.shared.qoder_pool);
+    let (trae, wb_uids, wb_total, qoder, zcode) =
+        apply_pool_snapshot(state, &rt.shared.pool, &rt.shared.wb_pool, &rt.shared.qoder_pool, &rt.shared.zcode_pool);
     fs_utils::app_log(
         &state.data_dir,
         &format!(
-            "API服务池热重载(凭据/成员变更联动): trae_pool={trae} wb_whitelist={wb_uids} wb_accounts={wb_total} qoder_pool={qoder}"
+            "API服务池热重载(凭据/成员变更联动): trae_pool={trae} wb_whitelist={wb_uids} wb_accounts={wb_total} qoder_pool={qoder} zcode_pool={zcode}"
         ),
     );
 }
@@ -951,6 +1075,11 @@ fn merge_pool_set(
     // Qoder 池内调度策略；空串 = 跟随 Trae 池（同 wb_strategy 语义）；None = 保留原值
     qoder_strategy: Option<String>,
     trae_enabled: Option<bool>,
+    // ZCode 池参数（z.ai GLM 池）；None = 保留原值
+    zcode_enabled: Option<bool>,
+    zcode_uids: Option<Vec<String>>,
+    zcode_account_concurrency_limit: Option<u32>,
+    zcode_pool_sticky_ttl_secs: Option<u64>,
 ) -> ApiPoolFile {
     // Trae 池白名单剥离 wb- 前缀条目：WB 账号归属独立白名单 wb_enabled_uids，
     // 旧版混存于共享 enabled_uids（历史兼容形态），保存时迁移归位防丢失
@@ -1014,6 +1143,13 @@ fn merge_pool_set(
         trae_tag_ids: existing.trae_tag_ids.clone(),
         wb_tag_ids: existing.wb_tag_ids.clone(),
         qoder_tag_ids: existing.qoder_tag_ids.clone(),
+        // ZCode 池配置：None = 保留原值，Some = 覆盖（空数组 = fail-open 全量入池）
+        zcode_enabled_uids: zcode_uids.unwrap_or_else(|| existing.zcode_enabled_uids.clone()),
+        zcode_enabled: zcode_enabled.unwrap_or(existing.zcode_enabled),
+        zcode_account_concurrency_limit: zcode_account_concurrency_limit
+            .unwrap_or(existing.zcode_account_concurrency_limit),
+        zcode_pool_sticky_ttl_secs: zcode_pool_sticky_ttl_secs
+            .unwrap_or(existing.zcode_pool_sticky_ttl_secs),
     }
 }
 
@@ -1072,6 +1208,11 @@ pub fn pool_set(
     trae_tag_ids: Option<Vec<String>>,
     wb_tag_ids: Option<Vec<String>>,
     qoder_tag_ids: Option<Vec<String>>,
+    // ZCode 池参数（z.ai GLM 池）；None = 保留原值
+    zcode_enabled: Option<bool>,
+    zcode_uids: Option<Vec<String>>,
+    zcode_account_concurrency_limit: Option<u32>,
+    zcode_pool_sticky_ttl_secs: Option<u64>,
 ) -> Result<(), String> {
     // B1（审查修复清单 v1.4.9）：api_pool 整文档覆盖写互斥——3 个写点
     // （本命令 / shared_groups ③段 / tags ③段）并发「load→merge→kv_set」互相
@@ -1110,6 +1251,10 @@ pub fn pool_set(
         qoder_group_ids,
         qoder_strategy,
         trae_enabled,
+        zcode_enabled,
+        zcode_uids,
+        zcode_account_concurrency_limit,
+        zcode_pool_sticky_ttl_secs,
     );
     // 标签筛选在 merge 后追加应用（merge_pool_set 纯函数签名不动，存量单测零改动）：
     // 显式空数组 = 清空标签筛选，None = 保留
@@ -1147,6 +1292,9 @@ pub fn pool_set(
         rt.shared
             .qoder_pool
             .set_concurrency_limit(pool_file.qoder_account_concurrency_limit);
+        rt.shared
+            .zcode_pool
+            .set_concurrency_limit(pool_file.zcode_account_concurrency_limit);
         rt.shared
             .trae_sticky
             .set_explicit_ttl(pool_file.trae_sticky_ttl_secs as i64);
@@ -1203,6 +1351,11 @@ pub fn pool_set(
             pool_file.qoder_enabled,
             std::sync::atomic::Ordering::Relaxed,
         );
+        // ZCode 上游开关热应用（z.ai GLM 池）
+        rt.shared.zcode_enabled.store(
+            pool_file.zcode_enabled,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // Qoder 竞速对冲阈值 + 会话粘性热应用（F-80-余 v2）
         rt.shared.qoder_hedge_threshold_ms.store(
             pool_file.qoder_hedge_threshold_ms,
@@ -1247,6 +1400,17 @@ pub fn qoder_pool_status(runtime: State<'_, Mutex<Option<ApiServerRuntime>>>) ->
     let guard = safe_lock(&runtime);
     match guard.as_ref() {
         Some(rt) => rt.shared.qoder_pool.status_list(),
+        None => vec![],
+    }
+}
+
+/// ZCode 池实时状态（z.ai GLM 池；含 per-account inflight 在途计数）。
+/// 服务未运行时返回空列表（前端候选列表显示「暂无上游账号候选」）
+#[tauri::command]
+pub fn zcode_pool_status(runtime: State<'_, Mutex<Option<ApiServerRuntime>>>) -> Vec<PoolStatus> {
+    let guard = safe_lock(&runtime);
+    match guard.as_ref() {
+        Some(rt) => rt.shared.zcode_pool.status_list(),
         None => vec![],
     }
 }
@@ -1392,23 +1556,49 @@ pub async fn api_wb_catalog_sync(state: State<'_, AppState>) -> Result<usize, St
 }
 
 /// WB 上游模型目录同步实现（手动命令与调度器 wb-catalog-sync 共用）：
-/// accounts 由调用方取好（wb_upstream_accounts，避免双读 pool/token store），
-/// 取首个含凭证账号拉取并替换目录；空列表时 Err（调度侧据此转静默跳过不计失败）
+/// accounts 由调用方取好（wb_upstream_accounts，避免双读 pool/token store）。
+/// 分区刷新（修复「海外账号模型目录」）：两区模型清单由上游各自下发，
+/// 各区取首个含凭证账号拉取并写入各自目录（CN/Global 两份存储，读取侧合并）；
+/// 两区均无凭证时 Err（调度侧据此转静默跳过不计失败），单区失败不影响另一区。
 pub(crate) fn wb_catalog_sync_impl(
     data_dir: &std::path::Path,
     accounts: &[crate::api_server::pool::WbSyncAccount],
 ) -> Result<usize, String> {
-    let acct = accounts
-        .first()
-        .ok_or("无可用 WB 账号凭证，无法拉取上游目录")?;
-    crate::api_server::wb_catalog::fetch_and_replace(
-        data_dir,
-        &acct.uid,
-        &acct.token,
-        &acct.domain,
-        &acct.enterprise_id,
-        acct.global_region,
-    )
+    let pick = |global: bool| {
+        accounts
+            .iter()
+            .find(|a| a.global_region == global)
+            .ok_or_else(|| format!("无{}区 WB 账号凭证，跳过该区目录", if global { "海外" } else { "国内" }))
+    };
+    let mut total = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    for global in [false, true] {
+        match pick(global) {
+            Ok(acct) => match crate::api_server::wb_catalog::fetch_and_replace(
+                data_dir,
+                &acct.uid,
+                &acct.token,
+                &acct.domain,
+                &acct.enterprise_id,
+                acct.global_region,
+            ) {
+                Ok(n) => total += n,
+                Err(e) => errors.push(format!("{}区: {e}", if global { "海外" } else { "国内" })),
+            },
+            Err(e) => errors.push(e),
+        }
+    }
+    if total > 0 {
+        if !errors.is_empty() {
+            crate::fs_utils::app_log(
+                data_dir,
+                &format!("WB 模型目录同步部分成功（{} 个模型）：{}", total, errors.join("；")),
+            );
+        }
+        Ok(total)
+    } else {
+        Err(errors.join("；"))
+    }
 }
 
 /// 列出 wb_model_catalog.json 中的 WB 模型（Buddy API 服务页展示模型 id/倍率/档位）
@@ -1454,6 +1644,277 @@ pub fn api_qoder_usage_stats(state: State<'_, AppState>, days: Option<u32>) -> V
 }
 
 // ==================== 多 API Key 命令 ====================
+
+/// 海外号池接入信息（ZCode 页「海外号池」面板，2026-10-17）：网关基址 +
+/// Buddy/Qoder 两池的海外模型清单（区域约束 Key 的可请求范围）。
+/// Buddy 取海外区目录（含两区同名模型）；Qoder 取合并目录的 global 条目。
+#[tauri::command]
+pub fn overseas_access_info(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let gs = crate::api_server::gateway_settings::load(&state.data_dir);
+    let base_url = format!("http://{}:{}/v1", gs.host, gs.port);
+    let buddy: Vec<serde_json::Value> =
+        crate::api_server::wb_catalog::list_global(&state.data_dir)
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "id": m.id,
+                    "name": if m.display.is_empty() { m.id.clone() } else { m.display.clone() },
+                    "rate": m.rate,
+                })
+            })
+            .collect();
+    let qoder: Vec<serde_json::Value> = crate::tasks::qoder_upstream::list()
+        .into_iter()
+        .filter(|m| m.get("region").and_then(serde_json::Value::as_str) == Some("global"))
+        .map(|m| {
+            serde_json::json!({
+                "id": m.get("id").and_then(serde_json::Value::as_str).unwrap_or(""),
+                "name": m.get("name").and_then(serde_json::Value::as_str).unwrap_or(""),
+                "credits": m.get("credits").and_then(serde_json::Value::as_str).unwrap_or(""),
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({ "base_url": base_url, "buddy": buddy, "qoder": qoder }))
+}
+
+// ==================== 额度中心 / 接入配置 / 连通性自测（2026-10-17）====================
+
+/// Key 生效范围内的模型清单（池绑定 + 区域约束推导，带池前缀，分组返回）。
+/// 接入配置生成与自测模型选择共用。
+fn key_scope_models(state: &AppState, entry: &crate::api_server::api_keys::ApiKeyEntry) -> Value {
+    let want_global = crate::api_server::api_keys::parse_region(&entry.region);
+    let mut out = json!({"trae": [], "buddy": [], "qoder": []});
+    if entry.bind_pool.is_empty() || entry.bind_pool == "trae" {
+        let trae: Vec<String> = crate::store::db(&state.data_dir)
+            .kv_get::<Vec<Value>>("api_models")
+            .iter()
+            .filter_map(|m| m.get("id").and_then(Value::as_str).map(|s| format!("trae/{}", s)))
+            .collect();
+        out["trae"] = json!(trae);
+    }
+    if entry.bind_pool.is_empty() || entry.bind_pool == "buddy" {
+        let models: Vec<String> = match want_global {
+            Some(true) => crate::api_server::wb_catalog::list_global(&state.data_dir)
+                .iter()
+                .map(|m| format!("buddy/{}", m.id))
+                .collect(),
+            _ => crate::api_server::wb_catalog::load(&state.data_dir)
+                .iter()
+                .map(|m| format!("buddy/{}", m.id))
+                .collect(),
+        };
+        out["buddy"] = json!(models);
+    }
+    if entry.bind_pool.is_empty() || entry.bind_pool == "qoder" {
+        let models: Vec<String> = crate::tasks::qoder_upstream::list()
+            .into_iter()
+            .filter(|m| {
+                want_global.map_or(true, |w| {
+                    m.get("region").and_then(Value::as_str) == Some(if w { "global" } else { "cn" })
+                })
+            })
+            .filter_map(|m| {
+                m.get("id")
+                    .and_then(Value::as_str)
+                    .map(|s| format!("qoder/{}", s))
+            })
+            .collect();
+        out["qoder"] = json!(models);
+    }
+    out
+}
+
+/// ① Key 连通性自测：以该 Key 真实发起一次最小对话请求（网关自调用，走完整
+/// 调度/区域约束/记账链路），返回成败 + 上游模型回显 + 账号归属（api 日志尾行）。
+#[tauri::command]
+pub async fn api_key_test(state: State<'_, AppState>, key_id: String) -> Result<Value, String> {
+    let entry = crate::api_server::api_keys::load(&state.data_dir)
+        .keys
+        .into_iter()
+        .find(|k| k.id == key_id)
+        .ok_or_else(|| format!("Key 不存在: {}", key_id))?;
+    if !entry.enabled {
+        return Ok(json!({"ok": false, "error": "该 Key 已停用", "elapsed_ms": 0}));
+    }
+    let gs = crate::api_server::gateway_settings::load(&state.data_dir);
+    let host = if gs.host.trim().is_empty() { "127.0.0.1" } else { gs.host.trim() };
+    let model = match (entry.bind_pool.as_str(), crate::api_server::api_keys::parse_region(&entry.region)) {
+        ("qoder", _) => "qoder/qwen3.8-flash",
+        ("buddy", Some(true)) => "buddy/deepseek-v4.1-flash",
+        ("buddy", _) => "buddy/hy3",
+        ("trae", _) => "trae/glm-5.3-flash",
+        (_, Some(true)) => "buddy/deepseek-v4.1-flash",
+        _ => "buddy/hy3",
+    };
+    let url = format!("http://{}:{}/v1/chat/completions", host, gs.port);
+    let body = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "回复ok即可"}],
+        "max_tokens": 64,
+        "stream": false,
+    });
+    let agent = crate::tasks::http_agent(45);
+    let key_value = entry.key.clone();
+    let key_name = entry.name.clone();
+    let started = std::time::Instant::now();
+    let resp = agent
+        .post(&url)
+        .set("Authorization", &format!("Bearer {}", key_value))
+        .set("Content-Type", "application/json")
+        .send_json(&body);
+    let elapsed = started.elapsed().as_millis() as u64;
+    match resp {
+        Ok(r) => {
+            let v: Value = r.into_json().map_err(|e| format!("响应解析失败: {}", e))?;
+            let content = v
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .chars()
+                .take(60)
+                .collect::<String>();
+            let served_model = v.get("model").and_then(Value::as_str).unwrap_or(model).to_string();
+            let (acct, uid) = last_api_log_acct(&state.data_dir, &key_name);
+            Ok(json!({
+                "ok": true, "requested": model, "model": served_model,
+                "content": content, "elapsed_ms": elapsed, "acct": acct, "uid": uid,
+            }))
+        }
+        Err(ureq::Error::Status(code, r)) => {
+            let text = r.into_string().unwrap_or_default();
+            Ok(json!({
+                "ok": false, "status": code,
+                "error": text.chars().take(240).collect::<String>(), "elapsed_ms": elapsed,
+            }))
+        }
+        Err(e) => Ok(json!({"ok": false, "error": format!("{}", e), "elapsed_ms": elapsed})),
+    }
+}
+
+/// api 日志尾行账号归属解析：按 key=<展示名>（精确段匹配，防 "Qoder" 匹配到
+/// "Qoder 海外号池"）取最近一条的 acct/uid。
+fn last_api_log_acct(data_dir: &std::path::Path, key_name: &str) -> (String, String) {
+    let date = chrono::Local::now().format("%Y-%m-%d");
+    let path = data_dir.join("logs").join(format!("api_{}.log", date));
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return (String::new(), String::new());
+    };
+    for line in text.lines().rev() {
+        let Some(i) = line.find(" key=") else { continue };
+        let rest = &line[i + 5..];
+        let name = rest.split(" pool=").next().unwrap_or("");
+        if name != key_name {
+            continue;
+        }
+        let grab = |tag: &str| {
+            rest.split(tag)
+                .nth(1)
+                .map(|s| s.split_whitespace().next().unwrap_or("").to_string())
+                .unwrap_or_default()
+        };
+        return (grab(" acct="), grab(" uid="));
+    }
+    (String::new(), String::new())
+}
+
+/// ③ Key 生效范围模型清单（接入配置生成数据源）
+#[tauri::command]
+pub fn api_key_models(state: State<'_, AppState>, key_id: String) -> Result<Value, String> {
+    let entry = crate::api_server::api_keys::load(&state.data_dir)
+        .keys
+        .into_iter()
+        .find(|k| k.id == key_id)
+        .ok_or_else(|| format!("Key 不存在: {}", key_id))?;
+    Ok(key_scope_models(&state, &entry))
+}
+
+/// ③b 直写本机 ZCode agent 供应商配置（~/.zcode/v2/provider_config.json）：
+/// 幂等新增/更新一条 provider（id=aiwork-<key_id>），写前备份。返回写入摘要。
+#[tauri::command]
+pub fn zcode_provider_write(state: State<'_, AppState>, key_id: String) -> Result<Value, String> {
+    let entry = crate::api_server::api_keys::load(&state.data_dir)
+        .keys
+        .into_iter()
+        .find(|k| k.id == key_id)
+        .ok_or_else(|| format!("Key 不存在: {}", key_id))?;
+    let models = key_scope_models(&state, &entry);
+    let mut all: Vec<String> = Vec::new();
+    for g in ["trae", "buddy", "qoder"] {
+        if let Some(arr) = models.get(g).and_then(Value::as_array) {
+            all.extend(arr.iter().filter_map(Value::as_str).map(str::to_string));
+        }
+    }
+    if all.is_empty() {
+        return Err("该 Key 生效范围内没有可写入的模型（目录为空）".into());
+    }
+    let home = std::env::var("USERPROFILE").map_err(|_| "USERPROFILE 缺失".to_string())?;
+    let path = std::path::Path::new(&home)
+        .join(".zcode")
+        .join("v2")
+        .join("provider_config.json");
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("读取 ZCode 配置失败: {}", e))?;
+    let mut cfg: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("ZCode 配置非 JSON: {}", e))?;
+    let bak = path.with_extension(format!(
+        "json.bak-{}",
+        chrono::Local::now().format("%Y%m%d%H%M%S")
+    ));
+    let _ = std::fs::copy(&path, &bak);
+    let pid = format!("aiwork-{}", key_id);
+    let gs = crate::api_server::gateway_settings::load(&state.data_dir);
+    let provider = json!({
+        "providerId": pid,
+        "providerName": entry.name,
+        "config": {
+            "group": "standard-personal",
+            "access": {"type": "api-key", "apiKey": entry.key},
+            "api": {"type": "anthropic-messages", "baseUrl": format!("http://127.0.0.1:{}/v1", gs.port)},
+            "personalModelIds": all,
+            "modelOrder": all,
+        },
+    });
+    let cfg_obj = cfg
+        .get_mut("config")
+        .and_then(Value::as_object_mut)
+        .ok_or("ZCode 配置缺 config 段")?;
+    let rules = cfg_obj
+        .get_mut("providerConfigRules")
+        .and_then(Value::as_object_mut)
+        .ok_or("ZCode 配置缺 providerConfigRules 段")?;
+    let list = rules.entry("providerRules").or_insert_with(|| json!([]));
+    let arr = list.as_array_mut().ok_or("providerRules 非数组")?;
+    match arr
+        .iter_mut()
+        .find(|r| r.get("providerId").and_then(Value::as_str) == Some(pid.as_str()))
+    {
+        Some(r) => *r = provider,
+        None => arr.push(provider),
+    }
+    let order = cfg_obj.entry("providerOrder").or_insert_with(|| json!([]));
+    if let Some(oarr) = order.as_array_mut() {
+        if !oarr.iter().any(|v| v.as_str() == Some(pid.as_str())) {
+            oarr.push(json!(pid));
+        }
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("写入 ZCode 配置失败: {}", e))?;
+    let _ = crate::fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "已写入 ZCode agent 供应商配置: {}（{} 个模型，备份 {:?}）",
+            pid,
+            all.len(),
+            bak
+        ),
+    );
+    Ok(json!({"ok": true, "provider_id": pid, "models": all.len(), "backup": bak.to_string_lossy()}))
+}
+
+/// ② 免费模型用量计数快照（额度中心数据源）
+#[tauri::command]
+pub fn free_usage_snapshot(state: State<'_, AppState>) -> Result<Value, String> {
+    Ok(crate::api_server::free_usage::snapshot(&state.data_dir))
+}
 
 /// 读取 API Key 列表与鉴权开关
 #[tauri::command]
@@ -1568,7 +2029,7 @@ pub fn api_unified_models(
     runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
     available_only: Option<bool>,
 ) -> Vec<crate::api_server::unified_catalog::UnifiedModel> {
-    let (wb_enabled, qoder_enabled, trae_ok, buddy_ok, qoder_ok) = match safe_lock(&runtime).as_ref() {
+    let (wb_enabled, qoder_enabled, zcode_enabled, trae_ok, buddy_ok, qoder_ok, zcode_ok) = match safe_lock(&runtime).as_ref() {
         Some(rt) => {
             let s = &rt.shared;
             (
@@ -1576,16 +2037,19 @@ pub fn api_unified_models(
                     .load(std::sync::atomic::Ordering::Relaxed),
                 s.qoder_enabled
                     .load(std::sync::atomic::Ordering::Relaxed),
+                s.zcode_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed),
                 // Trae 开关（默认开）参与可用性：关闭时 Trae 源徽章置灰
                 s.trae_enabled.load(std::sync::atomic::Ordering::Relaxed)
                     && s.pool.has_selectable(),
                 s.wb_pool.has_selectable(),
                 s.qoder_pool.has_selectable(),
+                s.zcode_pool.has_selectable(),
             )
         }
         None => {
             let pf: ApiPoolFile = crate::store::db(&state.data_dir).kv_get("api_pool");
-            (pf.wb_enabled, pf.qoder_enabled, pf.trae_enabled, true, true)
+            (pf.wb_enabled, pf.qoder_enabled, pf.zcode_enabled, pf.trae_enabled, true, true, true)
         }
     };
     let data_dir = state.data_dir.clone();
@@ -1595,6 +2059,7 @@ pub fn api_unified_models(
         trae_ok,
         buddy_ok,
         Some((qoder_enabled, qoder_ok)),
+        Some((zcode_enabled, zcode_ok)),
     );
     if available_only.unwrap_or(false) {
         list.retain(|m| m.sources.iter().any(|s| s.enabled));
@@ -1789,8 +2254,10 @@ pub async fn custom_model_test(
     if !cm.base_url.starts_with("http://") && !cm.base_url.starts_with("https://") {
         return Err("API 地址必须以 http:// 或 https:// 开头".into());
     }
+    // 普通上游 30s（连接 10s + 首字 10s + 出字余量）
+    let timeout_secs = 30;
     let handle = tokio::task::spawn_blocking(move || crate::api_server::custom_route::probe(&cm));
-    match tokio::time::timeout(std::time::Duration::from_secs(30), handle).await {
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), handle).await {
         Ok(Ok(result)) => result,
         Ok(Err(e)) => Err(format!("测试任务失败: {e}")),
         Err(_) => Err("测试超时（30 秒）".into()),
@@ -1921,6 +2388,10 @@ mod pool_merge_tests {
             qoder_strategy: "p2c".into(),
             qoder_enabled_uids: vec!["qd-1".into()],
             qoder_group_ids: Vec::new(),
+            zcode_enabled_uids: vec!["16".into()],
+            zcode_enabled: true,
+            zcode_account_concurrency_limit: 2,
+            zcode_pool_sticky_ttl_secs: 700,
             trae_tag_ids: Vec::new(),
             wb_tag_ids: Vec::new(),
             qoder_tag_ids: Vec::new(),
@@ -1936,6 +2407,7 @@ mod pool_merge_tests {
             None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None,
+            None, None, None, None,
         );
         assert_eq!(m.enabled_uids, vec!["u2".to_string()]);
         assert_eq!(m.strategy, "weighted");
@@ -1982,6 +2454,7 @@ mod pool_merge_tests {
             None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None,
+            None, None, None, None,
         );
         // Trae 白名单剥离 wb- 条目
         assert_eq!(m.enabled_uids, vec!["1001".to_string(), "1002".to_string()]);
@@ -2229,6 +2702,7 @@ mod pool_merge_tests {
             None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None,
+            None, None, None, None,
         );
         assert_eq!(m.strategy, "");
         assert_eq!(m.wb_strategy, "");

@@ -98,6 +98,10 @@ pub struct PoolEntry {
     pub failures: u64,
     /// 连续熔断次数（Server 错误 30m 起指数递增至 6h）
     pub cb_trips: u32,
+    /// 连续限额次数（SoftRate 连续命中，成功即清零）：60s 固定冷却会让
+    /// 「日额度已耗尽但文案解析不出时刻」的账号每 60 秒被重新选中、反复 429。
+    /// 按次数把冷却拉长 60s→2m→4m→8m→…→30m 上限，让调度自然绕开它。
+    pub rate_trips: u32,
     // ── WorkBuddy 上游凭证头字段（T2.1；SOLO 账号为空串/false）──
     pub domain: String,
     pub enterprise_id: String,
@@ -105,6 +109,43 @@ pub struct PoolEntry {
     /// refresh_token 已判定失效（F-78 批次 3）：同步自 RawAccount.refresh_token_invalid，
     /// 与 disabled 联动（重新 OAuth 登录后 sync 自动恢复）
     pub refresh_invalid: bool,
+    // ── T5.3 按模型维度冷却（Issue #99：6004 "可切换其他模型继续使用"）──
+    /// model → until 映射；upstream 6004 等文案含 "可在其他模型继续" 时用，
+    /// 冻结粒度为 (uid, model)，而非整账号。空字典表示无按模型冷却条目。
+    pub per_model_cooldowns: std::collections::HashMap<String, i64>,
+}
+
+/// 默认构造：全零运行态（新入池账号）。sync_from_* 的增量合并用
+/// `..PoolEntry::default()` 补足未显式列出的字段，避免漏字段导致编译错误
+/// 或（更糟）漏掉某个运行态字段的初始化。
+impl Default for PoolEntry {
+    fn default() -> Self {
+        Self {
+            uid: String::new(),
+            name: String::new(),
+            jwt: String::new(),
+            credits: None,
+            credits_expire_at: None,
+            credits_fetched_at: None,
+            disabled: false,
+            err_count: 0,
+            until: 0,
+            reason: String::new(),
+            device_id: String::new(),
+            machine_id: String::new(),
+            hard_until: 0,
+            last_used: 0,
+            successes: 0,
+            failures: 0,
+            cb_trips: 0,
+            rate_trips: 0,
+            domain: String::new(),
+            enterprise_id: String::new(),
+            global_region: false,
+            refresh_invalid: false,
+            per_model_cooldowns: std::collections::HashMap::new(),
+        }
+    }
 }
 
 impl PoolEntry {
@@ -185,6 +226,13 @@ pub struct ApiPool {
     /// f64 bits 存储；剩余积分 ≤ 阈值的账号不参与调度（0 = 不过滤）。
     /// 防止账号积分被调度耗尽后连免费模型也不可用
     reserve_credits: std::sync::atomic::AtomicU64,
+    /// 池标签（trae/buddy/qoder）：P1 冷却持久化时作 pool_cooldowns 表 pk 前缀。
+    /// do_start 装配三池时随 set_log_ctx 一并注入；空 = 未装配（测试不落库）
+    pool_label: Mutex<String>,
+    /// 运行态冷却自上次落库后是否变化（P1）：note_error/cooldown_until/
+    /// clear_cooldowns 等置脏，flusher 仅在脏时整池快照落库（2s 周期，
+    /// 请求热路径零 DB 写入）
+    cooldown_dirty: std::sync::atomic::AtomicBool,
     /// 冷却/禁用标记的 app.log 观测上下文：(data_dir, 池标签)。
     /// do_start 装配三池（trae/buddy/qoder）时注入；None（测试/未启动）不落日志
     log_ctx: Mutex<Option<(std::path::PathBuf, String)>>,
@@ -204,14 +252,18 @@ impl ApiPool {
             inflight: Mutex::new(HashMap::new()),
             concurrency_limit: std::sync::atomic::AtomicU32::new(1),
             reserve_credits: std::sync::atomic::AtomicU64::new(0.0f64.to_bits()),
+            pool_label: Mutex::new(String::new()),
+            cooldown_dirty: std::sync::atomic::AtomicBool::new(false),
             log_ctx: Mutex::new(None),
         }
     }
 
     /// 装配冷却/禁用标记的日志上下文：池标签 + 数据目录（do_start 启动时调用）；
-    /// 未装配（测试/未启动网关）时 note_error 不落 app.log，无副作用
+    /// 未装配（测试/未启动网关）时 note_error 不落 app.log，无副作用。
+    /// 池标签同时用于 P1 冷却持久化的 pool_cooldowns 表 pk 前缀
     pub fn set_log_ctx(&self, data_dir: &std::path::Path, label: &str) {
         *safe_lock(&self.log_ctx) = Some((data_dir.to_path_buf(), label.to_string()));
+        *safe_lock(&self.pool_label) = label.to_string();
     }
 
     /// 设置账号并发上限（F-77，pool_set 热应用；0 = 不限）
@@ -230,6 +282,134 @@ impl ApiPool {
     pub fn set_reserve_credits(&self, v: f64) {
         self.reserve_credits
             .store(v.max(0.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // ── P1 运行态冷却持久化（pool_cooldowns 表）─────────────────────────────
+
+    /// 冷却运行态发生变化时标脏（note_error/cooldown_until/按模型冷却/手动清除
+    /// 的公共尾步）；flusher 只在脏时落库，正常请求零额外开销
+    pub fn mark_cooldown_dirty(&self) {
+        self.cooldown_dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 若脏则取出整池冷却快照并清脏（CAS 防并发重复落库）。
+    /// 返回 (uid, snapshot) 列表；干净时返回 None（flusher 跳过写库）。
+    /// 过期条目（until/hard_until/按模型 ≤ now）过滤掉，表保持瘦身
+    pub fn take_cooldown_snapshot(&self) -> Option<Vec<(String, crate::models::PoolCooldownSnapshot)>> {
+        if !self
+            .cooldown_dirty
+            .compare_exchange(
+                true,
+                false,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            return None;
+        }
+        let now = now_ts();
+        let entries = safe_lock(&self.entries);
+        let mut out: Vec<(String, crate::models::PoolCooldownSnapshot)> = Vec::new();
+        for (uid, e) in entries.iter() {
+            let per_model: HashMap<String, i64> = e
+                .per_model_cooldowns
+                .iter()
+                .filter(|(_, until)| **until > now)
+                .map(|(m, u)| (m.clone(), *u))
+                .collect();
+            let soft_alive = e.until > now;
+            let hard_alive = e.hard_until > now;
+            if !soft_alive && !hard_alive && per_model.is_empty() && e.cb_trips == 0 && e.rate_trips == 0 {
+                continue;
+            }
+            out.push((
+                uid.clone(),
+                crate::models::PoolCooldownSnapshot {
+                    until: if soft_alive { e.until } else { 0 },
+                    hard_until: if hard_alive { e.hard_until } else { 0 },
+                    cb_trips: e.cb_trips,
+                    rate_trips: e.rate_trips,
+                    reason: if soft_alive || hard_alive { e.reason.clone() } else { String::new() },
+                    err_count: e.err_count,
+                    per_model,
+                },
+            ));
+        }
+        Some(out)
+    }
+
+    /// 落库本池运行态冷却（P1）：脏时取快照 → pool_cooldowns 表；干净即跳过。
+    /// 供网关 flusher（每 2s）与 stop 时 flush_pending_writes 调用；
+    /// 未装配 log_ctx（测试/未启动）或标签空时不落库
+    pub fn flush_cooldown_snapshot(&self) {
+        let Some((dir, label)) = safe_lock(&self.log_ctx).clone() else {
+            // CAS 清脏仍需处理：未装配时无落库目标，直接返回（不消费脏位，
+            // 装配后由下一轮 flusher 补落）
+            return;
+        };
+        if label.is_empty() {
+            return;
+        }
+        let Some(rows) = self.take_cooldown_snapshot() else {
+            return; // 干净：本轮无变化
+        };
+        let store = crate::store::db(&dir);
+        if let Err(e) = crate::store::docs::pool_cooldowns_save_pool(&store, &label, &rows) {
+            // 写失败恢复脏位，下轮重试（对齐 flush_usage_dirty 的失败语义）
+            self.mark_cooldown_dirty();
+            crate::fs_utils::app_log(
+                &dir,
+                &format!("pool cooldown flush failed: pool={label} err={e}"),
+            );
+        }
+    }
+
+    /// 启动回灌：把持久化冷却合并进池中**已存在**的账号（sync_from_* 装配后调用）。
+    /// max 合并语义——只延长不缩短（与 sync_from_accounts 已灌入的 Trae until 兼容）。
+    /// 重启前被冻结的号重启后立即恢复冻结，无需上游再挨一次 429 重新发现。
+    /// 手动清除冷却（clear_cooldowns）会标脏并落空快照，对应行从表中剔除，
+    /// 故不会把用户主动清掉的冷却重新灌回。
+    pub fn restore_persisted_cooldowns(
+        &self,
+        snap: &HashMap<String, crate::models::PoolCooldownSnapshot>,
+    ) {
+        let now = now_ts();
+        let mut entries = safe_lock(&self.entries);
+        let mut restored = 0usize;
+        for (uid, s) in snap {
+            let Some(e) = entries.get_mut(uid) else { continue };
+            if s.until > now && s.until > e.until {
+                e.until = s.until;
+                if !s.reason.is_empty() {
+                    e.reason = s.reason.clone();
+                }
+            }
+            if s.hard_until > now {
+                e.hard_until = e.hard_until.max(s.hard_until);
+            }
+            e.cb_trips = e.cb_trips.max(s.cb_trips);
+            e.rate_trips = e.rate_trips.max(s.rate_trips);
+            e.err_count = e.err_count.max(s.err_count);
+            for (m, until) in &s.per_model {
+                if *until > now {
+                    let cur = e.per_model_cooldowns.get(m).copied().unwrap_or(0);
+                    if *until > cur {
+                        e.per_model_cooldowns.insert(m.clone(), *until);
+                    }
+                }
+            }
+            restored += 1;
+        }
+        drop(entries);
+        if restored > 0 {
+            if let Some((dir, label)) = safe_lock(&self.log_ctx).clone() {
+                crate::fs_utils::app_log(
+                    &dir,
+                    &format!("pool cooldown restore: pool={label} accounts={restored}"),
+                );
+            }
+        }
     }
 
     /// 账号保留剩余积分阈值当前值
@@ -335,8 +515,12 @@ impl ApiPool {
         device_map: &DeviceMap,
     ) {
         let mut entries = safe_lock(&self.entries);
-        entries.clear();
         let enabled: HashSet<&str> = enabled_uids.iter().map(|s| s.as_str()).collect();
+        // 增量合并（2026-10-19 修正）：不再 entries.clear()。全量重建会丢掉
+        // hard_until（HardCredit 次日 04:00）、cb_trips（Server 熔断记忆）、
+        // rate_trips（SoftRate 递增退避）、per_model_cooldowns（按模型冷却）与
+        // last_used/successes/failures（加权因子），而本函数在账号导入/改名/
+        // 分组变更/OAuth 成功后都会被调用，导致冷却被静默清零、账号提前解冻。
         let group_filter: Option<HashSet<&str>> = if group_ids.is_empty() {
             None
         } else {
@@ -378,36 +562,45 @@ impl ApiPool {
                     .unwrap_or(&jwt_raw)
                     .trim()
                     .to_string();
-                entries.insert(
-                    uid.clone(),
-                    PoolEntry {
-                        uid: uid.clone(),
-                        name: a.name.clone(),
-                        jwt: jwt_clean,
-                        credits: remaining_credits.get(uid).copied(),
-                        credits_expire_at: expire_times.get(uid).copied(),
-                        // 快照文件级采集时间（issue #91 缓存保鲜）：一次刷新
-                        // 全量写入 credits 与 updated_at，时间戳对全体条目生效
-                        credits_fetched_at,
-                        disabled,
-                        err_count: cd.error_count,
-                        until: cd.until,
-                        reason: cd.reason,
-                        device_id,
-                        machine_id,
-                        hard_until: 0,
-                        last_used: 0,
-                        successes: 0,
-                        failures: 0,
-                        cb_trips: 0,
-                        domain: String::new(),
-                        enterprise_id: String::new(),
-                        global_region: false,
-                        refresh_invalid,
-                    },
-                );
+                // 增量合并：既有条目保留运行态，只更新快照与持久化冷却字段
+                match entries.get_mut(uid) {
+                    Some(e) => {
+                        e.name = a.name.clone();
+                        e.jwt = jwt_clean;
+                        e.credits = remaining_credits.get(uid).copied();
+                        e.credits_expire_at = expire_times.get(uid).copied();
+                        e.credits_fetched_at = credits_fetched_at;
+                        e.disabled = disabled;
+                        e.err_count = cd.error_count;
+                        e.until = cd.until;
+                        e.reason = cd.reason;
+                        e.device_id = device_id;
+                        e.machine_id = machine_id;
+                        e.refresh_invalid = refresh_invalid;
+                    }
+                    None => {
+                        entries.insert(uid.clone(), PoolEntry {
+                            uid: uid.clone(),
+                            name: a.name.clone(),
+                            jwt: jwt_clean,
+                            credits: remaining_credits.get(uid).copied(),
+                            credits_expire_at: expire_times.get(uid).copied(),
+                            credits_fetched_at,
+                            disabled,
+                            err_count: cd.error_count,
+                            until: cd.until,
+                            reason: cd.reason,
+                            device_id,
+                            machine_id,
+                            refresh_invalid,
+                            ..PoolEntry::default()
+                        });
+                    }
+                }
             }
         }
+        // 移除本次未入池的账号（保留上方增量合并语义）
+        entries.retain(|uid, _| enabled.contains(uid.as_str()));
         // F-77：清理已不在池内的在途计数条目（在途请求经 Arc 独立释放，不受影响）
         {
             let mut inflight = safe_lock(&self.inflight);
@@ -470,42 +663,58 @@ impl ApiPool {
     /// 携带区域/企业域信息供上游 headers 使用
     pub fn sync_from_wb(&self, accounts: &[WbSyncAccount], enabled: &[String]) {
         let mut entries = safe_lock(&self.entries);
-        // 仅替换 WB 形态的条目：以 domain/global_region 任一非空/true 识别。
-        // 实际部署中 SOLO 与 WB 不同时入池（api 服务单实例二选一上游），
-        // 但这里保持防御性：不清空非 WB 条目。
-        entries.retain(|_, e| e.domain.is_empty() && !e.global_region);
         let enabled_set: HashSet<&str> = enabled.iter().map(|s| s.as_str()).collect();
+        // 增量合并（2026-10-19 修正）：旧版全量重建会把账号运行态
+        //（until/hard_until/cb_trips/rate_trips/per_model_cooldowns/last_used/
+        // successes/failures）全部清零，而本函数在导入账号、OAuth 登录、改名、
+        // 分组变更、JWT 刷新成功后都会被调用（reload_pools_if_running）——
+        // 结果是刚被上游限流的模型立刻重新去打、积分耗尽冷却到 04:00 的账号提前
+        // 解冻、SoftRate 递增退避与 Server 熔断记忆归零。现改为：保留仍在池内
+        // 账号的运行态，只更新快照字段；已不在池内的条目才移除。
+        // 防御性保持：不清空非 WB 形态条目（SOLO 与 WB 不同时入池）。
+        let mut keep: HashSet<String> = HashSet::new();
         for a in accounts {
             if !enabled_set.contains(a.uid.as_str()) || a.token.is_empty() {
                 continue;
             }
-            entries.insert(
-                a.uid.clone(),
-                PoolEntry {
-                    uid: a.uid.clone(),
-                    name: a.name.clone(),
-                    jwt: a.token.clone(),
-                    credits: a.credits,
-                    credits_expire_at: a.credits_expire_at,
-                    credits_fetched_at: a.credits_fetched_at,
-                    disabled: a.needs_relogin,
-                    err_count: 0,
-                    until: 0,
-                    reason: String::new(),
-                    device_id: String::new(),
-                    machine_id: String::new(),
-                    hard_until: 0,
-                    last_used: 0,
-                    successes: 0,
-                    failures: 0,
-                    cb_trips: 0,
-                    domain: a.domain.clone(),
-                    enterprise_id: a.enterprise_id.clone(),
-                    global_region: a.global_region,
-                    refresh_invalid: false,
-                },
-            );
+            keep.insert(a.uid.clone());
+            match entries.get_mut(&a.uid) {
+                Some(e) => {
+                    e.name = a.name.clone();
+                    e.jwt = a.token.clone();
+                    e.credits = a.credits;
+                    e.credits_expire_at = a.credits_expire_at;
+                    e.credits_fetched_at = a.credits_fetched_at;
+                    e.disabled = a.needs_relogin;
+                    e.domain = a.domain.clone();
+                    e.enterprise_id = a.enterprise_id.clone();
+                    e.global_region = a.global_region;
+                    e.refresh_invalid = false;
+                }
+                None => {
+                    entries.insert(a.uid.clone(), PoolEntry {
+                        uid: a.uid.clone(),
+                        name: a.name.clone(),
+                        jwt: a.token.clone(),
+                        credits: a.credits,
+                        credits_expire_at: a.credits_expire_at,
+                        credits_fetched_at: a.credits_fetched_at,
+                        disabled: a.needs_relogin,
+                        domain: a.domain.clone(),
+                        enterprise_id: a.enterprise_id.clone(),
+                        global_region: a.global_region,
+                        ..PoolEntry::default()
+                    });
+                }
+            }
         }
+        // 仅移除已不在 WB 入池集合内的 WB 形态条目（非 WB 条目不动）
+        entries.retain(|_, e| {
+            if e.domain.is_empty() && !e.global_region {
+                return true;
+            }
+            keep.contains(&e.uid)
+        });
         // F-77：清理已不在池内的在途计数条目（在途请求经 Arc 独立释放，不受影响）
         {
             let mut inflight = safe_lock(&self.inflight);
@@ -520,39 +729,46 @@ impl ApiPool {
     /// effective 凭证补齐）
     pub fn sync_from_qoder(&self, accounts: &[QoderSyncAccount], enabled: &[String]) {
         let mut entries = safe_lock(&self.entries);
-        entries.clear();
         let enabled_set: HashSet<&str> = enabled.iter().map(|s| s.as_str()).collect();
+        // 增量合并（2026-10-19 修正，同 sync_from_wb）：保留池内账号的冷却/
+        // 熔断/限频计数/按模型冷却运行态，只更新快照字段。旧版 entries.clear()
+        // 会让 HardCredit（次日 04:00）与精确重置时刻冷却在任意一次账号同步后
+        // 静默丢失，账号被提前解冻并反复打上游。
+        let mut keep: HashSet<String> = HashSet::new();
         for a in accounts {
             if !enabled_set.contains(a.uid.as_str()) || a.access_token.is_empty() {
                 continue;
             }
-            entries.insert(
-                a.uid.clone(),
-                PoolEntry {
-                    uid: a.uid.clone(),
-                    name: a.name.clone(),
-                    jwt: a.access_token.clone(),
-                    credits: a.credits,
-                    credits_expire_at: a.credits_expire_at,
-                    credits_fetched_at: a.credits_fetched_at,
-                    disabled: a.needs_relogin,
-                    err_count: 0,
-                    until: 0,
-                    reason: String::new(),
-                    device_id: String::new(),
-                    machine_id: a.machine_id.clone(),
-                    hard_until: 0,
-                    last_used: 0,
-                    successes: 0,
-                    failures: 0,
-                    cb_trips: 0,
-                    domain: String::new(),
-                    enterprise_id: String::new(),
-                    global_region: false,
-                    refresh_invalid: false,
-                },
-            );
+            keep.insert(a.uid.clone());
+            match entries.get_mut(&a.uid) {
+                Some(e) => {
+                    e.name = a.name.clone();
+                    e.jwt = a.access_token.clone();
+                    e.credits = a.credits;
+                    e.credits_expire_at = a.credits_expire_at;
+                    e.credits_fetched_at = a.credits_fetched_at;
+                    e.disabled = a.needs_relogin;
+                    e.machine_id = a.machine_id.clone();
+                    e.global_region = a.global_region;
+                    e.refresh_invalid = false;
+                }
+                None => {
+                    entries.insert(a.uid.clone(), PoolEntry {
+                        uid: a.uid.clone(),
+                        name: a.name.clone(),
+                        jwt: a.access_token.clone(),
+                        credits: a.credits,
+                        credits_expire_at: a.credits_expire_at,
+                        credits_fetched_at: a.credits_fetched_at,
+                        disabled: a.needs_relogin,
+                        machine_id: a.machine_id.clone(),
+                        global_region: a.global_region,
+                        ..PoolEntry::default()
+                    });
+                }
+            }
         }
+        entries.retain(|uid, _| keep.contains(uid));
         // F-77：清理已不在池内的在途计数条目（在途请求经 Arc 独立释放，不受影响）
         {
             let mut inflight = safe_lock(&self.inflight);
@@ -560,23 +776,102 @@ impl ApiPool {
         }
     }
 
+    /// 从 ZCode 账号同步池（z.ai GLM 池）：账号源 = zcode.sqlite（zcode 域管理，
+    /// 网关只读），增量合并语义同 sync_from_qoder（保留冷却/熔断/限频运行态）。
+    /// 凭证快照仅作入池门槛与兜底——请求期真凭证经 zcode_identity 回调按次解析
+    pub fn sync_from_zcode(&self, accounts: &[ZCodeSyncAccount], enabled: &[String]) {
+        let mut entries = safe_lock(&self.entries);
+        let enabled_set: HashSet<&str> = enabled.iter().map(|s| s.as_str()).collect();
+        let mut keep: HashSet<String> = HashSet::new();
+        for a in accounts {
+            if !enabled_set.contains(a.uid.as_str()) || a.access_token.is_empty() {
+                continue;
+            }
+            keep.insert(a.uid.clone());
+            match entries.get_mut(&a.uid) {
+                Some(e) => {
+                    e.name = a.name.clone();
+                    e.jwt = a.access_token.clone();
+                    e.device_id = a.device_mid.clone();
+                    e.refresh_invalid = false;
+                }
+                None => {
+                    entries.insert(a.uid.clone(), PoolEntry {
+                        uid: a.uid.clone(),
+                        name: a.name.clone(),
+                        jwt: a.access_token.clone(),
+                        device_id: a.device_mid.clone(),
+                        ..PoolEntry::default()
+                    });
+                }
+            }
+        }
+        entries.retain(|uid, _| keep.contains(uid));
+        let mut inflight = safe_lock(&self.inflight);
+        inflight.retain(|uid, _| entries.contains_key(uid));
+    }
+
+    /// 账号区域查询（免费档记账用）：Some(true)=海外、Some(false)=国内、
+    /// None=池中无此账号
+    pub fn uid_region(&self, uid: &str) -> Option<bool> {
+        let entries = safe_lock(&self.entries);
+        entries.get(uid).map(|e| e.global_region)
+    }
+
     /// 指定 uid 取号（T2.4 会话粘性）：账号 healthy 时返回其凭证，否则 None
     pub fn pick_by_uid(&self, uid: &str) -> Option<PickedAccount> {
+        self.pick_by_uid_region(uid, None)
+    }
+
+    /// 指定 uid 取号 + 区域过滤（国内/海外号池隔离）：`want_global` = Some 时
+    /// 仅出该区账号（None = 不过滤，历史语义）。粘性绑定区不符 → None（调用方
+    /// 回落正常取号——模型区域决定账号区域，粘性不得跨区续用）。
+    pub fn pick_by_uid_region(&self, uid: &str, want_global: Option<bool>) -> Option<PickedAccount> {
         let entries = safe_lock(&self.entries);
         let now = now_ts();
         let tried = HashSet::new();
         let reserve = self.reserve_credits();
-        entries.get(uid).filter(|e| selectable(e, &tried, now, reserve)).map(|e| PickedAccount {
-            uid: e.uid.clone(),
-            jwt: e.jwt.clone(),
-            device_id: e.device_id.clone(),
-            machine_id: e.machine_id.clone(),
-            domain: e.domain.clone(),
-            enterprise_id: e.enterprise_id.clone(),
-            global_region: e.global_region,
-            // 专一/粘性锁定：忽略 busy 过滤（语义即「锁定即用」），无条件绑定
-            over_limit: true,
-        })
+        entries
+            .get(uid)
+            .filter(|e| selectable(e, &tried, now, reserve))
+            .filter(|e| want_global.map_or(true, |w| e.global_region == w))
+            .map(|e| PickedAccount {
+                uid: e.uid.clone(),
+                jwt: e.jwt.clone(),
+                device_id: e.device_id.clone(),
+                machine_id: e.machine_id.clone(),
+                domain: e.domain.clone(),
+                enterprise_id: e.enterprise_id.clone(),
+                global_region: e.global_region,
+                // 专一/粘性锁定：忽略 busy 过滤（语义即「锁定即用」），无条件绑定
+                over_limit: true,
+            })
+    }
+
+    /// 每区域各取一个含凭证账号（WB 模型目录刷新用，修复「海外账号模型目录」）：
+    /// 两区模型清单由上游各自下发，刷新需按区取号；区内任取一个（目录刷新
+    /// 不要求账号健康，积分耗尽账号照样能拉目录）。
+    /// 返回 (uid, jwt, domain, enterprise_id, global_region)，区内无凭证则缺该区。
+    pub fn pick_one_per_region(&self) -> Vec<(String, String, String, String, bool)> {
+        let entries = safe_lock(&self.entries);
+        let mut cn: Option<(String, String, String, String, bool)> = None;
+        let mut global: Option<(String, String, String, String, bool)> = None;
+        for e in entries.values() {
+            if e.jwt.is_empty() {
+                continue;
+            }
+            let slot = if e.global_region { &mut global } else { &mut cn };
+            if slot.is_none() {
+                *slot = Some((
+                    e.uid.clone(),
+                    e.jwt.clone(),
+                    e.domain.clone(),
+                    e.enterprise_id.clone(),
+                    e.global_region,
+                ));
+            }
+        }
+        [cn, global].into_iter().flatten().collect()
     }
 
     /// 带 Key 约束取号（F-35 子 Key 体系，批次3）：
@@ -605,10 +900,23 @@ impl ApiPool {
         allowed: Option<&HashSet<String>>,
         dedicated: Option<&str>,
     ) -> Option<(PickedAccount, Option<String>)> {
+        self.pick_excluding_constrained_ev_region(tried, allowed, dedicated, None)
+    }
+
+    /// 区域过滤版（国内/海外号池隔离）：`want_global` = Some 时只在该区账号中
+    /// 取号——国内模型不出海外号、海外模型不出国内号；None = 不过滤（历史语义）。
+    /// 专一绑定 uid 区不符时跳过专一锁定（不得跨区续用）。
+    pub fn pick_excluding_constrained_ev_region(
+        &self,
+        tried: &HashSet<String>,
+        allowed: Option<&HashSet<String>>,
+        dedicated: Option<&str>,
+        want_global: Option<bool>,
+    ) -> Option<(PickedAccount, Option<String>)> {
         // 专一模式：绑定账号 healthy 且未试错过 → 直接锁定（专一绑定不让位）
         if let Some(uid) = dedicated {
             if !tried.contains(uid) {
-                if let Some(p) = self.pick_by_uid(uid) {
+                if let Some(p) = self.pick_by_uid_region(uid, want_global) {
                     let mut entries = safe_lock(&self.entries);
                     if let Some(e) = entries.get_mut(uid) {
                         e.last_used = now_ts();
@@ -624,6 +932,7 @@ impl ApiPool {
         let all_cands: Vec<&PoolEntry> = entries
             .values()
             .filter(|e| selectable(e, tried, now, reserve))
+            .filter(|e| want_global.map_or(true, |w| e.global_region == w))
             .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
             .collect();
         // F-77 busy 过滤 + 全 busy 降级
@@ -715,7 +1024,19 @@ impl ApiPool {
         sticky_uid: &str,
         allowed: Option<&HashSet<String>>,
     ) -> Option<(PickedAccount, Option<String>)> {
-        let sticky = self.pick_by_uid(sticky_uid)?;
+        self.pick_sticky_yield_region(sticky_uid, allowed, None)
+    }
+
+    /// 区域过滤版粘性取号：粘性账号区不符模型区域 → 视同无粘性（None，调用方
+    /// 回落正常取号）；让位候选同样只在同区内选（国内/海外号池隔离）。
+    pub fn pick_sticky_yield_region(
+        &self,
+        sticky_uid: &str,
+        allowed: Option<&HashSet<String>>,
+        want_global: Option<bool>,
+    ) -> Option<(PickedAccount, Option<String>)> {
+        let sticky = self.pick_by_uid_region(sticky_uid, want_global)?;
+        let region_ok = |e: &PoolEntry| want_global.map_or(true, |w| e.global_region == w);
         let limit = self.concurrency_limit();
         let inflight = self.inflight_snapshot();
         let sticky_inflight = inflight.get(sticky_uid).copied().unwrap_or(0);
@@ -735,6 +1056,7 @@ impl ApiPool {
             entries
                 .values()
                 .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now, reserve))
+                .filter(|e| region_ok(e))
                 .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
                 .fold((false, false), |(any, idle), e| {
                     (any || true, idle || inflight_of(e, &inflight) < limit)
@@ -760,6 +1082,7 @@ impl ApiPool {
         let idle: Vec<&PoolEntry> = entries
             .values()
             .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now, reserve))
+            .filter(|e| region_ok(e))
             .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
             .filter(|e| inflight_of(e, &inflight) < limit)
             .collect();
@@ -820,13 +1143,20 @@ impl ApiPool {
     }
 
     /// 记录错误并冷却（T2.2 错误三态 + 分级冷却）。
+    /// None 属请求级错误（如 4001 模型配置缺失），与账号健康无关——在入口
+    /// 直接忽略，防止全池账号被同一模型错误连坐熔断（P0-1 审查结论，守卫
+    /// 下沉至此，调用点无需逐一重复；Client 未知 4xx 仍保留熔断记忆）。
     /// 冷却/禁用标记发生时同步落一条 app.log（F-80 可观测）：
     /// `account cooldown: pool=<池> acct=<名称> uid=<uid> kind=<错误分类> action=<处置>`，
     /// 排查「账号何时、为何被打冷却→选池 no_healthy_account→跨池回退」链路时可直接定位
     pub fn note_error(&self, uid: &str, kind: ErrKind) {
+        if kind == ErrKind::None {
+            return;
+        }
         let mut entries = safe_lock(&self.entries);
         let mut cooldown_ev: Option<(String, String)> = None;
         if let Some(e) = entries.get_mut(uid) {
+            Self::decay_counters(e);
             e.failures = e.failures.saturating_add(1);
             let mut action: Option<String> = None;
             match kind {
@@ -838,23 +1168,56 @@ impl ApiPool {
                 ErrKind::HardCredit => {
                     // 积分耗尽：冷却到下个 04:00（凌晨 00:00–04:00 窗口内为当天，
                     // next_0400 语义），到期自动恢复探测（F-29 v1.2）
-                    let until = next_0400(now_ts());
-                    e.hard_until = until;
-                    e.reason = "hard_credit".to_string();
-                    e.err_count = 0;
-                    action = Some(format!(
-                        "action=hard_cooldown until={} (下个04:00)",
-                        fmt_local_ts(until)
-                    ));
+                    //
+                    // 余额兜底（2026-10-20 事故修复）：号上积分仍 > 0 时，上游那条
+                    // 「额度不足」只可能是该模型受限或分类误判，整号冻结一天的后
+                    // 果（四个 700/1000 积分的号齐冻到 04:00，客户端持续「重新连接」）
+                    // 远大于收益。此时降级为普通冷却：不动 hard_until，按 SoftRate
+                    // 退避（60s 起按 trips 翻倍，封顶 30 分钟），接受上游的真拒绝
+                    // 而不是伪造一整天的不可用。
+                    if e.credits.is_some_and(|c| c > 0.0) {
+                        e.rate_trips = e.rate_trips.saturating_add(1);
+                        let secs = (60i64 << (e.rate_trips - 1).min(5)).min(30 * 60);
+                        let until = now_ts() + secs;
+                        e.until = until;
+                        e.reason = "hard_credit_downgraded".to_string();
+                        e.err_count = 0;
+                        action = Some(format!(
+                            "action=hard_credit_downgraded credits={:?} secs={secs} until={}",
+                            e.credits,
+                            fmt_local_ts(until)
+                        ));
+                    } else {
+                        let until = next_0400(now_ts());
+                        e.hard_until = until;
+                        e.reason = "hard_credit".to_string();
+                        e.err_count = 0;
+                        action = Some(format!(
+                            "action=hard_cooldown until={} (下个04:00)",
+                            fmt_local_ts(until)
+                        ));
+                    }
                 }
                 ErrKind::PlanLimit | ErrKind::SoftRate | ErrKind::NotFound => {
-                    let secs = kind.cooldown_duration().as_secs() as i64;
+                    let base_secs = kind.cooldown_duration().as_secs() as i64;
+                    // SoftRate 退避递增：60s 固定冷却无法覆盖「日额度耗尽但文案解析
+                    // 不出重置时刻」的场景——账号每 60s 解冻一次、又被选中、再 429，
+                    // 形成无限循环且每次都占用一次真实上游往返。按连续命中次数
+                    // 翻倍（60s→2m→4m→8m→16m），封顶 30 分钟；任何成功即清零。
+                    let secs = if kind == ErrKind::SoftRate {
+                        e.rate_trips = e.rate_trips.saturating_add(1);
+                        let shift = (e.rate_trips - 1).min(5);
+                        (base_secs << shift).min(30 * 60)
+                    } else {
+                        base_secs
+                    };
                     let until = now_ts() + secs;
                     e.until = until;
                     e.reason = kind.as_str().to_string();
                     e.err_count = 0;
                     action = Some(format!(
-                        "action=cooldown secs={secs} until={}",
+                        "action=cooldown secs={secs} trips={} until={}",
+                        e.rate_trips,
                         fmt_local_ts(until)
                     ));
                     // P2 修复10：不重置 cb_trips——熔断记忆只应在 note_success 重置，
@@ -881,6 +1244,9 @@ impl ApiPool {
             if let Some(a) = action {
                 cooldown_ev = Some((e.name.clone(), a));
             }
+            // P1：运行态冷却字段已变更（until/hard_until/cb_trips/rate_trips/
+            // err_count），标脏交 flusher 落库；请求热路径本身不写 SQLite
+            self.mark_cooldown_dirty();
         }
         drop(entries);
         // F-80：log_ctx 未装配（测试/未启动）时静默跳过，不产生日志副作用
@@ -898,13 +1264,126 @@ impl ApiPool {
         }
     }
 
+    /// 把账号冷却精确延长到上游下发的恢复时刻（6004 日限额「将在 … UTC+8 重置」）。
+    /// 取 `max(现有 until, ts)` 只增不减，且不碰 disabled/hard_until——到期由 `healthy`
+    /// 自然放开（无恢复探测需求：日额度重置时刻即上游权威时刻）。选号 `selectable` 走
+    /// `healthy`（读 `until`），故被冻账号在恢复前不再被取，池内其余健康账号正常顶上。
+    pub fn cooldown_until(&self, uid: &str, ts: i64) {
+        let now = now_ts();
+        if ts <= now {
+            return; // 已过/非法恢复时刻：不处理，交由常规冷却
+        }
+        let mut entries = safe_lock(&self.entries);
+        if let Some(e) = entries.get_mut(uid) {
+            if ts > e.until {
+                e.until = ts;
+                e.reason = "quota_reset".to_string();
+                e.err_count = 0;
+                self.mark_cooldown_dirty();
+            }
+        }
+    }
+
+    /// 按 (uid, model) 精确延长冷却到上游恢复时刻（6004「可切换其他模型继续使用」）。
+    /// 与 cooldown_until（整账号）的区别：只挡这一个模型的取号，账号对其他模型
+    /// （含积分模型）照常可用——上游文案明确限的是该模型频率，不是整个账号。
+    pub fn per_model_cooldown_until(&self, uid: &str, model: &str, ts: i64) {
+        let now = now_ts();
+        if ts <= now {
+            return;
+        }
+        let mut entries = safe_lock(&self.entries);
+        if let Some(e) = entries.get_mut(uid) {
+            let cur = e.per_model_cooldowns.get(model).copied().unwrap_or(0);
+            if ts > cur {
+                e.per_model_cooldowns.insert(model.to_string(), ts);
+                self.mark_cooldown_dirty();
+            }
+        }
+    }
+
+    /// 当前在该模型上处于冷却的账号 uid 集合（到期自动剔除）。
+    /// 仅供可观测与诊断使用；**不要**把它预注入取号的 tried 集合——那会把
+    /// 「该模型对此账号冷却」这个状态误当成「本轮已试过且失败」，池内仅剩
+    /// 这一个账号时必然退化成假 503（账号其他模型仍是健康的）。
+    /// 选号侧的按模型过滤见 [model_cooling_excluding]。
+    pub fn model_cooled_uids(&self, model: &str) -> Vec<String> {
+        self.model_cooling_excluding(model, None)
+    }
+
+    /// 按模型冷却的 uid 集合，可排除一个账号（`exclude_uid` = 当前候选）。
+    /// 语义：若把该账号也算进冷却名单，就永远看不到「除它之外还有没有备选」，
+    /// 而「没有备选」恰恰是必须放行的场景——否则等于把账号停了。
+    pub fn model_cooling_excluding(&self, model: &str, exclude_uid: Option<&str>) -> Vec<String> {
+        let entries = safe_lock(&self.entries);
+        let now = now_ts();
+        entries
+            .values()
+            .filter(|e| Some(e.uid.as_str()) != exclude_uid)
+            .filter(|e| {
+                e.per_model_cooldowns
+                    .get(model)
+                    .copied()
+                    .map(|until| now < until)
+                    .unwrap_or(false)
+            })
+            .map(|e| e.uid.clone())
+            .collect()
+    }
+
+    /// 该账号在此模型上是否仍处冷却（到期自动视为无冷却）。
+    pub fn is_model_cooling(&self, uid: &str, model: &str) -> bool {
+        let entries = safe_lock(&self.entries);
+        entries
+            .get(uid)
+            .and_then(|e| e.per_model_cooldowns.get(model))
+            .map(|&until| now_ts() < until)
+            .unwrap_or(false)
+    }
+
+    /// 除 `uid` 外，是否还有其他账号可在此模型上顶上（区域/白名单感知）。
+    /// 用于「该账号在此模型冷却，但池里没别人了」的判定——此时必须放行，
+    /// 让请求真实打到上游，由上游决定是否拒绝，而不是本地伪造 503。
+    pub fn has_other_selectable_for_model(
+        &self,
+        uid: &str,
+        allowed: Option<&HashSet<String>>,
+        want_global: Option<bool>,
+    ) -> bool {
+        self.selectable_stats_in_region_excluding(allowed, want_global, Some(uid)).1 > 0
+    }
+
+    /// 清除某账号全部按模型冷却（手动清除冷却 / 重新登录时调用）
+    pub fn clear_model_cooldowns(&self, uid: &str) {
+        if let Some(e) = safe_lock(&self.entries).get_mut(uid) {
+            e.per_model_cooldowns.clear();
+        }
+    }
+
     /// 记录成功（重置熔断与错误计数）
     pub fn note_success(&self, uid: &str) {
         let mut entries = safe_lock(&self.entries);
         if let Some(e) = entries.get_mut(uid) {
+            if e.cb_trips != 0 || e.rate_trips != 0 || e.err_count != 0 {
+                // 持久化字段（熔断/限额/连错计数）归零同样要落库，
+                // 否则重启后旧的退避记忆复活（P1）
+                self.mark_cooldown_dirty();
+            }
             e.err_count = 0;
             e.cb_trips = 0;
+            e.rate_trips = 0;
+            Self::decay_counters(e);
             e.successes = e.successes.saturating_add(1);
+        }
+    }
+
+    /// 成功/失败计数滚动窗口：总数超过 50 时双双减半（向上取整保 1），
+    /// 使 success_rate 反映近期表现而非历史总量——否则账号早期 100 次失败
+    /// 会把之后 100 次成功稀释到 0.5，加权调度永久低估恢复后的账号（P2-6）
+    fn decay_counters(e: &mut PoolEntry) {
+        if e.successes + e.failures >= 50 {
+            e.successes = (e.successes + 1) / 2;
+            e.failures = (e.failures + 1) / 2;
         }
     }
 
@@ -921,8 +1400,37 @@ impl ApiPool {
             e.hard_until = 0;
             e.reason.clear();
             e.err_count = 0;
+            // 手动清除必须同时清掉限频连续计数：否则下次限频会直接吃到
+            // 30 分钟上限，用户点「清除冷却」后仍被长时间冻结
+            e.rate_trips = 0;
+            // 同理清熔断次数：用户手动清除即宣告「我知道这些号被误伤/上游
+            // 已恢复」，若保留 cb_trips，下次 Server 错误直接 1h 起步（30m×2），
+            // 与「已清除即可用」的预期相悖
+            e.cb_trips = 0;
+            e.per_model_cooldowns.clear();
         }
+        // P1：清除后的空态也要落库，否则重启会把清除前的冷却快照复活
+        self.mark_cooldown_dirty();
         count
+    }
+
+    /// 清除单个账号的冷却（cooldown_clear 命令联动，P1）：与 clear_cooldowns
+    /// 同语义但只针对 uid；返回是否命中。清除后标脏，由调用方立即 flush 落库，
+    /// 保证「用户点了解除冷却」在重启后依然生效（不被 pool_cooldowns 复活）。
+    pub fn clear_one(&self, uid: &str) -> bool {
+        let mut entries = safe_lock(&self.entries);
+        let Some(e) = entries.get_mut(uid) else {
+            return false;
+        };
+        e.until = 0;
+        e.hard_until = 0;
+        e.reason.clear();
+        e.err_count = 0;
+        e.rate_trips = 0;
+        e.cb_trips = 0;
+        e.per_model_cooldowns.clear();
+        self.mark_cooldown_dirty();
+        true
     }
 
     /// 返回池状态列表
@@ -935,6 +1443,7 @@ impl ApiPool {
             .map(|e| PoolStatus {
                 uid: e.uid.clone(),
                 name: e.name.clone(),
+                global_region: e.global_region,
                 credits: e.credits,
                 credits_expire_at: e.credits_expire_at,
                 cooling: e.until > 0 && now < e.until,
@@ -954,6 +1463,22 @@ impl ApiPool {
 
     pub fn count(&self) -> usize {
         safe_lock(&self.entries).len()
+    }
+
+    /// 启动回灌入口（do_start 三池 sync 装配完成后各调一次，P1）：
+    /// 按池标签从 pool_cooldowns 表读回上进程的冷却运行态并 max 合并。
+    /// 未装配 log_ctx/标签（测试或未启动）时静默跳过
+    pub fn restore_cooldowns_from_store(&self) {
+        let Some((dir, label)) = safe_lock(&self.log_ctx).clone() else { return };
+        if label.is_empty() {
+            return;
+        }
+        let store = crate::store::db(&dir);
+        let snap = crate::store::docs::pool_cooldowns_load_pool(&store, &label);
+        if snap.is_empty() {
+            return;
+        }
+        self.restore_persisted_cooldowns(&snap);
     }
 
     /// 池内是否存在可选账号（healthy + 非零积分 + 未过期）。
@@ -976,10 +1501,43 @@ impl ApiPool {
         self.selectable_stats_in(allowed).1 > 0
     }
 
+    /// 区域过滤版健康预检（国内/海外号池隔离）：该区无可选账号即视为不健康，
+    /// dispatch 据此跨池回退或显式报错（如海外模型 + 海外池全挂 → 如实
+    /// no_healthy，而不是落到国内号被上游拒绝）。None = 不过滤（历史语义）。
+    pub fn has_selectable_in_region(
+        &self,
+        allowed: Option<&HashSet<String>>,
+        want_global: Option<bool>,
+    ) -> bool {
+        self.selectable_stats_in_region(allowed, want_global).1 > 0
+    }
+
     /// 可选账号统计（诊断用，issue #29）：返回 (池内可选总数, 白名单内可选数)。
     /// `allowed` 语义同 has_selectable_in（None = 不限）；供 NoHealthy 错误
     /// 消息携带「池健康数 / 白名单命中数」，帮助用户自查 Key 约束配置
     pub fn selectable_stats_in(&self, allowed: Option<&HashSet<String>>) -> (usize, usize) {
+        self.selectable_stats_in_region(allowed, None)
+    }
+
+    /// 区域过滤版统计：`want_global` = Some 时只统计该区账号。
+    pub fn selectable_stats_in_region(
+        &self,
+        allowed: Option<&HashSet<String>>,
+        want_global: Option<bool>,
+    ) -> (usize, usize) {
+        self.selectable_stats_in_region_excluding(allowed, want_global, None)
+    }
+
+    /// 统计时可排除一个账号（`exclude_uid`）：用于「该账号已命中冷却，池内是否
+    /// 还有别的健康号可顶上」。模型级冷却表按裸模型名记账、不区分账号，若不排除
+    /// 当前账号就判断，会把刚被限流的号自己算成「可用备选」，得出「模型仍健康」
+    /// 的错误结论。
+    pub fn selectable_stats_in_region_excluding(
+        &self,
+        allowed: Option<&HashSet<String>>,
+        want_global: Option<bool>,
+        exclude_uid: Option<&str>,
+    ) -> (usize, usize) {
         let entries = safe_lock(&self.entries);
         let now = now_ts();
         let tried = HashSet::new();
@@ -987,9 +1545,14 @@ impl ApiPool {
         let mut total = 0usize;
         let mut in_allowed = 0usize;
         for e in entries.values() {
+            if Some(e.uid.as_str()) == exclude_uid {
+                continue;
+            }
             if selectable(e, &tried, now, reserve) {
                 total += 1;
-                if allowed.map_or(true, |a| a.contains(&e.uid)) {
+                if want_global.map_or(true, |w| e.global_region == w)
+                    && allowed.map_or(true, |a| a.contains(&e.uid))
+                {
                     in_allowed += 1;
                 }
             }
@@ -1118,6 +1681,18 @@ pub struct QoderSyncAccount {
     pub credits_expire_at: Option<i64>,
     /// 余额快照采集时间（Unix 秒）：reserve 过滤新鲜度门槛（issue #91 口径）
     pub credits_fetched_at: Option<i64>,
+    /// 账号所属区（2026-10-17 海外接入）：true=海外（api3.qoder.sh 网关 +
+    /// openapi.qoder.sh）；池条目 global_region 由此盖章，选号分区过滤依据
+    pub global_region: bool,
+}
+
+/// ZCode 账号入池同步结构（z.ai GLM 池）：uid = zcode.sqlite accounts.id 字符串化。
+/// access_token/device_mid 为入池快照（请求期经 identity 回调重读最新值）
+pub struct ZCodeSyncAccount {
+    pub uid: String,
+    pub name: String,
+    pub access_token: String,
+    pub device_mid: String,
 }
 
 /// 候选过滤：healthy + 未 tried + 积分未过期 + 非零积分 + 非 hard_credit 冷却
@@ -1285,6 +1860,14 @@ pub fn next_0400(now: i64) -> i64 {
     target - 8 * 3600
 }
 
+/// 次日 00:00（东八区）的 Unix 秒：Qoder 免费模型额度重置时刻（上游文案
+/// 「明天 00:00 再重试当前免费模型」），(uid, model) 冷却的到期时间
+pub fn next_0000(now: i64) -> i64 {
+    let local = now + 8 * 3600;
+    let day_start = local - (local % 86400);
+    day_start + 86400 - 8 * 3600
+}
+
 fn now_ts() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1294,7 +1877,7 @@ fn now_ts() -> i64 {
 
 /// Unix 秒 → 固定东八区时间展示（与 next_0400 的 local_ts 约定同源），
 /// 供冷却日志 until 可读化；解析失败回退原始数值
-fn fmt_local_ts(ts: i64) -> String {
+pub(crate) fn fmt_local_ts(ts: i64) -> String {
     use chrono::TimeZone;
     chrono::FixedOffset::east_opt(8 * 3600)
         .and_then(|tz| tz.timestamp_opt(ts, 0).single())
@@ -1398,6 +1981,80 @@ mod tests {
             !dir.join("logs").join("app.log").exists(),
             "未装配 log_ctx 不应产生日志文件"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ==================== P1：运行态冷却落库 ↔ 启动回灌 ====================
+
+    /// 全链路：冷却 → flusher 快照落库 → 模拟重启（新建池 + sync + 回灌）→
+    /// 冻结/熔断/限额/按模型冷却全部复活；过期条目不回灌。
+    #[test]
+    fn cooldown_snapshot_roundtrips_across_restart() {
+        let dir = std::env::temp_dir().join(format!("aiwa_p1_rt_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // 池 A：装配 log_ctx 后制造多种冷却
+        let pool_a = build_pool(&[("uid_a", 0.0, 0)]);
+        pool_a.set_log_ctx(&dir, "buddy");
+        pool_a.note_error("uid_a", ErrKind::SoftRate); // until + rate_trips
+        pool_a.note_error("uid_a", ErrKind::HardCredit); // hard_until（下个04:00）
+        // 按模型冷却到未来时刻
+        let future = now_ts() + 3600;
+        pool_a.per_model_cooldown_until("uid_a", "hy4-preview", future);
+        pool_a.flush_cooldown_snapshot();
+        // 干净后重复 flush 应无副作用（CAS 消费）
+        pool_a.flush_cooldown_snapshot();
+        // 模拟重启：全新池实例（同目录同标签）
+        let pool_b = build_pool(&[("uid_a", 10.0, 0)]);
+        pool_b.set_log_ctx(&dir, "buddy");
+        pool_b.restore_cooldowns_from_store();
+        {
+            let entries = safe_lock(&pool_b.entries);
+            let e = entries.get("uid_a").unwrap();
+            assert!(e.until > now_ts(), "软冷却应复活");
+            assert_eq!(e.rate_trips, 1, "限额退避计数应复活");
+            assert!(e.hard_until > now_ts(), "hard_credit 冷却应复活");
+            assert_eq!(
+                e.per_model_cooldowns.get("hy4-preview").copied(),
+                Some(future),
+                "按模型冷却应复活"
+            );
+        }
+        // 过期条目不落库：冷却全部到期后 flush → 表内该池行清空 → 回灌无效果
+        let pool_c = build_pool(&[("uid_a", 10.0, 0)]);
+        pool_c.set_log_ctx(&dir, "buddy");
+        pool_c.clear_cooldowns();
+        pool_c.flush_cooldown_snapshot();
+        let pool_d = build_pool(&[("uid_a", 10.0, 0)]);
+        pool_d.set_log_ctx(&dir, "buddy");
+        pool_d.restore_cooldowns_from_store();
+        {
+            let entries = safe_lock(&pool_d.entries);
+            let e = entries.get("uid_a").unwrap();
+            assert_eq!(e.until, 0, "清除后重灌不得复活");
+            assert_eq!(e.hard_until, 0);
+            assert_eq!(e.rate_trips, 0, "清除语义须落库（空快照剔除行）");
+            assert!(e.per_model_cooldowns.is_empty());
+        }
+        // 手动清除冷却的账号不再被误恢复——正是 P1 与 clear_cooldowns 的配合点
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 区域隔离：pool_cooldowns 表按 "{pool}:{uid}" 记账，两池同 uid 不串扰
+    #[test]
+    fn cooldown_snapshot_isolated_per_pool_label() {
+        let dir = std::env::temp_dir().join(format!("aiwa_p1_iso_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let trae = build_pool(&[("uid_x", 10.0, 0)]);
+        trae.set_log_ctx(&dir, "trae");
+        trae.note_error("uid_x", ErrKind::SoftRate);
+        trae.flush_cooldown_snapshot();
+        // 同 uid 的 buddy 池回灌：trae 的冷却绝不得跨池复活
+        let buddy = build_pool(&[("uid_x", 10.0, 0)]);
+        buddy.set_log_ctx(&dir, "buddy");
+        buddy.restore_cooldowns_from_store();
+        let entries = safe_lock(&buddy.entries);
+        assert_eq!(entries.get("uid_x").unwrap().until, 0, "冷却不得跨池串扰");
+        drop(entries);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1747,6 +2404,8 @@ mod tests {
             err_count: 0, until: 0, reason: String::new(),
             device_id: String::new(), machine_id: String::new(),
             hard_until: 0, last_used: 1000, successes: 0, failures: 0, cb_trips: 0,
+            rate_trips: 0,
+            per_model_cooldowns: std::collections::HashMap::new(),
             domain: String::new(), enterprise_id: String::new(), global_region: false,
             refresh_invalid: false,
         };
@@ -1759,6 +2418,8 @@ mod tests {
                 err_count: 0, until: 0, reason: String::new(),
                 device_id: String::new(), machine_id: String::new(),
                 hard_until: 0, last_used: 0, successes: 0, failures: 0, cb_trips: 0,
+                rate_trips: 0,
+                per_model_cooldowns: std::collections::HashMap::new(),
                 domain: String::new(), enterprise_id: String::new(), global_region: false,
                 refresh_invalid: false,
             }
@@ -1790,6 +2451,21 @@ mod tests {
         assert_eq!(pick_p2c(&single, 7, now, &HashMap::new()).unwrap().uid, "b");
     }
 
+    /// 测试用 QoderSyncAccount 快速构造
+    fn acct_q(uid: &str, name: &str, token: &str, global: bool) -> crate::api_server::pool::QoderSyncAccount {
+        crate::api_server::pool::QoderSyncAccount {
+            uid: uid.to_string(),
+            name: name.to_string(),
+            access_token: token.to_string(),
+            machine_id: String::new(),
+            credits: Some(100.0),
+            credits_expire_at: None,
+            credits_fetched_at: Some(now_ts()),
+            needs_relogin: false,
+            global_region: global,
+        }
+    }
+
     /// 测试用 PoolEntry 快速构造
     fn test_entry(uid: &str, credits: f64, last_used: i64) -> PoolEntry {
         PoolEntry {
@@ -1810,6 +2486,8 @@ mod tests {
             successes: 0,
             failures: 0,
             cb_trips: 0,
+            rate_trips: 0,
+            per_model_cooldowns: std::collections::HashMap::new(),
             domain: String::new(),
             enterprise_id: String::new(),
             global_region: false,
@@ -1819,11 +2497,14 @@ mod tests {
 
     #[test]
     fn hard_credit_cools_until_next_0400() {
-        let pool = build_pool(&[("uid_a", 0.0, 0), ("uid_b", 5.0, 0)]);
+        // 余额为 0 才是「真·积分耗尽」：2026-10-20 起有余额的号会降级为短冷却，
+        // 整号 04:00 冻结只保留给零余额账号（原用 5 积分账号，语义已变更）
+        let pool = build_pool(&[("uid_a", 10.0, 0), ("uid_b", 0.0, 0)]);
         // 强制注入：模拟积分耗尽（hard_credit 由上游错误触发，不走 selectable 的零积分捷径）
         pool.note_error("uid_b", ErrKind::HardCredit);
         // uid_b 进入 QuotaProtection
-        assert_eq!(pool.status_list()[1].state, "QuotaProtection");
+        let st = pool.status_list().into_iter().find(|s| s.uid == "uid_b").unwrap();
+        assert_eq!(st.state, "QuotaProtection");
         // diagnose 给出 hard_credit 原因
         let d = pool.diagnose().into_iter().find(|x| x.uid == "uid_b").unwrap();
         assert!(d.reason.starts_with("hard_credit"));
@@ -1834,7 +2515,28 @@ mod tests {
                 e.hard_until = now_ts() - 1;
             }
         }
-        assert_eq!(pool.status_list()[1].state, "Available");
+        let st = pool.status_list().into_iter().find(|s| s.uid == "uid_b").unwrap();
+        assert_eq!(st.state, "Available");
+    }
+
+    /// 余额兜底（2026-10-20 事故修复）：号上积分仍 > 0 时不得整号冻结到 04:00——
+    /// 四个 700/1000 积分的国内号因一条额度文案齐冻一天，客户端持续「重新连接」。
+    /// 降级为普通冷却（不设 hard_until），账号很快回到可调度集合。
+    #[test]
+    fn hard_credit_with_positive_balance_downgrades() {
+        let pool = build_pool(&[("uid_a", 0.0, 0), ("uid_b", 700.0, 0)]);
+        pool.note_error("uid_b", ErrKind::HardCredit);
+        let status = pool.status_list().into_iter().find(|s| s.uid == "uid_b").unwrap();
+        assert!(!status.hard_credit, "有余额的号不应进入 04:00 硬冻结");
+        assert_eq!(
+            status.cooldown_reason.as_deref(),
+            Some("hard_credit_downgraded")
+        );
+        assert!(status.cooldown_until.is_some(), "降级后仍应有短冷却");
+        // 零余额号仍走原口径（真·积分耗尽才冻结到 04:00）
+        pool.note_error("uid_a", ErrKind::HardCredit);
+        let zero = pool.status_list().into_iter().find(|s| s.uid == "uid_a").unwrap();
+        assert!(zero.hard_credit, "零余额号应保持 hard_credit 冻结");
     }
 
     #[test]
@@ -1875,6 +2577,330 @@ mod tests {
         }
     }
 
+    // ==================== 6004 日限额：账号级冻结（模型级不受累） ====================
+
+    #[test]
+    fn cooldown_until_freezes_only_that_account() {
+        let pool = build_pool(&[("uid_a", 10.0, 0), ("uid_b", 10.0, 0)]);
+        let reset = now_ts() + 19 * 3600;
+        pool.cooldown_until("uid_a", reset);
+        let st = pool.status_list();
+        let a = st.iter().find(|s| s.uid == "uid_a").unwrap();
+        let b = st.iter().find(|s| s.uid == "uid_b").unwrap();
+        assert!(a.cooling, "被限额账号应进入冷却");
+        assert_eq!(a.cooldown_until, Some(reset), "冷却截止须为上游恢复时刻");
+        assert_eq!(a.cooldown_reason.as_deref(), Some("quota_reset"));
+        assert!(!b.cooling, "同池其他账号不受影响");
+        // 取号：uid_a 被冻，池内仍可选到 uid_b（这正是「自动换另一个账号」）
+        assert!(pool.pick_by_uid("uid_a").is_none(), "被冻账号不可取号");
+        assert!(pool.pick_by_uid("uid_b").is_some(), "另一账号应顶上");
+        assert!(pool.has_selectable());
+    }
+
+    /// 回归（2026-10-18 海外池实测）：模型级冷却表按裸模型名记账、不区分账号，
+    /// 一个号撞 429 就会把整个模型判死。判断「是否还有别的号能顶上」时必须排除
+    /// 当前命中的账号——否则刚被限流的号会把自己算成可用备选，得出「模型仍健康」
+    /// 的错误结论，进而继续把请求打给同一批号。
+    /// 回归（2026-10-18 用户实测 6004）：上游「可在其他模型继续使用」语义 =
+    /// 冷却必须按 (uid, model) 粒度，账号在该模型被限不影响其他模型调度。
+    #[test]
+    fn per_model_cooldown_blocks_only_that_model() {
+        let pool = build_pool(&[("uid_a", 10.0, 0)]);
+        let until = now_ts() + 2;
+        pool.per_model_cooldown_until("uid_a", "step-5-preview", until);
+        // step-5 视角：该号在冷却名单里（路由会并入 tried 排除它）
+        assert_eq!(pool.model_cooled_uids("step-5-preview"), vec!["uid_a".to_string()]);
+        // deepseek 视角：完全不受影响（积分模型照常可用——用户核心诉求）
+        assert!(pool.model_cooled_uids("deepseek-v4.1-flash").is_empty());
+        // 整账号 healthy 不受按模型冷却影响
+        assert!(pool.has_selectable(), "其他模型不应被整号冻结波及");
+        // 到期自动剔除
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        assert!(pool.model_cooled_uids("step-5-preview").is_empty(), "到期后必须恢复");
+        // 只增不减：更近的过去时刻不缩短；clear 全清
+        pool.per_model_cooldown_until("uid_a", "step-5-preview", now_ts() + 3600);
+        pool.per_model_cooldown_until("uid_a", "step-5-preview", now_ts() + 60);
+        assert_eq!(pool.model_cooled_uids("step-5-preview"), vec!["uid_a".to_string()]);
+        pool.clear_model_cooldowns("uid_a");
+        assert!(pool.model_cooled_uids("step-5-preview").is_empty());
+    }
+
+    /// 回归（2026-10-18 用户关切）：「冻结」必须是**有期限**的，绝不能变成永久封禁。
+    /// 覆盖三条恢复路径：① 精确重置时刻到期 ② SoftRate 递增冷却到期 ③ 手动清除。
+    /// 到期判断是纯时间比较（`healthy` 里 `now < until`），不存在把账号永久踢出的状态；
+    /// 但必须同时确认「解冻后可被重新选中」以及「计数器不会把下次冷却直接顶满」。
+    #[test]
+    fn frozen_account_recovers_after_every_cooldown_path() {
+        // ① cooldown_until 精确到期即恢复（模拟上游给的 03:23:29 到了）
+        let pool = build_pool(&[("uid_a", 10.0, 0)]);
+        pool.cooldown_until("uid_a", now_ts() + 2);
+        assert!(!pool.has_selectable(), "冻结期内不可选");
+        std::thread::sleep(std::time::Duration::from_millis(2100));
+        assert!(pool.has_selectable(), "重置时刻到期后必须重新可用");
+
+        // ② SoftRate 递增冷却到期后恢复，且计数在成功后退回基准
+        let pool2 = build_pool(&[("uid_b", 10.0, 0)]);
+        for _ in 0..3 {
+            pool2.note_error("uid_b", ErrKind::SoftRate);
+        }
+        // 冷却确实很长（递增生效），但仍是有限值，不是永封
+        let st = pool2.status_list();
+        let e = st.iter().find(|s| s.uid == "uid_b").unwrap();
+        let left = e.cooldown_until.unwrap() - now_ts();
+        assert!(left > 0 && left <= 30 * 60, "冷却须有限且在 30 分钟上限内：{left}s");
+
+        // ③ 手动清除冷却后立即可用，且连续计数归零（下次限频不会直接顶满）
+        let cleared = pool2.clear_cooldowns();
+        assert!(cleared >= 1);
+        assert!(pool2.has_selectable(), "手动清除后立即可用");
+        pool2.note_error("uid_b", ErrKind::SoftRate); // 模拟成功后又撞一次
+        let st = pool2.status_list();
+        let e = st.iter().find(|s| s.uid == "uid_b").unwrap();
+        assert!(
+            e.cooldown_until.unwrap() - now_ts() <= 60,
+            "清除后计数应归零，下次限频回到 60s 基准"
+        );
+    }
+
+    /// 回归（2026-10-19 用户实测 BUG）：池内仅剩一个账号时，不能因为「该模型
+    /// 冷却中」就判无可用账号——那等于把账号停了。has_other_selectable_for_model
+    /// 排除当前账号后为 false，正是「必须放行」的信号。
+    #[test]
+    fn single_account_not_blocked_by_its_own_model_cooldown() {
+        let pool = build_pool(&[("only_one", 10.0, 0)]);
+        // 该账号在某模型上被上游限流（6004「可切换其他模型继续」）
+        pool.per_model_cooldown_until("only_one", "hy4-preview", now_ts() + 3600);
+        assert!(pool.is_model_cooling("only_one", "hy4-preview"));
+        // 关键：排除自己之后没有备选 → has_other_selectable_for_model = false
+        // 调用方据此放行，而不是返回 no_healthy_account
+        assert!(
+            !pool.has_other_selectable_for_model("only_one", None, None),
+            "池内仅一个账号时，不得把它自己的模型冷却当成「无可用账号」"
+        );
+        // 账号整体仍然可选（其他模型照常可用）
+        assert!(pool.pick_by_uid("only_one").is_some(), "账号本身必须保持可选");
+        // 多账号场景：有备选 → true（此时换号是正确的）
+        let pool2 = build_pool(&[("a", 10.0, 0), ("b", 10.0, 0)]);
+        pool2.per_model_cooldown_until("a", "hy4-preview", now_ts() + 3600);
+        assert!(
+            pool2.has_other_selectable_for_model("a", None, None),
+            "池内有其他账号时应换号"
+        );
+        assert!(pool2.pick_by_uid("b").is_some());
+    }
+
+    /// 回归（2026-10-19）：sync_from_* 增量合并不丢运行态。旧版全量重建会把
+    /// HardCredit/cb_trips/rate_trips/per_model_cooldowns 清零，导致冷却被静默
+    /// 丢弃、账号提前解冻并反复打上游。
+    #[test]
+    fn sync_preserves_runtime_cooldown_state() {
+        let pool = ApiPool::new();
+        // 首次入池
+        pool.sync_from_qoder(
+            &[acct_q("qd_a", "A", "tok", true), acct_q("qd_b", "B", "tok", true)],
+            &["qd_a".into(), "qd_b".into()],
+        );
+        // 制造运行态：qd_a 积分耗尽 + 某模型被限流 + 连续限频 2 次
+        pool.note_error("qd_a", ErrKind::HardCredit);
+        pool.per_model_cooldown_until("qd_a", "qwen3.8-flash", now_ts() + 7200);
+        pool.note_error("qd_a", ErrKind::SoftRate);
+        pool.note_error("qd_a", ErrKind::SoftRate);
+        // 触发一次同步（模拟账号导入/OAuth/改名后的 reload_pools_if_running）
+        pool.sync_from_qoder(
+            &[acct_q("qd_a", "A-renamed", "tok2", true), acct_q("qd_b", "B", "tok", true)],
+            &["qd_a".into(), "qd_b".into()],
+        );
+        let st = pool.status_list();
+        let a = st.iter().find(|s| s.uid == "qd_a").unwrap();
+        assert_eq!(a.name, "A-renamed", "快照字段应更新");
+        // HardCredit 冷却必须跨同步保留：表现是该账号在 04:00 前取不到号
+        assert!(
+            pool.pick_by_uid("qd_a").is_none(),
+            "HardCredit 冷却必须跨 sync 保留（否则账号提前解冻、反复打上游）"
+        );
+        // 同池另一个账号不受影响，照常可选
+        assert!(pool.pick_by_uid("qd_b").is_some(), "其他账号不得被牵连");
+        assert!(pool.is_model_cooling("qd_a", "qwen3.8-flash"), "按模型冷却必须保留");
+    }
+
+    /// 回归（2026-10-18）：日额度耗尽但文案解析不出重置时刻时，账号会退化成
+    /// SoftRate 60s。若每次撞完就 60s 解冻、又被选中，就是无限循环（每轮还浪费
+    /// 一次真实上游往返）。连续命中须递增冷却，成功才清零。
+    #[test]
+    fn soft_rate_cooldown_escalates_and_resets_on_success() {
+        let pool = build_pool(&[("uid_a", 10.0, 0)]);
+        let mut prev = 0i64;
+        for round in 1..=4 {
+            pool.note_error("uid_a", ErrKind::SoftRate);
+            let st = pool.status_list();
+            let e = st.iter().find(|s| s.uid == "uid_a").unwrap();
+            let left = e.cooldown_until.unwrap() - now_ts();
+            assert!(
+                left > prev,
+                "第 {round} 次连续限频的冷却应长于上一次（{left}s vs {prev}s）"
+            );
+            prev = left;
+            assert!(e.cooling, "冷却窗口内不可被选中");
+        }
+        // 成功一次即清零：下一次限频回到 60s 基准
+        pool.note_success("uid_a");
+        pool.note_error("uid_a", ErrKind::SoftRate);
+        let st = pool.status_list();
+        let e = st.iter().find(|s| s.uid == "uid_a").unwrap();
+        assert!(
+            e.cooldown_until.unwrap() - now_ts() <= 60,
+            "成功后计数须清零，冷却回到基准 60s"
+        );
+    }
+
+    /// 回归（P0-1，2026-10-19）：请求级错误（ErrKind::None，如 4001 模型配置
+    /// 缺失；ErrKind::Client，如 context_too_long）与账号健康无关。此前 5 处
+    /// 调用点缺守卫，同一模型错误让全池每号各计 3 次 → 全部连坐熔断 30 分钟。
+    /// 守卫下沉到 note_error 入口后，直传 None/Client 也必须无痕。
+    #[test]
+    fn request_level_errors_never_touch_account_health() {
+        let pool = build_pool(&[("uid_a", 10.0, 0)]);
+        for _ in 0..5 {
+            pool.note_error("uid_a", ErrKind::None);
+        }
+        let st = pool.status_list();
+        let e = st.iter().find(|s| s.uid == "uid_a").unwrap();
+        assert_eq!(e.err_count, 0, "None 不得累计连续错误数");
+        assert!(!e.cooling, "None 不得触发冷却/熔断");
+        assert!(!e.disabled, "None 不得禁用账号");
+        assert_eq!(
+            pool.selectable_stats_in(None).1,
+            1,
+            "账号必须仍可被选中"
+        );
+        // 对照：Client（未知 4xx）保留原熔断记忆语义，仍计入 err_count
+        pool.note_error("uid_a", ErrKind::Client);
+        assert_eq!(pool.status_list()[0].err_count, 1, "Client 仍应计入连续错误");
+    }
+
+    /// 回归（P2-7，2026-10-19）：手动清除冷却即用户宣告「已恢复」，
+    /// cb_trips 必须同步清零——否则清除后下次撞墙直接 1h 起步（30m×2^1），
+    /// 与「清除后可用」预期相悖。
+    #[test]
+    fn clear_cooldowns_resets_circuit_breaker_memory() {
+        let pool = build_pool(&[("uid_a", 10.0, 0)]);
+        // 3 次连续 Server 错误触发首个熔断（30m，cb_trips → 1）
+        for _ in 0..3 {
+            pool.note_error("uid_a", ErrKind::Server);
+        }
+        let e = pool.status_list().remove(0);
+        let first_span = e.cooldown_until.unwrap() - now_ts();
+        assert!((29 * 60..=31 * 60).contains(&first_span), "首熔应为 30m，实测 {first_span}s");
+        pool.clear_cooldowns();
+        // 清除后再撞满 3 次：必须回到 30m 基准而非 60m
+        for _ in 0..3 {
+            pool.note_error("uid_a", ErrKind::Server);
+        }
+        let e = pool.status_list().remove(0);
+        let second_span = e.cooldown_until.unwrap() - now_ts();
+        assert!(
+            (29 * 60..=31 * 60).contains(&second_span),
+            "清除冷却后熔断应重置为 30m 基准，实测 {second_span}s（若 ≈3600 即 cb_trips 未清）"
+        );
+    }
+
+    /// 回归（P2-6，2026-10-19）：successes/failures 单调累计会让历史稀释
+    /// 近期表现（100 败 + 100 成 = 0.5 永远抬不起来）。窗口衰减后，
+    /// 恢复期的连串成功应把 success_rate 拉回高位。
+    #[test]
+    fn success_fail_counters_use_rolling_window() {
+        let pool = build_pool(&[("uid_a", 10.0, 0)]);
+        // 先制造大量失败
+        for _ in 0..60 {
+            pool.note_error("uid_a", ErrKind::Server);
+        }
+        // 再大量成功：衰减必须让失败占比降下来（不衰减则恒定 0.5）
+        for _ in 0..80 {
+            pool.note_success("uid_a");
+        }
+        let (succ, fail) = {
+            let entries = safe_lock(&pool.entries);
+            let e = entries.get("uid_a").unwrap();
+            (e.successes, e.failures)
+        };
+        assert!(succ + fail <= 51, "总数应被窗口封顶（≤51），实测 {}", succ + fail);
+        assert!(
+            succ > fail * 2,
+            "近期成功应显著占优（succ={succ} fail={fail}），否则历史稀释未修"
+        );
+    }
+
+    #[test]
+    fn selectable_excluding_current_account_detects_fallback() {
+        let pool = build_pool(&[("uid_a", 10.0, 0), ("uid_b", 10.0, 0)]);
+        // 三个号里 a 限频冷却，b 健康：排除 a 后仍应看到 b
+        pool.note_error("uid_a", ErrKind::SoftRate);
+        let (_, in_allowed) =
+            pool.selectable_stats_in_region_excluding(None, None, Some("uid_a"));
+        assert_eq!(in_allowed, 1, "排除被限流账号后应仍有一个健康号可顶上");
+        // 池内仅剩 a（排除后为空）——这才是「确实没有备选」
+        let solo = build_pool(&[("uid_a", 10.0, 0)]);
+        solo.note_error("uid_a", ErrKind::SoftRate);
+        let (_, after) = solo.selectable_stats_in_region_excluding(None, None, Some("uid_a"));
+        assert_eq!(after, 0, "池内无其他账号时应判定为无备选");
+        // 不排除时口径不变（保持原 has_selectable 语义）
+        assert_eq!(pool.selectable_stats_in_region(None, None).1, 1);
+    }
+
+    /// 区域作用域备选判定（海外 Qoder 189s 假死修复的池层基座，2026-10-19）：
+    /// 排除某号后「是否还有备选」必须只看**同区**账号——此前 qoder 执行路径
+    /// 传 (None, None)，国内健康号让海外请求误判「有备选」，排队快退 429
+    /// 永不触发，逐号 90s 空转放大成 503。
+    #[test]
+    fn region_scoped_other_selectable_ignores_cross_region_accounts() {
+        let pool = ApiPool::new();
+        pool.sync_from_qoder(
+            &[
+                acct_q("qd-cn", "国内号", "tk", false),
+                acct_q("qd-gl", "海外号", "tk", true),
+            ],
+            &["qd-cn".to_string(), "qd-gl".to_string()],
+        );
+        // 海外请求视角：排除唯一海外号 → 无备选（国内号不得顶替）
+        assert!(
+            !pool.has_other_selectable_for_model("qd-gl", None, Some(true)),
+            "国内健康号不得被算作海外请求的备选"
+        );
+        assert_eq!(
+            pool.selectable_stats_in_region_excluding(None, Some(true), Some("qd-gl"))
+                .1,
+            0,
+            "海外区排除自身后应为 0"
+        );
+        // 国内请求视角：排除海外号 → 国内号仍在
+        assert!(pool.has_other_selectable_for_model("qd-gl", None, Some(false)));
+        // 不带区域过滤（历史语义）仍看到跨区备选——回归保护
+        assert!(pool.has_other_selectable_for_model("qd-gl", None, None));
+        // has_selectable_in_region（dispatch 健康预检新口径）：区域无号 = false
+        pool.note_error("qd-gl", ErrKind::SoftRate);
+        assert!(
+            !pool.has_selectable_in_region(None, Some(true)),
+            "海外号全冷却时海外 Key 应判池不健康"
+        );
+        assert!(
+            pool.has_selectable_in_region(None, Some(false)),
+            "国内号不受海外冷却影响"
+        );
+    }
+
+    #[test]
+    fn cooldown_until_never_shortens_and_ignores_past() {
+        let pool = build_pool(&[("uid_a", 10.0, 0)]);
+        let now = now_ts();
+        // 已有更长冷却 → 更短的恢复时刻不得缩短
+        pool.cooldown_until("uid_a", now + 3600);
+        pool.cooldown_until("uid_a", now + 60);
+        assert_eq!(pool.status_list()[0].cooldown_until, Some(now + 3600));
+        // 过去/非法时刻：不处理（不产生冷却、不改 reason）
+        pool.cooldown_until("uid_b", now - 1);
+        assert!(pool.pick_by_uid("uid_a").is_some() || pool.status_list()[0].cooling);
+    }
+
     #[test]
     fn next_0400_is_between_1s_and_24h_away() {
         let now = now_ts();
@@ -1887,6 +2913,52 @@ mod tests {
             let local = t + 8 * 3600;
             assert_eq!(local % 86400, 4 * 3600);
         }
+    }
+
+    /// next_0000（Qoder 免费额度重置时刻，2026-10-19）：严格在未来、不超 24h，
+    /// 本地时钟恰落 00:00
+    #[test]
+    fn next_0000_is_midnight_tomorrow() {
+        let now = now_ts();
+        for offset in [0i64, 3600, 86_399] {
+            let t = next_0000(now + offset);
+            let delta = t - (now + offset);
+            assert!(delta > 0 && delta <= 24 * 3600, "delta={delta}");
+            assert_eq!((t + 8 * 3600) % 86400, 0);
+        }
+        // next_0000 与 next_0400 的先后取决于当前本地时刻：04:00 之后两者都指向
+        // 明天（00:00 先于 04:00）；00:00–04:00 之间 next_0400 是今天 04:00 而
+        // next_0000 是明天 00:00（前者更早）。原断言恒要求后者更大，凌晨跑必失败
+        let local_hour = (now + 8 * 3600) % 86400 / 3600;
+        if local_hour >= 4 {
+            assert!(next_0000(now) < next_0400(now), "local_hour={local_hour}");
+        } else {
+            assert!(next_0400(now) < next_0000(now), "local_hour={local_hour}");
+        }
+    }
+
+    /// Qoder 免费额度按 (uid,model) 冷却：账号对其他模型照常可选，
+    /// 单号池「无备选放行」判定与排除同区语义（119 误冻结整号事故回归锁）
+    #[test]
+    fn qoder_free_model_cooldown_keeps_account_selectable() {
+        let pool = ApiPool::new();
+        pool.sync_from_qoder(
+            &[
+                acct_q("qd-a", "号A", "tk", false),
+                acct_q("qd-b", "号B", "tk", false),
+            ],
+            &["qd-a".to_string(), "qd-b".to_string()],
+        );
+        let reset = next_0000(now_ts());
+        pool.per_model_cooldown_until("qd-a", "Qwen3.8-Flash", reset);
+        // 账号级健康不受影响（selectable/healthy 仍 true——不整号冻结）
+        assert!(pool.is_model_cooling("qd-a", "Qwen3.8-Flash"), "该模型应冷却");
+        assert!(!pool.is_model_cooling("qd-a", "其他模型"), "其他模型不受影响");
+        // 有同区备选 → 换号信号为 true
+        assert!(pool.has_other_selectable_for_model("qd-a", None, Some(false)));
+        // 冷却到期自动失效
+        pool.per_model_cooldown_until("qd-a", "m-exp", now_ts() - 1);
+        assert!(!pool.is_model_cooling("qd-a", "m-exp"), "过期条目视为无冷却");
     }
 
     // ==================== P2 修复10：cb_trips 不被非 Server 错误重置 ====================
@@ -1983,6 +3055,7 @@ mod tests {
                     credits: None,
                     credits_expire_at: None,
                     credits_fetched_at: None,
+                global_region: false,
                 },
                 crate::api_server::pool::QoderSyncAccount {
                     uid: "qd-dead".into(),
@@ -1993,6 +3066,7 @@ mod tests {
                     credits: None,
                     credits_expire_at: None,
                     credits_fetched_at: None,
+                global_region: false,
                 },
                 // 空令牌账号不入池（无法签名）
                 crate::api_server::pool::QoderSyncAccount {
@@ -2004,6 +3078,7 @@ mod tests {
                     credits: None,
                     credits_expire_at: None,
                     credits_fetched_at: None,
+                global_region: false,
                 },
             ],
             &["qd-1".to_string(), "qd-dead".to_string(), "qd-empty".to_string()],
@@ -2026,6 +3101,7 @@ mod tests {
                 credits: None,
                 credits_expire_at: None,
                 credits_fetched_at: None,
+            global_region: false,
             }],
             &["qd-dead".to_string()],
         );
@@ -2048,6 +3124,7 @@ mod tests {
                 credits: Some(42.0),
                 credits_expire_at: Some(1_999_999_999),
                 credits_fetched_at: Some(1_700_000_000),
+            global_region: false,
             }],
             &["qd-c".to_string()],
         );
@@ -2068,12 +3145,14 @@ mod tests {
                     uid: "qd-a".into(), name: String::new(), access_token: "tk".into(),
                     machine_id: String::new(), needs_relogin: false,
                     credits: Some(0.0), credits_expire_at: Some(1), credits_fetched_at: Some(1),
+                global_region: false,
                 },
                 crate::api_server::pool::QoderSyncAccount {
                     uid: "qd-b".into(), name: String::new(), access_token: "tk".into(),
                     machine_id: String::new(), needs_relogin: false,
                     credits: Some(5.0), credits_expire_at: Some(1_999_999_999),
                     credits_fetched_at: Some(1),
+                global_region: false,
                 },
             ],
             &["qd-a".to_string(), "qd-b".to_string()],
@@ -2112,6 +3191,7 @@ mod tests {
                 uid: "qd-0".into(), name: String::new(), access_token: "tk".into(),
                 machine_id: String::new(), needs_relogin: false,
                 credits: Some(0.0), credits_expire_at: None, credits_fetched_at: Some(1),
+            global_region: false,
             }],
             &["qd-0".to_string()],
         );
@@ -2133,6 +3213,7 @@ mod tests {
                 uid: "qd-0".into(), name: String::new(), access_token: "tk".into(),
                 machine_id: String::new(), needs_relogin: true,
                 credits: Some(0.0), credits_expire_at: Some(1), credits_fetched_at: Some(1),
+            global_region: false,
             }],
             &["qd-0".to_string()],
         );

@@ -23,10 +23,15 @@ pub async fn zcode_wb_capture(state: State<'_, ZcodeState>) -> AppResult<WbAccou
     service::capture_current(&state.db).await
 }
 
-/// 切换到此账号:退出 WorkBuddy → 替换会话文件 → 重新启动
+/// 切换到此账号:退出 WorkBuddy → 替换会话文件 → 重新启动。
+/// 海外会话注入海外 ACC 配置(否则客户端以国内产品域配置启动,海外登录态连不上)。
 #[tauri::command]
-pub async fn zcode_wb_switch(state: State<'_, ZcodeState>, id: i64) -> AppResult<()> {
-    service::switch_account(&state.db, id).await
+pub async fn zcode_wb_switch(state: State<'_, ZcodeState>, app: tauri::AppHandle, id: i64) -> AppResult<()> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| crate::zcode::error::AppError::Other(format!("无法定位数据目录: {e}")))?;
+    service::switch_account(&state.db, id, &dir).await
 }
 
 #[tauri::command]

@@ -75,6 +75,10 @@ pub async fn start_api_server(
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = host.clone();
     ensure_bind_auth_policy(&host, &super::api_keys::load(&state.data_dir))?;
+    // 海外号池专用 Key 预置（幂等；Qoder/Buddy 各一把 region=global，见 api_keys）
+    super::api_keys::ensure_overseas_pool_keys(&state.data_dir);
+    // 存量 Key 一次性迁移为「仅国内」（用户裁决；幂等标记防重复）
+    super::api_keys::normalize_legacy_key_regions(&state.data_dir);
     let bind_host = state
         .listen_host
         .lock()
@@ -125,6 +129,10 @@ fn spawn_persistence_flusher(state: Arc<ApiSharedState>) {
             };
             state.flush_usage_dirty();
             crate::api_server::api_keys::flush_dirty(&state.data_dir);
+            // P1：三池运行态冷却脏时快照落库（干净即跳过，2s 周期零成本）
+            state.pool.flush_cooldown_snapshot();
+            state.wb_pool.flush_cooldown_snapshot();
+            state.qoder_pool.flush_cooldown_snapshot();
         });
 }
 
@@ -280,30 +288,28 @@ fn spawn_wb_health_probe(state: Arc<ApiSharedState>) {
             let Some(state) = weak.upgrade() else {
                 return;
             };
-            let picked = state.wb_pool.pick_excluding_constrained(
-                &std::collections::HashSet::new(),
-                None,
-                None,
-            );
-            if let Some(p) = picked {
-                match wb_catalog::fetch_and_replace(
-                    &state.data_dir,
-                    &p.uid,
-                    &p.jwt,
-                    &p.domain,
-                    &p.enterprise_id,
-                    p.global_region,
-                ) {
+            // 分区刷新（修复「海外账号模型目录」）：两区各取一个含凭证账号，
+            // 各自拉取并写入区域目录（CN/Global 两份存储，读取侧合并）；
+            // 单区失败不影响另一区（best effort，失败不影响启动）
+            for (uid, jwt, domain, eid, global) in state.wb_pool.pick_one_per_region() {
+                match wb_catalog::fetch_and_replace(&state.data_dir, &uid, &jwt, &domain, &eid, global) {
                     Ok(n) => {
                         crate::fs_utils::app_log(
                             &state.data_dir,
-                            &format!("WB 模型目录动态替换成功: {} 个模型", n),
+                            &format!(
+                                "WB 模型目录动态替换成功（{}区）: {} 个模型",
+                                if global { "海外" } else { "国内" },
+                                n
+                            ),
                         );
                     }
                     Err(e) => {
                         crate::fs_utils::app_log(
                             &state.data_dir,
-                            &format!("WB 模型目录动态替换失败（保持静态兜底）: {}", e),
+                            &format!(
+                                "WB 模型目录动态替换失败（{}区）: {e}",
+                                if global { "海外" } else { "国内" }
+                            ),
                         );
                     }
                 }

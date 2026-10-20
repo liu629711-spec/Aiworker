@@ -139,6 +139,13 @@ pub struct DeviceEntry {
     pub market_user_id: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
+    /// 手动锁定：true 时 OAuth 登录回写（writeback_oauth_device）不得覆盖
+    /// device_id。用于多账号各持一个真实注册设备号的场景——OAuth 登录设备号
+    /// 必须与 icube 签名私钥同源（F-78），会被回写成 icube did，与手动分配
+    /// 的签到设备号（如 aha_doctor 通道号）冲突；锁定后登录照常、签到设备号
+    /// 保持手动分配值。mint 脚本/手动改 device_map 时置 true。
+    #[serde(default)]
+    pub locked: bool,
 }
 
 pub type DeviceMap = HashMap<String, DeviceEntry>;
@@ -655,6 +662,36 @@ pub struct AccountCooldownsFile {
     pub updated_at: Option<String>,
 }
 
+/// 网关三池运行态冷却快照（P1 落库持久化，pool_cooldowns 表）：
+/// 内存 `PoolEntry` 里的 until/hard_until/cb_trips/rate_trips/per_model_cooldowns
+/// 此前进程重启即清零，导致「重启前被上游限流冻结的号，重启后立刻被重新选中再打
+/// 429」以及「SoftRate/Server 递增退避记忆丢失」。本快照由网关 2s flusher 在
+/// 冷却脏标置位时整池落库，启动时经 `ApiPool::restore_persisted` 回灌仍在池内账号
+/// 的运行态（不复活已从池中移除的号）。
+///
+/// uid 前缀带池标签（trae/buddy/qoder），三池共用一张表天然不撞；Trae 池的
+/// `until`/`err_count` 同时被既有 account_cooldowns 表消费（签到解冻、重置 UI），
+/// 本快照对 Trae 只补 hard_until/cb_trips/rate_trips/按模型这几项增量字段。
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct PoolCooldownSnapshot {
+    /// 软冷却截止（Unix 秒），0 = 无
+    pub until: i64,
+    /// hard_credit 冷却截止（次日 04:00），0 = 无
+    pub hard_until: i64,
+    /// 连续熔断次数（Server 30m 起指数递增至 6h）
+    pub cb_trips: u32,
+    /// 连续限额次数（SoftRate 递增退避）
+    pub rate_trips: u32,
+    /// 冷却原因（错误分类名或 consecutive_errors/hard_credit）
+    pub reason: String,
+    /// 连续错误计数（熔断器阈值 3 的进度，重启不丢）
+    #[serde(default)]
+    pub err_count: i32,
+    /// model → 冷却截止（Unix 秒）：6004「可切换其他模型」按 (uid,model) 冻结
+    #[serde(default)]
+    pub per_model: HashMap<String, i64>,
+}
+
 /// API 池配置文件：api_pool.json
 #[derive(Serialize, Deserialize)]
 pub struct ApiPoolFile {
@@ -774,6 +811,21 @@ pub struct ApiPoolFile {
     /// 覆盖 qoder_sticky store 的 EXPLICIT_TTL_SECS 常量（旧版硬编码不可配）
     #[serde(default = "default_sticky_ttl_secs")]
     pub qoder_sticky_ttl_secs: u64,
+    // ── ZCode 上游（z.ai GLM OAuth 池，api.z.ai/api/anthropic）───────────
+    /// ZCode 池白名单（账号 id 列表；空 = 全部含凭证账号入池）。账号源 =
+    /// zcode.sqlite（zcode 域管理），网关只读
+    #[serde(default)]
+    pub zcode_enabled_uids: Vec<String>,
+    /// ZCode 上游开关：开启后 GLM-5.3/GLM-5.3-Flash 模型可路由 ZCode 账号池。
+    /// 默认 true（账号已在 zcode 域维护，关闭属显式动作）
+    #[serde(default = "default_true")]
+    pub zcode_enabled: bool,
+    /// ZCode 池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限）
+    #[serde(default = "default_account_concurrency_limit")]
+    pub zcode_account_concurrency_limit: u32,
+    /// ZCode 池粘性 TTL 秒（per-pool 三参数之一，默认 300）
+    #[serde(default = "default_pool_sticky_ttl_secs")]
+    pub zcode_pool_sticky_ttl_secs: u64,
 }
 
 fn default_hedge_threshold_ms() -> u64 {
@@ -835,6 +887,10 @@ impl Default for ApiPoolFile {
             qoder_strategy: String::new(),
             qoder_enabled_uids: Vec::new(),
             qoder_group_ids: Vec::new(),
+            zcode_enabled_uids: Vec::new(),
+            zcode_enabled: true,
+            zcode_account_concurrency_limit: default_account_concurrency_limit(),
+            zcode_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
             trae_tag_ids: Vec::new(),
             wb_tag_ids: Vec::new(),
             qoder_tag_ids: Vec::new(),
@@ -847,6 +903,10 @@ impl Default for ApiPoolFile {
 pub struct PoolStatus {
     pub uid: String,
     pub name: String,
+    /// 账号所属区（2026-10-17 海外接入）：true=海外——Key 编辑弹框候选按
+    /// Key 区域约束置灰/标注的依据
+    #[serde(default)]
+    pub global_region: bool,
     pub credits: Option<f64>,
     pub credits_expire_at: Option<i64>,
     pub cooling: bool,

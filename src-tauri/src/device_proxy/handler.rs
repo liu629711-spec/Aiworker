@@ -568,15 +568,23 @@ fn write_accounts(ctx: &ProxyCtx, cfg: &serde_json::Value) -> Result<(), String>
 /// 新 JWT 捕获成功 → 自动解除该账号冷却（对齐 Python clear_cooldown 意图；
 /// Python 版实为 NameError 空转，此处为真实修复）
 fn clear_cooldown(ctx: &ProxyCtx, user_id: &str) {
-    // SQLite 化（P3）：冷却状态经 store 读写
-    let mut cd = crate::store::docs::account_cooldowns_load(&crate::store::db(&ctx.data_dir));
-    if cd.cooldowns.remove(user_id).is_some() {
-        cd.updated_at = Some(crate::fs_utils::now_iso());
-        if crate::store::docs::account_cooldowns_save(&crate::store::db(&ctx.data_dir), &cd).is_ok() {
-            ctx.log.log(&format!(
-                "  [冷却解除] uid={user_id}（新 JWT 捕获成功，自动解除登录失效标记）"
-            ));
-        }
+    // SQLite 化（P3）：冷却状态经 store 读写。
+    // 持锁读改写（2026-10-19 修正）：旧版在锁外 load→save，与签到/手动清冷却
+    // 并发时会用旧快照整表覆盖，抹掉别人刚写入的新冷却条目。
+    let removed = crate::store::docs::with_account_cooldowns(
+        &crate::store::db(&ctx.data_dir),
+        |cd| {
+            let hit = cd.cooldowns.remove(user_id).is_some();
+            if hit {
+                cd.updated_at = Some(crate::fs_utils::now_iso());
+            }
+            Ok(hit)
+        },
+    );
+    if removed.unwrap_or(false) {
+        ctx.log.log(&format!(
+            "  [冷却解除] uid={user_id}（新 JWT 捕获成功，自动解除登录失效标记）"
+        ));
     }
 }
 
@@ -625,6 +633,83 @@ fn try_capture_refresh_token(ctx: &ProxyCtx, path: &str, resp_body: &[u8]) {
     };
     // 一次持锁同时更新 JWT 与 refresh_token（审查修复：两段锁间隙会落盘半更新中间态）
     update_account_jwt_and_refresh(ctx, &uid, &validated, Some(rt));
+}
+
+// ---------------- aha_doctor device_register 设备号捕获（2026-10-19 自动 mint 基座） --------
+
+/// 截获 Trae 客户端 aha_doctor 通道的 device_register 响应（log-klink.zijieapi.com，
+/// channel=aha_doctor），把服务端分配/确认的 device_id 落入设备号池（doctor_did 池）。
+///
+/// 用途：签到需要「每账号一个真实注册设备号」（派生号 9074、一机一天一号 9095）。
+/// 客户端每次启动都会注册 1-2 个号；此前这些号只用一次就丢弃，新增账号没有真实号
+/// 可绑就永远签不上。此处把号收进池子，配号命令（device_ensure_real）从池中取
+/// 未占用的号绑定给无设备号的账号——新增账号在下次客户端启动后自动具备签到资格。
+pub(crate) fn try_capture_device_register(ctx: &ProxyCtx, host: &str, path: &str, resp_body: &[u8]) {
+    if !host.contains("zijieapi.com") || !path.contains("device_register") {
+        return;
+    }
+    if !path.contains("channel=aha_doctor") {
+        return; // icube 通道（ICDRS）的号不参与签到配额，不收
+    }
+    // device_id 优先取 URL 参数（注册确认请求带 did）；响应体为 aha 私有加密格式
+    // （293B 二进制信封），不做体解析
+    let did = path
+        .split("device_id=")
+        .nth(1)
+        .and_then(|s| s.split('&').next())
+        .filter(|s| !s.is_empty() && s.len() >= 10 && s.chars().all(|c| c.is_ascii_digit()));
+    let Some(did) = did else { return };
+    // URL 里出现 device_id 有两种形态：注册确认（服务端已分配）与首次注册（不带）。
+    // 此处只收「请求 URL 显式带号」的确认形态——首次注册的分配结果由客户端写入
+    // applog.cache2，由 mint/配号流程按需读取，避免把响应解析复杂化。
+    let iid = path
+        .split("iid=")
+        .nth(1)
+        .and_then(|s| s.split('&').next())
+        .unwrap_or("")
+        .to_string();
+    let cdid = path
+        .split("cdid=")
+        .nth(1)
+        .and_then(|s| s.split('&').next())
+        .unwrap_or("")
+        .to_string();
+    if did == "0" {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let meta_key = format!("doctor_meta:{did}");
+    // 不手动持 DEVICE_MAP_LOCK：device_map_save 自身是 choke-point（内部持锁），
+    // 外层再拿同一把非重入锁会死锁（2026-10-19 测试实测挂起 60s+）。
+    // load 无锁读取 + save 内部持锁写回即可。
+    let store = crate::store::db(&ctx.data_dir);
+    let mut map = crate::store::docs::device_map_load(&store);
+    // 池条目：pk 用 `doctor:<did>`，仅记录号本身，不占用任何账号。
+    // 已存在（locked 绑定 / 既有池条目）→ 幂等刷新。
+    let pk = format!("doctor:{did}");
+    if !map.contains_key(&pk) {
+        map.insert(
+            pk.clone(),
+            crate::models::DeviceEntry {
+                device_id: did.to_string(),
+                market_user_id: None,
+                session_id: None,
+                locked: false,
+            },
+        );
+        let _ = crate::store::docs::device_map_save(&store, &map);
+    }
+    // 采集元数据（iid/cdid/时间）走 kv 独立键，避免污染 DeviceEntry 结构
+    let meta = serde_json::json!({
+        "iid": iid,
+        "cdid": cdid,
+        "seen_at": now,
+        "source": "proxy_capture",
+    });
+    let _ = crate::store::db(&ctx.data_dir).kv_set(&meta_key, &meta);
+    ctx.log.log(&format!(
+        "  [设备号池] aha_doctor 注册号已采集: {did}（可用于新增账号配号）"
+    ));
 }
 
 // ---------------- 豆包会话凭证抓取 ----------------
@@ -859,6 +944,17 @@ async fn forward_upstream<S: AsyncRead + AsyncWrite + Unpin>(
                     try_capture_doubao_credentials(&ctx2, &host2, &req_h, &resp_h);
                 });
             }
+            // aha_doctor 设备号采集（2026-10-19 自动 mint 基座）：注册确认请求
+            // 带 device_id 的即采集入池；涉及 SQLite 写盘走 blocking
+            {
+                let ctx2 = Arc::clone(ctx);
+                let host2 = host.to_string();
+                let path2 = req.path.clone();
+                let body2 = resp_body.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    try_capture_device_register(&ctx2, &host2, &path2, &body2);
+                });
+            }
             ctx.req_logger.log_request(
                 &method,
                 host,
@@ -1067,7 +1163,22 @@ pub async fn serve_mitm<S: AsyncRead + AsyncWrite + Unpin>(
             let uid = auth_header_value(&req).and_then(extract_user_id);
             match uid {
                 Some(uid) => {
-                    let dev = crate::commands::accounts::derive_device(&uid);
+                    // 设备头改写：优先取 device_map 中该账号的真实注册设备号
+                    //（OAuth 回写 / 代理捕获 / 手动登记），条目缺失才回落 uid 派生。
+                    // 2026-10-16 事故修复：此前此处无条件改写为 derive_device(uid)
+                    // 派生假号，真实客户端发起的签到被换成假设备号后必被服务端
+                    // 9074 拒绝（x-device-id 必须是客户端注册过的设备号）。
+                    let dev = {
+                        let store = crate::store::db(&ctx.data_dir);
+                        let _g = crate::store::docs::DEVICE_MAP_LOCK
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        crate::store::docs::device_map_load(&store)
+                            .get(&uid)
+                            .filter(|e| !e.device_id.is_empty())
+                            .cloned()
+                            .unwrap_or_else(|| crate::commands::accounts::derive_device(&uid))
+                    };
                     let mut rewritten = req;
                     rewritten.hset("x-device-id", dev.device_id.clone());
                     // 派生值缺失时不注入空头（审查修复：空值头非法且可能被上游 400）
@@ -1129,6 +1240,66 @@ fn auth_header_value(req: &RawRequest) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 设备号池采集（自动 mint 基座，2026-10-19）：doctor 通道注册确认请求的
+    /// device_id 入池（doctor:<did> 键）；icube 通道与无号请求不采；重复采集幂等。
+    #[test]
+    fn device_register_capture_pools_doctor_did() {
+        let dir = std::env::temp_dir().join(format!(
+            "aiwork_dcap_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let captured = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let ctx = ProxyCtx {
+            log: ProxyLog::new(dir.join("proxy.log"), None, captured),
+            req_logger: Arc::new(RequestLogger::new(dir.clone())),
+            targets: vec!["zijieapi.com".to_string()],
+            auto_capture_jwt: true,
+            data_dir: dir.clone(),
+            upstream: None,
+            direct_domains: Arc::new(Vec::new()),
+            pin_state: Mutex::new(std::collections::HashMap::new()),
+        };
+        // doctor 通道带号 → 采集
+        try_capture_device_register(
+            &ctx,
+            "log-klink.zijieapi.com",
+            "/service/2/device_register/?device_id=2362203548509033&iid=744827358573812&cdid=abc&channel=aha_doctor&aid=776330",
+            b"{}",
+        );
+        let store = crate::store::db(&dir);
+        let map = crate::store::docs::device_map_load(&store);
+        assert!(map.contains_key("doctor:2362203548509033"), "应入池");
+        assert_eq!(map["doctor:2362203548509033"].device_id, "2362203548509033");
+        // 幂等：重复采集不炸不重复
+        try_capture_device_register(
+            &ctx,
+            "log-klink.zijieapi.com",
+            "/service/2/device_register/?device_id=2362203548509033&iid=744827358573812&cdid=abc&channel=aha_doctor",
+            b"{}",
+        );
+        // icube 通道（非 aha_doctor）→ 不采
+        try_capture_device_register(
+            &ctx,
+            "log-klink.zijieapi.com",
+            "/service/2/device_register/?device_id=1111222233334444&channel=icube",
+            b"{}",
+        );
+        // 无号请求 → 不采
+        try_capture_device_register(
+            &ctx,
+            "log-klink.zijieapi.com",
+            "/service/2/device_register/?cdid=abc&channel=aha_doctor",
+            b"{}",
+        );
+        let map2 = crate::store::docs::device_map_load(&store);
+        assert!(map2.contains_key("doctor:2362203548509033"));
+        assert!(!map2.contains_key("doctor:1111222233334444"), "icube 通道不入池");
+        assert_eq!(map2.len(), map.len(), "无号/重复采集不增条目");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn jwt_validation_and_uid_extraction() {

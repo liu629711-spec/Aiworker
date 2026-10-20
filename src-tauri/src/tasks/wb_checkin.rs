@@ -963,13 +963,36 @@ pub fn run_growth_round(state: &AppState, flags: &GrowthOpts, uids: &[String], e
         accounts.retain(|a| uids.iter().any(|u| s_of(a.get("id")) == *u));
     }
     emit(&json!({"type": "start", "total": accounts.len(), "mode": "growth"}));
+    // 处置前置（wb_health 状态机口径）：Dead（服务端吊销）/NoCredential 账号跳过成长——
+    // 凭证必 401，事件对齐签到契约（status=fail）让前端统计口径一致。
+    let token_store = wb_common::load_token_store(state);
+    let now_ms = chrono::Utc::now().timestamp_millis();
     // 多账号成长间隔（与签到共用 wb_checkin_gap_secs，默认 3s，0=关闭）：防上游频控
     let gap_secs = crate::models::effective_checkin_gap(state.settings().wb_checkin_gap_secs);
     for (i, acct) in accounts.iter().enumerate() {
         if i > 0 && gap_secs > 0 {
             std::thread::sleep(std::time::Duration::from_secs(gap_secs));
         }
-        let mut ev = process_account_growth(state, &agent, acct, flags);
+        let name = first_str(&[
+            acct.get("nickname").and_then(Value::as_str).map(str::to_string),
+            Some(s_of(acct.get("uid")).chars().take(8).collect()),
+        ]);
+        let aid = s_of(acct.get("id"));
+        // token_store 是 {"tokens": {...}}，须下钻 tokens 层；顶层 get 恒 None 会把
+        // 全部账号误判「没有凭证记录」（2026-10-19 与 wb_credits 同源 bug）
+        let verdict = crate::tasks::wb_health::classify_record(
+            token_store.get("tokens").and_then(|t| t.get(aid.as_str())),
+            py_truthy(acct.get("needs_relogin")),
+            now_ms,
+        );
+        let mut ev = if matches!(
+            verdict.disposition,
+            crate::tasks::wb_health::Disposition::Skip | crate::tasks::wb_health::Disposition::Manual
+        ) {
+            json!({ "type": "growth", "user_id": aid, "name": name, "status": "fail", "message": verdict.hint })
+        } else {
+            process_account_growth(state, &agent, acct, flags)
+        };
         ev["index"] = json!(i + 1);
         emit(&ev);
     }
@@ -989,9 +1012,26 @@ pub fn run_renew_only(state: &AppState, lazy_hours: i64) -> Value {
         .cloned()
         .unwrap_or_default();
     let mut items: Vec<Value> = vec![];
+    // 处置前置（wb_health 状态机口径）：Dead（服务端吊销）/NoCredential 账号跳过刷新——
+    // 吊销凭证 refresh 必失败且耗一次网络往返，唯一出路是 OAuth 重扫；Expiring/Expired
+    // （Warn）正是本任务要刷的对象，必须放行。
+    let token_store = wb_common::load_token_store(state);
+    let now_ms = chrono::Utc::now().timestamp_millis();
     for acct in &accounts {
         let aid = s_of(acct.get("id"));
         if aid.is_empty() {
+            continue;
+        }
+        let verdict = crate::tasks::wb_health::classify_record(
+            token_store.get("tokens").and_then(|t| t.get(aid.as_str())),
+            py_truthy(acct.get("needs_relogin")),
+            now_ms,
+        );
+        if matches!(
+            verdict.disposition,
+            crate::tasks::wb_health::Disposition::Skip | crate::tasks::wb_health::Disposition::Manual
+        ) {
+            items.push(json!({"user_id": aid, "refreshed": false, "note": "skipped", "reason": verdict.hint}));
             continue;
         }
         let (creds, refreshed, note) = wb_common::ensure_fresh(state, &agent, acct, lazy_hours);

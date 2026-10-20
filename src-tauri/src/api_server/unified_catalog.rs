@@ -110,10 +110,16 @@ fn normalize_unified_efforts(list: Vec<String>) -> Vec<String> {
     out
 }
 
-/// 图片支持推断：Code / Flash 系列明确不支持（优先判定，如 Seed-Code）；
-/// Seed 系列（豆包多模态）与名称含「数字+V」（如 GLM-5V-Turbo）支持；未知 → None（显示 —）
+/// 图片支持推断（无目录元数据时的兜底；L1/L2 有真实条目时优先，见 unified 装配处）。
+///
+/// 只保留**确定无视觉**的编码模型前缀：`-code` / `code-` 系列（如 seed-code）。
+/// 「flash」不再作为否定判据（2026-10-19 修正）：glm-5.3-flash / qwen3-flash 等
+/// 上游实际支持图片输入，按名字含 flash 一律判 false 会让 /v1/models 误报
+/// 「不支持识图」，客户端因此不把图片发给网关（实测用户用 glm-5.3-flash 看图对话
+/// 正常，网关却声明 supports_image=false）。
+/// Seed 系列（豆包多模态）与名称含「数字+V」（如 GLM-5V-Turbo）支持；未知 → None。
 fn infer_supports_image(canonical: &str) -> Option<bool> {
-    if canonical.contains("code") || canonical.contains("flash") {
+    if canonical.ends_with("-code") || canonical.starts_with("code-") || canonical.contains("-code-") {
         return Some(false);
     }
     if canonical.contains("seed") {
@@ -248,7 +254,7 @@ pub fn unified_models_whitelisted(
     trae_ok: bool,
     buddy_ok: bool,
 ) -> Vec<UnifiedModel> {
-    unified_models_whitelisted_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None)
+    unified_models_whitelisted_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None, None)
 }
 
 /// 同 [`unified_models_whitelisted`]，`qoder = Some((开关, 池健康))` 时合并
@@ -259,9 +265,10 @@ pub fn unified_models_whitelisted_ex(
     trae_ok: bool,
     buddy_ok: bool,
     qoder: Option<(bool, bool)>,
+    zcode: Option<(bool, bool)>,
 ) -> Vec<UnifiedModel> {
     let wl = load_whitelist(data_dir);
-    unified_models_ex(data_dir, wb_enabled, trae_ok, buddy_ok, qoder)
+    unified_models_ex(data_dir, wb_enabled, trae_ok, buddy_ok, qoder, zcode)
         .into_iter()
         .filter(|m| whitelist_allows(&wl, &m.id))
         .collect()
@@ -384,7 +391,7 @@ pub fn unified_models(
     trae_ok: bool,
     buddy_ok: bool,
 ) -> Vec<UnifiedModel> {
-    unified_models_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None)
+    unified_models_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None, None)
 }
 
 /// 同 [`unified_models`]，`qoder = Some((开关, 池健康))` 时合并 Qoder 目录：
@@ -395,6 +402,7 @@ pub fn unified_models_ex(
     trae_ok: bool,
     buddy_ok: bool,
     qoder: Option<(bool, bool)>,
+    zcode: Option<(bool, bool)>,
 ) -> Vec<UnifiedModel> {
     let l1 = load_meta(data_dir);
     // 注（issue #38-4 排查决策）：Trae 侧快照（kv api_models）无条件参与聚合，
@@ -411,6 +419,8 @@ pub fn unified_models_ex(
         TargetPool::Custom => true,
         // Qoder：开关 && 池健康（调用方未提供旗标时该源不参与聚合）
         TargetPool::Qoder => qoder.map_or(false, |(e, ok)| e && ok),
+        // ZCode：开关 && 池健康（调用方未提供旗标时该源不参与聚合）
+        TargetPool::ZCode => zcode.map_or(false, |(e, ok)| e && ok),
     };
 
     let mut order: Vec<String> = Vec::new();
@@ -429,6 +439,11 @@ pub fn unified_models_ex(
     let mut qoder_ctx: HashMap<String, u64> = HashMap::new();
     let mut qoder_mt: HashMap<String, u64> = HashMap::new();
     let mut qoder_img: HashMap<String, bool> = HashMap::new();
+    // ZCode 侧候选值（镜像 qoder_* 模式）：命中 zcode 时才应用，池禁用时
+    // 残留声明不拖低多源条目
+    let mut zcode_ctx: HashMap<String, u64> = HashMap::new();
+    let mut zcode_mt: HashMap<String, u64> = HashMap::new();
+    let mut zcode_img: HashMap<String, bool> = HashMap::new();
     // 自定义模型供应商（canonical → 用户填写值；聚合末段优先于系列推断）
     let mut custom_vendor: HashMap<String, String> = HashMap::new();
 
@@ -711,6 +726,92 @@ pub fn unified_models_ex(
         }
     }
 
+    // 源5：ZCode（z.ai GLM OAuth 池，对外标识 zcode）——静态目录（GLM-5.3 /
+    // GLM-5.3-Flash，1M ctx / 128K out / low·max·high 档位）。开关关闭或调用方
+    // 未提供旗标时不合并（同 Qoder 模式）。GLM-5.3 与 Trae/Buddy 三池同款 →
+    // 已存在 canonical 仅追加来源标记 + 候选值；zcode 独有模型（flashx 等
+    // 未收录）不会到这里——目录只收录 ZCode 客户端声明的两款
+    if let Some((_zcode_enabled, _zcode_ok)) = zcode {
+        for m in super::zcode_catalog::list_json() {
+            let Some(id) = m.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let canonical = canonical_id(id);
+            if canonical.is_empty() {
+                continue;
+            }
+            let zrate: Option<f64> = None; // z.ai 按套餐配额，无倍率概念
+            let zctx = m.get("maxInputTokens").and_then(Value::as_u64).filter(|v| *v > 0);
+            let zmt = m.get("maxOutputTokens").and_then(Value::as_u64).filter(|v| *v > 0);
+            let zimg = m.get("supportsImages").and_then(Value::as_bool);
+            let zdisplay = m
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(id)
+                .to_string();
+            let zvendor = m
+                .get("vendor")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("智谱 AI")
+                .to_string();
+            let zefforts: Vec<String> = m
+                .get("efforts")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .unwrap_or_default();
+            match acc.get_mut(&canonical) {
+                Some(u) => {
+                    u.sources.push(UnifiedSource {
+                        pool: "zcode",
+                        rate: zrate,
+                        enabled: enabled_of(TargetPool::ZCode),
+                    });
+                    if let Some(c) = zctx {
+                        zcode_ctx.insert(canonical.clone(), c);
+                    }
+                    if let Some(t) = zmt {
+                        zcode_mt.insert(canonical.clone(), t);
+                    }
+                    if let Some(img) = zimg {
+                        zcode_img.insert(canonical.clone(), img);
+                    }
+                    if !zefforts.is_empty() {
+                        u.efforts = super::efforts::declared_union(&[
+                            std::mem::take(&mut u.efforts),
+                            zefforts,
+                        ]);
+                    }
+                }
+                None => {
+                    order.push(canonical.clone());
+                    acc.insert(
+                        canonical.clone(),
+                        UnifiedModel {
+                            id: id.to_string(),
+                            display: zdisplay,
+                            vendor: zvendor,
+                            region: None,
+                            rate: zrate,
+                            efforts: zefforts,
+                            max_mode: false,
+                            context_length: zctx,
+                            max_tokens: zmt,
+                            supports_image: zimg,
+                            sources: vec![UnifiedSource {
+                                pool: "zcode",
+                                rate: zrate,
+                                enabled: enabled_of(TargetPool::ZCode),
+                            }],
+                            manual: false,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
     let mut out: Vec<UnifiedModel> = order
         .into_iter()
         .filter_map(|c| acc.remove(&c))
@@ -775,6 +876,18 @@ pub fn unified_models_ex(
                 u.supports_image = Some(*img);
             }
         }
+        // context_length/max_tokens/supports_image 命中 zcode → ZCode 目录声明
+        if hit == Some("zcode") {
+            if let Some(c) = zcode_ctx.get(&canonical) {
+                u.context_length = Some(*c);
+            }
+            if let Some(t) = zcode_mt.get(&canonical) {
+                u.max_tokens = Some(*t);
+            }
+            if let Some(img) = zcode_img.get(&canonical) {
+                u.supports_image = Some(*img);
+            }
+        }
         // display：L1 人工 label 绝对最高优先（§3.2，覆盖双源展示名）；
         // 未人工维护时命中 buddy → 取 WB 展示名，命中 trae → 保持 Trae 侧（已含 L2 label）
         if let Some(label) = l1.get(&canonical).and_then(|m| m.label.clone()) {
@@ -819,6 +932,21 @@ pub fn unified_models_ex(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 图片支持推断（2026-10-19 修正）：flash 不再等于「不支持」——
+    /// glm-5.3-flash / qwen3-flash 上游实际支持图片输入（用户实测可用）；
+    /// 仅编码模型（-code 形态）确定无视觉；未知返回 None 交给上层显示 —。
+    #[test]
+    fn infer_supports_image_no_longer_blacklists_flash() {
+        assert_eq!(infer_supports_image("glm-5.3-flash"), None, "flash 不应被判不支持");
+        assert_eq!(infer_supports_image("qwen3-flash"), None);
+        // 编码模型仍确定排除
+        assert_eq!(infer_supports_image("seed-code"), Some(false));
+        assert_eq!(infer_supports_image("my-code-model"), Some(false));
+        // 已知多模态仍判定支持
+        assert_eq!(infer_supports_image("doubao-seed-1.6"), Some(true));
+        assert_eq!(infer_supports_image("glm-5v-turbo"), Some(true));
+    }
 
     /// 测试数据目录脚手架：写 api_models / wb_model_catalog / trae_model_meta
     struct Fixture {
@@ -867,13 +995,17 @@ mod tests {
                            "supported_efforts": ["low","medium","high"], "rate": 0.79})
                 })
                 .collect();
-            st.kv_set(
-                "wb_model_catalog",
-                // 模拟「人工维护」目录：必须携带当前 builtin_rev 才退出内置表重建
-                //（wb_catalog::load 对旧版本自动落盘的目录按新快照重建，见该文件 BUILTIN_REV 注释）
-                &json!({"models": list, "builtin_rev": crate::api_server::wb_catalog::BUILTIN_REV}),
-            )
-            .unwrap();
+            // 两区同种子（海外区有 builtin_global 兜底：只写 CN 键会让海外内置
+            // 表并进合并目录，破坏「WB 侧恰为种子」的断言前提）
+            for key in ["wb_model_catalog", crate::api_server::wb_catalog::KV_KEY_GLOBAL] {
+                st.kv_set(
+                    key,
+                    // 模拟「人工维护」目录：必须携带当前 builtin_rev 才退出内置表重建
+                    //（wb_catalog::load 对旧版本自动落盘的目录按新快照重建，见该文件 BUILTIN_REV 注释）
+                    &json!({"models": list, "builtin_rev": crate::api_server::wb_catalog::BUILTIN_REV}),
+                )
+                .unwrap();
+            }
         }
         if let Some(m) = meta {
             st.kv_set_raw("trae_model_meta", &m.to_string()).unwrap();
@@ -1090,16 +1222,19 @@ mod tests {
                     &json!({"priority": ["buddy", "trae"], "per_model": {}, "fallback": true}))
             .unwrap();
         super::super::config_cache::invalidate(&f.dir, "dispatch_policy");
-        crate::store::db(&f.dir)
-            .kv_set(
-                "wb_model_catalog",
-                &json!({"models": [{"id": "glm-5.3", "display": "GLM-5.3", "context_length": 0,
-                               "max_tokens": 0, "supports_image": true,
-                               "supported_efforts": [], "rate": 0.0}],
-                        "builtin_rev": crate::api_server::wb_catalog::BUILTIN_REV}),
-            )
-            .unwrap();
+        for key in ["wb_model_catalog", crate::api_server::wb_catalog::KV_KEY_GLOBAL] {
+            crate::store::db(&f.dir)
+                .kv_set(
+                    key,
+                    &json!({"models": [{"id": "glm-5.3", "display": "GLM-5.3", "context_length": 0,
+                                   "max_tokens": 0, "supports_image": true,
+                                   "supported_efforts": [], "rate": 0.0}],
+                            "builtin_rev": crate::api_server::wb_catalog::BUILTIN_REV}),
+                )
+                .unwrap();
+        }
         super::super::config_cache::invalidate(&f.dir, "wb_model_catalog");
+        super::super::config_cache::invalidate(&f.dir, "wb_model_catalog_merged");
         let list = unified_models(&f.dir, true, true, true);
         assert_eq!(find(&list, "glm-5.3").rate, Some(0.0), "WB rate=0 = 免费声明（命中 buddy 侧透传）");
     }

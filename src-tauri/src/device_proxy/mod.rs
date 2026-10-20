@@ -84,12 +84,20 @@ pub const DEFAULT_TARGETS: &[&str] = &[
 /// 上游直连白名单默认域（p3-2e）：命中域的转发流量跳过用户 VPN 直接连目标。
 /// 实测依据（2026-09-30）：qoder 各域经上游 VPN（7890）全挂（IDE chat「无法连接
 /// 服务器」），关闭系统代理直连即恢复——这些是国内域，VPN 分流反而破坏出口路径。
+/// workbuddy/codebuddy 域族同因加入（2026-10-17 实测）：经上游 VPN 访问
+/// workbuddy.ai 返回 HTTP 404、直连 200——海外客户端走系统代理（本代理）时
+/// 登录/接口全被上游出口破坏（用户报障「海外客户端连不上」根因）。
 /// 可用环境变量 `UPSTREAM_BYPASS_DOMAINS`（逗号分隔）覆盖默认值。
 pub const DEFAULT_UPSTREAM_BYPASS_DOMAINS: &[&str] = &[
     "qoder.com.cn",
     "qoder.sh",
     "qoder.cn",
     "qoder.ai",
+    "workbuddy.ai",
+    "codebuddy.ai",
+    "workbuddy.cn",
+    "codebuddy.cn",
+    "tencentbuddy.com",
 ];
 
 /// 解析直连白名单域：环境变量 `UPSTREAM_BYPASS_DOMAINS`（逗号分隔）优先，
@@ -707,7 +715,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 
 /// 把 checkin_accounts.json 中各账号的 device 字段刷新为当前算法生成的设备标识
 ///（对齐 Python `sync_account_devices`：升级历史记录中由旧算法生成的假占位符
-/// device_id 全 '2' / session_id 全 '5'；仅当字段确实变化时才写盘）
+/// device_id 全 '2' / session_id 全 '5'；仅当字段确实变化时才写盘）。
+/// 2026-10-16 修订：只升级假占位符，**OAuth 回写 / 代理捕获 / 手动登记的真实
+/// 注册设备号一律保留**（详见循环内注释——无差别覆写会制造 9074 签到失败）。
 pub fn sync_account_devices(ctx: &ProxyCtx) {
     let _g = handler::accounts_lock().lock().unwrap_or_else(|e| e.into_inner());
     // SQLite 化（P3）：accounts 表 raw 读写（保留扩展字段与数字 uid 兼容语义）
@@ -732,10 +742,47 @@ pub fn sync_account_devices(ctx: &ProxyCtx) {
             .filter(|s| !s.is_empty());
         let Some(uid) = uid else { continue };
         let dev = crate::commands::accounts::derive_device(&uid);
-        let same = a.get("device_id").and_then(|v| v.as_str()) == Some(dev.device_id.as_str())
-            && a.get("session_id").and_then(|v| v.as_str()) == dev.session_id.as_deref()
-            && a.get("market_user_id").and_then(|v| v.as_str()) == dev.market_user_id.as_deref();
-        if same {
+        // 仅升级「假占位符」，真实注册设备号一律保留：
+        // ① 缺失/空值；② 旧算法特征——device_id 全同一数字（对齐 PS 注释的
+        //    gen=1 全 '2'；服务端分配的真实设备号不可能全同数字）或 session_id
+        //    全 '5'；③ 当前派生值本身（刷新幂等，salt 变更时同步三元组）。
+        // OAuth 回写 / 代理捕获 / 手动登记的真实号不是以上任何一类——
+        // 2026-10-16 事故复盘：此前无差别覆写成 derive_device(uid) 派生假号，
+        // 而服务端（约 2026-09-30 起）校验 x-device-id 必须是客户端真实注册过
+        // 的设备号，派生号一律 9074「当前参与用户太多」；一台设备一天只能签
+        // 一个账号（9095），多账号签到依赖每账号各持一个真实设备号。
+        let cur_dev = a.get("device_id").and_then(|v| v.as_str()).unwrap_or("");
+        let cur_sess = a.get("session_id").and_then(|v| v.as_str());
+        let uniform_digits = !cur_dev.is_empty()
+            && cur_dev.chars().all(|c| c.is_ascii_digit())
+            && cur_dev
+                .chars()
+                .all(|c| Some(c) == cur_dev.chars().next());
+        let sess_all_five = cur_sess
+            .map(|s| !s.is_empty() && s.chars().all(|c| c == '5'))
+            .unwrap_or(false);
+        let is_placeholder = cur_dev.is_empty()
+            || uniform_digits
+            || sess_all_five
+            || cur_dev == dev.device_id.as_str();
+        if !is_placeholder {
+            // 真实设备号：仅补全缺失的三元组非关键字段，绝不动 device_id
+            let mut filled = false;
+            if a.get("market_user_id").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                if let Some(mid) = dev.market_user_id.clone() {
+                    a["market_user_id"] = serde_json::Value::String(mid);
+                    filled = true;
+                }
+            }
+            if a.get("session_id").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+                if let Some(sid) = dev.session_id.clone() {
+                    a["session_id"] = serde_json::Value::String(sid);
+                    filled = true;
+                }
+            }
+            if filled {
+                changed = true;
+            }
             continue;
         }
         a["device_id"] = serde_json::Value::String(dev.device_id.clone());
@@ -757,6 +804,153 @@ pub fn sync_account_devices(ctx: &ProxyCtx) {
         } else {
             ctx.log.log("  [sync] 账号设备标识写入失败（未落库）");
         }
+    }
+    // 新增账号自动配号（2026-10-19）：池内账号若仍持有派生假号（9074 风险）且
+    // 设备号池（doctor:<did> 池条目，代理启动/客户端注册时采集）有空闲真实号 →
+    // 自动绑定。绑定即 locked（防 OAuth 回写覆盖）。这让「新增 Trae 账号 → 客户端
+    // 随便启动一次 → 自动具备签到资格」成为默认行为，无需手动 mint。
+    auto_assign_doctor_devices(ctx, &cfg["accounts"]);
+}
+
+/// 从 doctor 设备号池给持有派生假号的账号自动配号。
+/// 判定「假号」：与 derive_device(uid) 相同（确定性派生）——真实注册号不可能
+/// 恰好等于派生值。池空闲判定：doctor: 前缀条目且未被任何账号 device_map 占用。
+/// 读取 aha_doctor 本地事件缓存里当前设备号（`%LOCALAPPDATA%\aha_doctor\<app>\event\applog.cache2`）。
+///
+/// 该文件是 aha SDK 的二进制小缓存，含 `install_id` / `device_id` / `cdid` 三个字段，
+/// device_id 为 8 字节小端整数（客户端首次注册后由服务端分配写入）。这是「客户端
+/// 本轮实际注册到哪个号」的唯一非加密真源——代理 URL 采集只在注册确认请求带号时
+/// 命中，首次注册路径依赖本函数补齐（2026-10-19 自动配号链路）。
+fn read_aha_doctor_cached_did() -> Option<String> {
+    let local = std::env::var_os("LOCALAPPDATA")?;
+    let mut base = std::path::PathBuf::from(local);
+    base.push("aha_doctor");
+    // 客户端目录名随产品（Trae / Trae CN / SOLO CN …）——逐个探测
+    for app in ["Trae CN", "Trae", "SOLO CN"] {
+        let mut p = base.clone();
+        p.push(app);
+        p.push("event");
+        p.push("applog.cache2");
+        let Ok(buf) = std::fs::read(&p) else { continue };
+        let needle = b"device_id";
+        let Some(idx) = buf.windows(needle.len()).position(|w| w == needle) else {
+            continue;
+        };
+        // 从字段名之后扫描 8 字节小端整数，取第一个落在服务端 did 量级的值
+        let mut i = idx;
+        while i + 8 <= buf.len() {
+            let v = u64::from_le_bytes(buf[i..i + 8].try_into().ok()?);
+            if (100_000_000_000_000..10_000_000_000_000_000).contains(&v) {
+                return Some(v.to_string());
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+fn auto_assign_doctor_devices(ctx: &ProxyCtx, accounts: &serde_json::Value) {
+    let Some(accs) = accounts.as_array() else { return };
+    let store = crate::store::db(&ctx.data_dir);
+    // 不手动持 DEVICE_MAP_LOCK：device_map_save 是 choke-point（内部持锁），
+    // 外层再拿同一把非重入锁会死锁（同 try_capture_device_register 修复）。
+    // 载入→改→存 由 save 内部锁保证写侧互斥；此处读快照竞态可接受
+    //（同函数在代理启动与登录回写后都会再跑一轮，漏配下轮补上）。
+    let mut map = crate::store::docs::device_map_load(&store);
+    // ① 先把「客户端本轮注册到的 did」收进池：客户端首次注册不带 device_id，
+    // 分配结果只写进 %LOCALAPPDATA%\aha_doctor\<app>\event\applog.cache2；
+    // 代理侧 URL 采集（确认形态）拿不到它，这里直接读文件补齐。
+    if let Some(fresh) = read_aha_doctor_cached_did() {
+        let pk = format!("doctor:{fresh}");
+        let occupied_by_account = map
+            .iter()
+            .any(|(k, e)| !k.starts_with("doctor:") && e.device_id == fresh);
+        if !map.contains_key(&pk) && !occupied_by_account {
+            map.insert(
+                pk,
+                crate::models::DeviceEntry {
+                    device_id: fresh.clone(),
+                    market_user_id: None,
+                    session_id: None,
+                    locked: false,
+                },
+            );
+            ctx.log.log(&format!("  [设备号池] 从 aha_doctor 缓存采集新号 {fresh}"));
+        }
+    }
+    // ② 占用集合：所有非 doctor: 键的 device_id
+    let occupied: std::collections::HashSet<String> = map
+        .iter()
+        .filter(|(k, _)| !k.as_str().starts_with("doctor:"))
+        .map(|(_, e)| e.device_id.clone())
+        .collect();
+    // 空闲池号（未被任何账号占用）
+    let free: Vec<String> = map
+        .iter()
+        .filter(|(k, _)| k.as_str().starts_with("doctor:"))
+        .map(|(_, e)| e.device_id.clone())
+        .filter(|d| !d.is_empty() && !occupied.contains(d))
+        .collect();
+    if free.is_empty() {
+        return;
+    }
+    let mut assigned = 0usize;
+    let mut pool = free.clone();
+    // 同号冲突检测（9095 根治，2026-10-19）：一个真实设备号被 N 个账号共用时，
+    // 一天只有一个能签上（服务端按 device_id 计配额）。此处统计每个 did 的占用
+    // 账号数，占用 ≥2 的组里保留第一个，其余改配池内空闲号。
+    let mut did_owners: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for (k, e) in map.iter() {
+        if !k.starts_with("doctor:") && !e.device_id.is_empty() {
+            did_owners.entry(e.device_id.clone()).or_default().push(k.clone());
+        }
+    }
+    let mut needs_reassign: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (_, owners) in did_owners.iter() {
+        if owners.len() > 1 {
+            // 保留第一个（稳定：按 uid 字典序最小者），其余待改配
+            let mut sorted = owners.clone();
+            sorted.sort();
+            for uid in sorted.into_iter().skip(1) {
+                needs_reassign.insert(uid);
+            }
+        }
+    }
+    for a in accs {
+        let uid = a
+            .get("UserID")
+            .or_else(|| a.get("user_id"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let Some(uid) = uid else { continue };
+        let derived = crate::commands::accounts::derive_device(uid);
+        let entry = map.entry(uid.to_string()).or_insert_with(|| {
+            // 无条目 → 即派生假号持有者；直接以派生值入表再替换
+            crate::commands::accounts::derive_device(uid)
+        });
+        let is_fake = entry.device_id == derived.device_id;
+        let is_shared = needs_reassign.contains(uid);
+        if !is_fake && !is_shared {
+            continue; // 真实且独占的号，不动
+        }
+        let Some(did) = pool.pop() else { break };
+        let old = entry.device_id.clone();
+        entry.device_id = did.clone();
+        entry.locked = true;
+        assigned += 1;
+        ctx.log.log(&format!(
+            "  [配号] uid={uid} 自动绑定设备号池空闲号 {did}（原 {}：{}）",
+            old,
+            if is_fake { "派生假号" } else { "多号共用" }
+        ));
+    }
+    if assigned > 0 {
+        let _ = crate::store::docs::device_map_save(&store, &map);
+        crate::fs_utils::app_log(
+            &ctx.data_dir,
+            &format!("设备号池自动配号完成: 本轮绑定 {assigned} 个账号"),
+        );
     }
 }
 
@@ -949,6 +1143,43 @@ mod tests {
         sync_account_devices(&ctx);
         let after: serde_json::Value = crate::store::docs::accounts_load_raw(&crate::store::db(&dir));
         assert_eq!(cfg["accounts"][0]["device_id"], after["accounts"][0]["device_id"]);
+    }
+
+    /// 真实注册设备号（非占位符、非派生值）必须原样保留，缺失的
+    /// session/market 才补全——2026-10-16 事故修复的回归测试
+    #[test]
+    fn sync_preserves_real_device_ids() {
+        let dir = temp_dir("sync_real");
+        let ctx = test_ctx(&dir);
+        crate::store::docs::accounts_save_raw(
+            &crate::store::db(&dir),
+            &serde_json::json!({
+                "accounts": [
+                    // 真实设备号 + 完整三元组（OAuth 回写 / 手动登记形态）
+                    {"name": "real", "UserID": "1325345171053931", "device_id": "744827358569716",
+                     "session_id": "abc123", "market_user_id": "m1"},
+                    // 真实设备号 + 缺失 session/market：只补空字段，不动 device_id
+                    {"name": "real2", "user_id": 12345, "device_id": "1853105110786875"}
+                ]
+            }),
+        )
+        .unwrap();
+        sync_account_devices(&ctx);
+        let cfg: serde_json::Value =
+            crate::store::docs::accounts_load_raw(&crate::store::db(&dir));
+        let acc = &cfg["accounts"];
+        assert_eq!(acc[0]["device_id"].as_str().unwrap(), "744827358569716");
+        assert_eq!(acc[0]["session_id"].as_str().unwrap(), "abc123");
+        assert_eq!(acc[0]["market_user_id"].as_str().unwrap(), "m1");
+        assert_eq!(acc[1]["device_id"].as_str().unwrap(), "1853105110786875");
+        // 缺失的 session/market 被补全（derive 恒有值）
+        assert!(acc[1]["session_id"].as_str().is_some());
+        assert!(acc[1]["market_user_id"].as_str().is_some());
+        // 二次同步仍无变化（幂等）
+        sync_account_devices(&ctx);
+        let after: serde_json::Value =
+            crate::store::docs::accounts_load_raw(&crate::store::db(&dir));
+        assert_eq!(cfg, after);
     }
 
     /// 缺 accounts 数组 / 空表时静默返回，不报错不写库

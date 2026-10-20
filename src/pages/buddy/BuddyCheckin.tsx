@@ -223,7 +223,10 @@ export default function BuddyCheckin() {
     setLines([]);
     setDoneInfo(null);
     try {
-      await api.workbuddy.checkinStart({ skip_checked_in: true, skip_expired: false });
+      // skip_expired=true（2026-10-18）：已标记「需重新登录」的账号直接跳过——
+      // 其 refresh token 已被吊销，签到必失败且服务端对死凭证会拖延 ~39s/次 ×3 轮
+      // 重试，白等两分钟并拖动整轮耗时。恢复仍走 OAuth 重扫（账号页）。
+      await api.workbuddy.checkinStart({ skip_checked_in: true, skip_expired: true });
     } catch (err) {
       setRunning(false);
       pushToast('error', `发起签到失败：${String(err)}`);

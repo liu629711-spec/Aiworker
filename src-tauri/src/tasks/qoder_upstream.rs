@@ -48,6 +48,16 @@ use crate::tasks::qoder_sign::{self, CosyIdentity};
 /// Qoder 对话上游（CN 推理网关；签名路径会剥去 `/algo` 前缀与查询串，
 /// 见 `qoder_sign::signature_path` 的测试背书）
 pub const QODER_CHAT_URL: &str = "https://gateway.qoder.com.cn/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1";
+
+/// 对话端点按区构造：`QODER_CHAT_URL` 为 CN 固化形态（既有调用/单测锚点），
+/// 海外区仅替换主机（api3.qoder.sh），路径与 query 与 CN 实测同构。
+pub fn chat_url_for(global: bool) -> String {
+    if global {
+        format!("{}{}", QoderRegion::Global.gateway(), "algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1")
+    } else {
+        QODER_CHAT_URL.to_string()
+    }
+}
 /// 对话上游 host（传输错误文案用）
 pub const QODER_CHAT_HOST: &str = "https://gateway.qoder.com.cn";
 
@@ -161,7 +171,7 @@ fn vendor_of(id: &str) -> Option<&'static str> {
 /// 倍率取**正常价**：断网/未登录才用这张表，折扣由远程刷新如实带回。
 fn fallback(region: QoderRegion) -> Vec<Value> {
     let global: &[(&str, &str, bool, bool, &[&str], bool, bool, &str)] = &[
-        ("Qwen3.8-Flash", "qfmodel", true, true, &["low", "medium", "xhigh"], true, true, "0.1"),
+        ("Qwen3.8-Flash", "qfmodel", true, true, &["low", "medium", "xhigh"], true, true, "0.0"),
         ("Qwen3.8-Max", "qmodel_38max", true, true, &["low", "medium", "xhigh"], true, true, "0.5"),
         // 产品决策下线的模型（Auto/Ultimate/Performance/Efficient/Sonus/Cantus）
         // 不进兜底表——远程清单带回也会被 `REMOVED_MODEL_IDS` 过滤（parse_catalog）
@@ -391,6 +401,11 @@ fn catalog_test_lock() -> &'static std::sync::Mutex<()> {
 }
 
 /// 某地区当前生效的清单（远程优先，否则静态兜底）
+/// 指定区域目录快照（额度中心免费档记账用；进程级单例状态的 pub 包装）
+pub fn catalog_for_region(region: QoderRegion) -> Vec<Value> {
+    catalog_for(&read_state(), region)
+}
+
 fn catalog_for(state: &CatalogState, region: QoderRegion) -> Vec<Value> {
     let remote = match region {
         QoderRegion::Global => &state.global,
@@ -461,12 +476,93 @@ pub fn list() -> Vec<Value> {
     out
 }
 
+/// 免费档清单合并（免费额度可见性）：新清单（目录刷新）与既有账号数据合并，
+/// **保留既有 `exhausted_at` / `reset_at`**（额度错误码驱动的耗尽与恢复时刻标注）
+/// ——目录刷新/积分刷新只换 id/name/rate/region 部分，不抹掉耗尽历史。
+/// 两处回写点（qoder_credits 积分链路、qoder_catalog 目录链路）与 Buddy 域
+/// 共用本函数，保证语义一致。
+pub fn merge_free_models(prev: &[Value], fresh: &[Value]) -> Vec<Value> {
+    fresh
+        .iter()
+        .map(|m| {
+            let mut m = m.clone();
+            let id = m.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            if let Some(old) = prev
+                .iter()
+                .find(|p| p.get("id").and_then(Value::as_str) == Some(id.as_str()))
+            {
+                // 耗尽标注与恢复时刻：均由错误码驱动记录，刷新时保留
+                for key in ["exhausted_at", "reset_at"] {
+                    if let Some(v) = old.get(key).filter(|v| !v.is_null()) {
+                        m[key] = v.clone();
+                    }
+                }
+            }
+            m
+        })
+        .collect()
+}
+
 /// 把客户端的模型名解析成目录条目（含 upstreamKey/config/region）。
 ///
 /// 匹配序 id → name → upstreamKey（trim lowercase 全等）；先账号所属地区、
 /// 再另一地区、最后兜底表双区——「国际版账号请求中国版专属模型」会拿到
 /// 明确的解析结果，由上游报出真实原因，而不是网关谎报「模型不存在」。
 #[allow(dead_code)] // p3-3-wire（dispatch/routes）消费
+/// 目录中免费档模型清单（免费额度可见性，Qoder 域）。
+///
+/// 判定依据：目录条目的倍率字段 `credits`（字符串形态，如 "x0.0 credits"）
+/// 解析为 0 即免费档——上游 model/list 与静态兜底表同字段。
+/// **按区域分别采集**（不走 list() 的跨区去重）：同一模型 id 在两区的倍率
+/// 由上游各自下发（可随活动漂移），跨区去重会让后到/被顶掉的那一区丢条目；
+/// 去重键取 (id, region)，两区各自如实记录。
+/// 返回 [{id,name,rate,region}]，rate 恒为 0.0（便于前端统一渲染）；
+/// 倍率字段缺失/非解析的条目跳过（不猜测）。
+pub fn free_tier_models() -> Vec<Value> {
+    let state = read_state();
+    let mut out: Vec<Value> = Vec::new();
+    // 按区域分别采集（不走 list() 的跨区去重）：倍率由上游按区下发，
+    // 两区各自判定，避免去重导致某一区的免费档被另一区顶掉。
+    // 去重键为 (id, region)。
+    for region in [QoderRegion::Cn, QoderRegion::Global] {
+        for m in catalog_for(&state, region) {
+            let raw = m
+                .get("credits")
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    Value::Number(n) => n.to_string(),
+                    _ => String::new(),
+                })
+                .unwrap_or_default();
+            // 倍率解析复用 credits_rate_of（"x0.0 credits" 形态；0 = 免费合法值）
+            let Some(rate) = credits_rate_of(&raw) else { continue };
+            if rate > 0.0 {
+                continue;
+            }
+            let id = m.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            if id.is_empty() {
+                continue;
+            }
+            let region_id = region.id();
+            if out.iter().any(|e| {
+                e.get("id").and_then(Value::as_str) == Some(id.as_str())
+                    && e.get("region").and_then(Value::as_str) == Some(region_id)
+            }) {
+                continue;
+            }
+            let name = m.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+            out.push(json!({
+                "id": id,
+                // name 缺失回退 id（不再另查；目录条目 name 恒有值）
+                "name": if name.is_empty() { id.clone() } else { name },
+                "rate": rate,
+                "region": region_id,
+            }));
+        }
+    }
+    out
+}
+
 /// 跨池命名差异别名表（issue #90 修复③b）：三家池对同一模型命名不一
 /// （DeepSeek 4.1 Flash 在 Trae 侧叫 `deepseek4.1flash`、在 Qoder/Buddy 侧叫
 /// `DeepSeek-Flash`），用户切池时沿用旧名会 404。命中键 → Qoder 目录内
@@ -693,6 +789,12 @@ fn now_ts() -> u64 {
 pub enum UpstreamKind {
     /// 额度/套餐不足（可换账号重试）
     Quota,
+    /// **所选模型的免费额度耗尽**（114/115/119 或「免费额度」文案）：上游明示
+    /// 「可切换其他免费额度未用完的模型，或改用积分模型，明天 00:00 重试当前
+    /// 免费模型」——账号本身健康（积分照常可用），冻结整号到 04:00 会把
+    /// 付费模型与积分一起误杀（2026-10-19 实测 qwen3.8-flash 免费额度文案
+    /// 被判 HardCredit → 700 积分的号显示「积分耗尽」锁死一整天）
+    FreeQuota,
     /// 触发限流（可换账号重试）
     Rate,
     /// 鉴权失败（**明确的**：HTTP 401 或业务码 105）
@@ -711,13 +813,14 @@ pub enum UpstreamKind {
 impl UpstreamKind {
     /// → 网关账号池错误分类（api_server::ErrKind）。
     ///
-    /// Queued → None（不冷却不换号）；Quota → HardCredit（pool::note_error
+    /// Queued/FreeQuota → None（不整号冷却）；Quota → HardCredit（pool::note_error
     /// 特殊处理为次日 04:00 恢复探测）；Forbidden → 直接禁用待人工确认；
-    /// Unknown 按 Server 熔断。
+    /// Unknown 按 Server 熔断。FreeQuota 的处置在路由层按 (uid, model) 冷却。
     #[allow(dead_code)] // p3-3-wire（dispatch/routes）消费
     pub fn to_err_kind(self) -> crate::api_server::ErrKind {
         match self {
             Self::Quota => crate::api_server::ErrKind::HardCredit,
+            Self::FreeQuota => crate::api_server::ErrKind::None,
             Self::Rate => crate::api_server::ErrKind::SoftRate,
             Self::Auth => crate::api_server::ErrKind::SessionDead,
             Self::Forbidden => crate::api_server::ErrKind::Forbidden,
@@ -788,6 +891,13 @@ const AUTH_CODES: &[&str] = &["105"];
 /// 119 所选模型的免费额度用完、122 计费组上限
 const QUOTA_CODES: &[&str] =
     &["110", "112", "113", "114", "115", "116", "117", "118", "119", "122"];
+/// 免费额度类（QUOTA_CODES 的**账号健康无害**子集）：114 试用额度 / 115 免费
+/// 用户配额 / 119 所选模型免费额度——上游语义是「该模型免费额度今天用完，
+/// 明天 00:00 重置；可切其他模型或改用积分」。整号冻结（HardCredit）会连积分
+/// 付费路径一起误杀（2026-10-19 事故：qwen3.8-flash 触发 119 → 两个 700 积分
+/// 的号被判「积分耗尽」锁到 04:00）。命中此表**或**文案含「免费额度」即归
+/// FreeQuota，路由层按 (uid, model) 冷却到次日 00:00。
+const FREE_QUOTA_CODES: &[&str] = &["114", "115", "119"];
 
 /// 嵌套 JSON 的钻取深度上限（防病态输入下的环；实测两层就到底）
 const SIGNAL_SCAN_DEPTH: usize = 5;
@@ -955,6 +1065,40 @@ fn pricing_url_of(raw: &str) -> Option<String> {
     None
 }
 
+/// 判断错误正文里是否给出了「账号级」的额度耗尽证据（2026-10-20 事故修复）。
+///
+/// 上游的额度错误可能同时带这两个字段：`credit`/`credits` 是**该账号剩余积分**
+/// （数字），出现时以它为准——余额 > 0 就说明「积分没耗尽」，此时整号冻结
+/// （HardCredit，次日 04:00 才恢复）是误判。字段缺失时返回 false（维持既有
+/// 整号冷却口径）：解析不到余额不等于「有余额」，不能因此放宽额度判定。
+fn account_has_credit_balance(signals: &ErrorSignals, text: &str) -> bool {
+    let _ = signals;
+    // 上游把内层报文塞进 message 字符串，正文里的引号是转义形态（\"credits\"），
+    // 先去反斜杠再匹配——与 raw_has_code 的裸文本归一处理同口径
+    let flat: String = text.chars().filter(|ch| *ch != '\\').collect();
+    for key in ["\"credits\"", "\"credit\"", "\"balance\"", "\"remaining_credits\""] {
+        let mut rest = flat.as_str();
+        while let Some(pos) = rest.find(key) {
+            let after = rest[pos + key.len()..].trim_start();
+            if let Some(after) = after.strip_prefix(':') {
+                let after = after.trim_start();
+                let digits: String = after
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                    .collect();
+                if !digits.is_empty() {
+                    if let Ok(value) = digits.parse::<f64>() {
+                        // 余额字段存在即以此为准：> 0 视为未耗尽
+                        return value > 0.0;
+                    }
+                }
+            }
+            rest = &rest[pos + key.len()..];
+        }
+    }
+    false
+}
+
 /// 分类上游错误（判定链：排队 → 业务码 → 额度关键词 → 状态码）
 pub fn classify_upstream_error(status: u16, text: &str) -> ClassifiedError {
     let body = text.to_lowercase();
@@ -977,6 +1121,32 @@ pub fn classify_upstream_error(status: u16, text: &str) -> ClassifiedError {
     if signals.has_code(AUTH_CODES) || AUTH_CODES.iter().any(|code| raw_has_code(text, code)) {
         return ClassifiedError::new(UpstreamKind::Auth, "登录态已失效，请重新登录", None);
     }
+    // ②b 免费额度类（114/115/119 或「免费额度」文案）：账号健康无害，前置于
+    // 通用额度判定——这些码同样在 QUOTA_CODES 表里，晚判会被整族吞成 HardCredit
+    if signals.has_code(FREE_QUOTA_CODES)
+        || FREE_QUOTA_CODES.iter().any(|code| raw_has_code(text, code))
+        || body.contains("免费额度")
+    {
+        return ClassifiedError::new(
+            UpstreamKind::FreeQuota,
+            "所选模型的免费额度已用完（明天 00:00 重置），可切换其他模型或使用积分",
+            pricing,
+        );
+    }
+    // ②c 业务码额度类但**余额仍在**的形态按模型级处置（2026-10-20 事故修复）：
+    // 上游在 200 流尾部用额度码收尾时，号上积分往往没动（19:52 连续 57 次 200
+    // 后一次长请求收额度码，700/1000 积分的四个号齐判 HardCredit 冻结到 04:00）。
+    // 卡片面（账号积分余额）与这一判定冲突时，卡片面胜出：整号冻结的代价是一天，
+    // 而按模型冷却到次日 00:00 已能挡住重复打上游。
+    if (signals.has_code(QUOTA_CODES) || QUOTA_CODES.iter().any(|code| raw_has_code(text, code)))
+        && account_has_credit_balance(&signals, text)
+    {
+        return ClassifiedError::new(
+            UpstreamKind::FreeQuota,
+            "当前模型额度已用完（可切换其他模型或使用积分），账号积分余额仍可用",
+            pricing,
+        );
+    }
     if signals.has_code(QUOTA_CODES) || QUOTA_CODES.iter().any(|code| raw_has_code(text, code)) {
         return ClassifiedError::new(
             UpstreamKind::Quota,
@@ -997,6 +1167,28 @@ pub fn classify_upstream_error(status: u16, text: &str) -> ClassifiedError {
     }
     // ④ 额度关键词 / 定价页链接（蓝本判定链；401/429 已前置特判，
     // 此处只兜 403/4xx 正文携带额度语义的形态）
+    //
+    // 泛词降级（2026-10-20 事故修复）：正文里出现 "credit"/"plan"/"exceeded"
+    // 只能证明「有额度/套餐语义」，不能证明「这个账号积分耗尽」——上游的排队
+    // 说明、鉴权失败、套餐说明都会带这些词，此前一律判 Quota → 整号 HardCredit
+    // 冻结到次日 04:00，代价是一整天的账号可用性。只有当上游明示额度耗尽短语，
+    // 或卡片面积分余额确为 0 时，才允许整号冻结；其余按模型级处置（按 uid+model
+    // 冷却到次日 00:00，账号本身继续参与调度）。
+    let explicit_exhausted = [
+        "insufficient",
+        "no_quota",
+        "quota_exceed",
+        "exceed_quota",
+        "quota exceeded",
+        "out of credits",
+        "no credits",
+        "run out of credits",
+        "额度不足",
+        "额度已用尽",
+        "额度已用完",
+    ]
+    .iter()
+    .any(|signal| body.contains(signal));
     let quota_signals = [
         "pricingurl",
         "insufficient",
@@ -1010,12 +1202,26 @@ pub fn classify_upstream_error(status: u16, text: &str) -> ClassifiedError {
         "plan",
         "trial",
     ];
-    if pricing.is_some() || quota_signals.iter().any(|signal| body.contains(signal)) {
+    if explicit_exhausted {
         return ClassifiedError::new(
             UpstreamKind::Quota,
             "当前账号额度不足或套餐不支持该模型",
             pricing,
         );
+    }
+    if pricing.is_some() || quota_signals.iter().any(|signal| body.contains(signal)) {
+        // 正文自带余额且 > 0：泛词只能说明该模型受限，账号积分仍可用（同 ②c）
+        let kind = if account_has_credit_balance(&signals, text) {
+            UpstreamKind::FreeQuota
+        } else {
+            UpstreamKind::Quota
+        };
+        let message = if kind == UpstreamKind::FreeQuota {
+            "当前模型额度受限（账号积分余额仍可用），可切换其他模型重试"
+        } else {
+            "当前账号额度不足或套餐不支持该模型"
+        };
+        return ClassifiedError::new(kind, message, pricing);
     }
     if body.contains("rate limit") || body.contains("too many") {
         return ClassifiedError::new(UpstreamKind::Rate, "请求过于频繁，请稍后重试", None);
@@ -1073,13 +1279,16 @@ pub fn make_qoder_request(
         email: "",
         machine_id: &creds.machine_id,
     };
-    let headers = match qoder_sign::build_cosy_headers(Some(&encoded), QODER_CHAT_URL, &identity) {
+    // 网关基址按凭证区域（2026-10-17 海外接入）：CN gateway.qoder.com.cn /
+    // Global api3.qoder.sh——路径与 query 同构，仅主机分叉
+    let chat_url = chat_url_for(creds.global_region);
+    let headers = match qoder_sign::build_cosy_headers(Some(&encoded), &chat_url, &identity) {
         Ok(headers) => headers,
         // 签名失败 = 凭证素材缺失（uid/token 为空），按鉴权问题上报
         Err(e) => return Err((401, e, None)),
     };
     let mut req = qoder_agent()
-        .post(QODER_CHAT_URL)
+        .post(&chat_url)
         .set("Content-Type", "application/json")
         .set("Accept", "text/event-stream")
         .set("User-Agent", qoder_common::CLIENT_USER_AGENT)
@@ -2266,6 +2475,97 @@ pub fn prepare_qoder_body(
 mod tests {
     use super::*;
 
+    /// 免费档模型提取（免费额度可见性）：目录里倍率 0.0 的条目必须进清单且
+    /// rate=0、name/region 齐全；付费档不进。
+    /// 判定与 free_tier_models 同源（credits_rate_of），并按区域逐区期望——
+    /// 保证「某区免费档不被另一区去重顶掉」（Qwen3.8-Flash 两区均为 0.0 免费档）。
+    #[test]
+    fn free_tier_models_match_zero_rate_entries() {
+        let _g = catalog_test_guard();
+        let free = free_tier_models();
+        // 期望集合：按区域展开目录，credits 解析为 0 的 (region,id)
+        let state = read_state();
+        let mut expected: Vec<(String, String)> = Vec::new();
+        for region in [QoderRegion::Cn, QoderRegion::Global] {
+            for m in catalog_for(&state, region) {
+                let raw = m.get("credits").and_then(Value::as_str).unwrap_or("");
+                if credits_rate_of(raw) != Some(0.0) {
+                    continue;
+                }
+                let id = m.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                expected.push((region.id().to_string(), id));
+            }
+        }
+        expected.sort();
+        expected.dedup();
+        let mut got: Vec<(String, String)> = free
+            .iter()
+            .filter_map(|m| {
+                let id = m.get("id").and_then(Value::as_str)?.to_string();
+                let rg = m.get("region").and_then(Value::as_str)?.to_string();
+                Some((rg, id))
+            })
+            .collect();
+        got.sort();
+        got.dedup();
+        assert_eq!(got, expected, "免费清单应恰为各区域目录中 rate=0 的条目集合");
+
+        // 每条：rate 恒 0.0、id/name 非空、region 为合法区域 id
+        for m in &free {
+            assert_eq!(m.get("rate").and_then(Value::as_f64), Some(0.0));
+            assert!(!m.get("id").and_then(Value::as_str).unwrap_or("").is_empty());
+            assert!(!m.get("name").and_then(Value::as_str).unwrap_or("").is_empty());
+            let rg = m.get("region").and_then(Value::as_str).unwrap_or("");
+            assert!(rg == "cn" || rg == "global", "region 应为 cn|global，实得 {rg:?}");
+        }
+    }
+
+    /// 免费档清单合并：目录刷新只换模型快照，**保留既有 exhausted_at / reset_at**
+    /// （耗尽与恢复历史不被刷新抹掉）；新出现/消失的模型如实反映。
+    #[test]
+    fn merge_free_models_preserves_exhaustion_history() {
+        let prev = vec![
+            json!({"id": "A", "name": "老A名", "rate": 0.0, "region": "cn",
+                   "exhausted_at": "2026-10-16 10:00:00", "reset_at": "2026-10-17 00:00:00"}),
+            json!({"id": "B", "name": "B", "rate": 0.0, "region": "cn"}),
+        ];
+        let fresh = vec![
+            json!({"id": "A", "name": "新A名", "rate": 0.0, "region": "cn"}),
+            json!({"id": "C", "name": "C", "rate": 0.0, "region": "global"}),
+        ];
+        let merged = merge_free_models(&prev, &fresh);
+        // 数量跟随新清单（B 消失、C 新增）
+        assert_eq!(merged.len(), 2);
+        // A：新元数据 + 保留耗尽/恢复历史
+        assert_eq!(merged[0]["name"], json!("新A名"));
+        assert_eq!(merged[0]["exhausted_at"], json!("2026-10-16 10:00:00"));
+        assert_eq!(merged[0]["reset_at"], json!("2026-10-17 00:00:00"));
+        // C：新条目无标注
+        assert_eq!(merged[1]["id"], json!("C"));
+        assert!(merged[1].get("exhausted_at").is_none());
+        assert!(merged[1].get("reset_at").is_none());
+        // 空 prev（首次采集）不 panic、无标注
+        let first = merge_free_models(&[], &fresh);
+        assert_eq!(first.len(), 2);
+        assert!(first[0].get("exhausted_at").is_none());
+    }
+
+    /// 倍率解析容错（复用 credits_rate_of）：带 x 前缀 / 单位尾巴 / 空白均可；
+    /// 非数字拒绝（不猜测）。
+    #[test]
+    fn free_tier_rate_parsing_tolerates_variants() {
+        assert_eq!(credits_rate_of("x0.0 credits"), Some(0.0));
+        assert_eq!(credits_rate_of("x0.00 credits"), Some(0.0));
+        assert_eq!(credits_rate_of(" x0.0 credits "), Some(0.0));
+        assert_eq!(credits_rate_of("x0.5 credits"), Some(0.5));
+        assert_eq!(credits_rate_of(""), None);
+        assert_eq!(credits_rate_of("free"), None);
+        assert_eq!(credits_rate_of("0.0"), None, "缺 x 前缀/单位不猜测");
+    }
+
     // ── issue #90 修复③b：跨池命名别名归一 ──
 
     /// Trae 侧命名（deepseek4.1flash）与空格变体（workbuddy 侧 deepseek flash）
@@ -2684,6 +2984,79 @@ mod tests {
         assert!(matches!(c.kind, UpstreamKind::Quota));
     }
 
+    /// 免费额度类（2026-10-19 事故修复）：114/115/119 归 FreeQuota——账号健康、
+    /// 仅该免费模型今日额度用尽；116（个人 Credits 用完）仍归 Quota 整号处理
+    #[test]
+    fn free_quota_codes_split_from_paid_quota() {
+        for code in ["114", "115", "119"] {
+            let c = classify_upstream_error(
+                403,
+                &format!(r#"{{"code":"403","message":"{{\"code\":\"{code}\"}}"}}"#),
+            );
+            assert!(
+                matches!(c.kind, UpstreamKind::FreeQuota),
+                "业务码 {code} 应归 FreeQuota，实际: {:?}",
+                c.kind
+            );
+            assert!(matches!(
+                c.kind.to_err_kind(),
+                crate::api_server::ErrKind::None
+            ), "FreeQuota 不得映射整号冷却");
+        }
+        let paid = classify_upstream_error(403, r#"{"code":"116","message":"credits used up"}"#);
+        assert!(matches!(paid.kind, UpstreamKind::Quota));
+    }
+
+    /// 线上中文文案形态（无裸码 119，「免费额度」关键词兜底）：必须归 FreeQuota。
+    /// 这就是把 700 积分账号误判「积分耗尽」锁到 04:00 的那条报文。
+    #[test]
+    fn free_quota_chinese_message_is_free_not_hard() {
+        let c = classify_upstream_error(
+            403,
+            r#"{"code":"119","message":"所选模型的免费额度已经用完，请稍后再试；可先切换到其他免费额度未用完的模型，或改用积分模型继续提问，明天 00:00 再重试当前免费模型"}"#,
+        );
+        assert!(matches!(c.kind, UpstreamKind::FreeQuota), "实际: {:?}", c.kind);
+        assert!(c.message.contains("00:00"));
+    }
+
+    /// 2026-10-20 事故回归：额度泛词（credit/plan/exceeded）不再整号判死。
+    /// 线上形态是「200 流尾部收额度码，号上积分未动」——四个 700/1000 积分的
+    /// 国内号齐判 HardCredit 冻结到次日 04:00，客户端表现是持续「重新连接」。
+    /// 现在的口径：泛词命中有余额 → 模型级；正文明示额度耗尽 → 才整号。
+    #[test]
+    fn vague_quota_words_do_not_freeze_whole_account() {
+        // 泛词命中但正文额度余量仍 > 0：按模型级处置
+        let soft = classify_upstream_error(
+            400,
+            r#"{"code":400,"message":"usage plan check failed","credits":700.5}"#,
+        );
+        assert!(
+            matches!(soft.kind, UpstreamKind::FreeQuota),
+            "实际: {:?}",
+            soft.kind
+        );
+        assert!(matches!(
+            soft.kind.to_err_kind(),
+            crate::api_server::ErrKind::None
+        ));
+        // 明示额度耗尽短语：仍按整号 HardCredit（余额字段不足以推翻明示文案）
+        let hard = classify_upstream_error(403, r#"{"message":"insufficient credit"}"#);
+        assert!(matches!(hard.kind, UpstreamKind::Quota), "实际: {:?}", hard.kind);
+        // 余额字段为 0：维持整号冻结
+        let zero = classify_upstream_error(403, r#"{"message":"plan limit","credits":0}"#);
+        assert!(matches!(zero.kind, UpstreamKind::Quota), "实际: {:?}", zero.kind);
+    }
+
+    /// 业务码额度类 + 余额仍在：归 FreeQuota（按 uid+model 冷却），不整号冻结
+    #[test]
+    fn quota_code_with_positive_balance_is_model_scoped() {
+        let c = classify_upstream_error(
+            403,
+            r#"{"code":"403","message":"{\"code\":\"116\",\"credits\":700}"}"#,
+        );
+        assert!(matches!(c.kind, UpstreamKind::FreeQuota), "实际: {:?}", c.kind);
+    }
+
     #[test]
     fn bare_403_is_forbidden() {
         let c = classify_upstream_error(403, "permission denied");
@@ -2733,6 +3106,10 @@ mod tests {
         assert!(matches!(
             UpstreamKind::Quota.to_err_kind(),
             crate::api_server::ErrKind::HardCredit
+        ));
+        assert!(matches!(
+            UpstreamKind::FreeQuota.to_err_kind(),
+            crate::api_server::ErrKind::None
         ));
         assert!(matches!(
             UpstreamKind::Rate.to_err_kind(),
@@ -2821,7 +3198,9 @@ mod tests {
         let flash: Vec<&Value> = items.iter().filter(|m| m["id"] == "Qwen3.8-Flash").collect();
         assert_eq!(flash.len(), 1, "并集必须按 id 去重");
         assert_eq!(flash[0]["region"], "global", "去重时 global 优先");
-        assert_eq!(flash[0]["credits"], "x0.1 credits");
+        // Global 兜底倍率：0.0（免费档，用户 2026-10-16 确认 Global 同为免费）。
+        // 文本保留兜底表字面量 "0.0"（credits_of_text 原样透传 n）
+        assert_eq!(flash[0]["credits"], "x0.0 credits");
         assert_eq!(flash[0]["config"]["key"], "qfmodel");
         assert_eq!(flash[0]["maxOutputTokens"], MAX_OUTPUT_TOKENS);
         assert_eq!(flash[0]["supportsToolCall"], true);

@@ -305,6 +305,13 @@ pub(crate) fn dispatch_error_response(
                 "qoder_upstream_disabled",
                 "invalid_request_error",
             ),
+            DispatchError::ZCodeDisabled => (
+                StatusCode::BAD_REQUEST,
+                "zcode",
+                "该模型属 ZCode 上游，但 ZCode 上游未启用（api_pool.json zcode_enabled）".to_string(),
+                "zcode_upstream_disabled",
+                "invalid_request_error",
+            ),
             DispatchError::TraeDisabled => (
                 StatusCode::BAD_REQUEST,
                 "trae",
@@ -370,6 +377,7 @@ pub(crate) fn no_healthy_detail(state: &ApiSharedState, pool: TargetPool, key_st
         TargetPool::Trae => &state.pool,
         TargetPool::Buddy => &state.wb_pool,
         TargetPool::Qoder => &state.qoder_pool,
+        TargetPool::ZCode => &state.zcode_pool,
         // 不可达：custom 在 resolve_target 顶部短路返回（匹配穷尽兜底）
         TargetPool::Custom => return "no healthy account available".to_string(),
     };
@@ -475,7 +483,9 @@ pub async fn healthz(State(state): State<Arc<ApiSharedState>>) -> Response {
     let wb_ok = wb_enabled && state.wb_pool.has_selectable();
     let qoder_enabled = state.qoder_enabled.load(std::sync::atomic::Ordering::Relaxed);
     let qoder_ok = qoder_enabled && state.qoder_pool.has_selectable();
-    if solo_ok || wb_ok || qoder_ok {
+    let zcode_enabled = state.zcode_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let zcode_ok = zcode_enabled && state.zcode_pool.has_selectable();
+    if solo_ok || wb_ok || qoder_ok || zcode_ok {
         (
             StatusCode::OK,
             axum::Json(json!({
@@ -483,6 +493,7 @@ pub async fn healthz(State(state): State<Arc<ApiSharedState>>) -> Response {
                 "solo_available": solo_ok,
                 "wb_available": wb_ok,
                 "qoder_available": qoder_ok,
+                "zcode_available": zcode_ok,
             })),
         )
             .into_response()
@@ -611,6 +622,9 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     // Qoder 源旗标（p3-3）：条目始终入表（开关关闭时徽章置灰）
     let qoder_enabled = state.qoder_enabled.load(std::sync::atomic::Ordering::Relaxed);
     let qoder_ok = state.qoder_pool.has_selectable();
+    // ZCode 源旗标（z.ai GLM 池）：同款语义
+    let zcode_enabled = state.zcode_enabled.load(std::sync::atomic::Ordering::Relaxed);
+    let zcode_ok = state.zcode_pool.has_selectable();
     let data_dir = state.data_dir.clone();
     // issue #90 修复③a：来源标识开关（dispatch_policy.model_source_labels）——
     // 开启后为多源同名模型附带池前缀别名条目（trae/xxx / buddy/xxx / qoder/xxx），
@@ -624,6 +638,7 @@ pub async fn models(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             trae_ok,
             buddy_ok,
             Some((qoder_enabled, qoder_ok)),
+            Some((zcode_enabled, zcode_ok)),
         )
     })
     .await
@@ -767,6 +782,14 @@ pub async fn chat_completions(
                     return super::qoder_route::qoder_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard);
                 }
                 return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
+            }
+            TargetPool::ZCode => {
+                // ZCode 上游（z.ai GLM 池）：OpenAI 入参转 anthropic messages 信封，
+                // 无 effort 预处理（GLM thinking 由请求体原样透传）
+                if stream {
+                    return super::zcode_route::zcode_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard);
+                }
+                return super::zcode_route::zcode_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
             }
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：Trae 池 effort 通道（默认思考两池对齐）——
@@ -1106,6 +1129,14 @@ pub async fn messages(
                 }
                 return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await;
             }
+            TargetPool::ZCode => {
+                // ZCode 上游（z.ai GLM 池）：入参同样已投影为 OpenAI 内部格式，
+                // 执行路径内再转 anthropic 信封（与上游协议对齐）
+                if stream {
+                    return super::zcode_route::zcode_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard);
+                }
+                return super::zcode_route::zcode_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await;
+            }
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：Anthropic thinking 参数视为显式请求
                 //（enabled → high 档；disabled → 空串短路默认思考与路由提示）
@@ -1259,6 +1290,13 @@ pub async fn completions(
                 }
                 return super::qoder_route::qoder_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await;
             }
+            TargetPool::ZCode => {
+                // ZCode 上游（z.ai GLM 池）：text completions 同内部格式投影
+                if stream {
+                    return super::zcode_route::zcode_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard);
+                }
+                return super::zcode_route::zcode_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await;
+            }
             TargetPool::Trae => {
                 // issue #31 T3.2/T3.3：text completions 无 effort 字段 → 仅默认思考生效
                 let wire = trae_effort_wire(&state, r.effort_hint, None, &r.model);
@@ -1372,14 +1410,26 @@ async fn images_entry(
     // issue #25 资源池绑定：Key 绑定 trae 时约束作用域不在 WB 池（白名单空），
     // 生图仍用 WB 池但不应用 Trae 账号白名单（避免误过滤）。
     // issue #30 混合白名单：按前缀作用域提取 Buddy 条目（空集 = 排除，不得过滤）
-    let (allowed_set, dedicated) = super::api_keys::constraints_for(&state.data_dir, &key_str)
-        .and_then(|k| k.pool_constraints("buddy"))
-        .map_or((None, None), |c| (c.allowed, c.dedicated));
+    // 三约束解析（2026-10-19 修正：补上 want_global）。旧版只取
+    // allowed/dedicated 两项，且调用非区域版 pick——海外 Key / 海外专属模型会
+    // 取到国内账号凭证，上游按账号区校验模型权限后必然失败（跨区必失败）。
+    let (allowed_set, dedicated, key_want_global) =
+        super::api_keys::constraints_for(&state.data_dir, &key_str)
+            .and_then(|k| k.pool_constraints("buddy"))
+            .map_or((None, None, None), |c| (c.allowed, c.dedicated, c.want_global));
+    // 生图模型所属区：目录推导 + Key 区域约束显式覆盖（同 wb_route 口径）
+    let want_global = key_want_global
+        .or_else(|| super::wb_catalog::region_of(&state.data_dir, &model));
     let picked = {
         let tried = HashSet::new();
         state
             .wb_pool
-            .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref())
+            .pick_excluding_constrained_ev_region(
+                &tried,
+                allowed_set.as_ref(),
+                dedicated.as_deref(),
+                want_global,
+            )
             .map(|(p, ev)| {
                 // F-77⑤ 可观测：busy_yield / busy_fallback 调度事件
                 if let Some(ev) = ev {
@@ -1894,7 +1944,11 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                     }
                                 }
                                 let kind = classify_error(status, &resp_body);
-                                state.pool.note_error(&picked.uid, kind);
+                                // ErrKind::None（如 4001 模型配置缺失）属请求/模型级问题，
+                                // 与账号健康无关——不计入账号失败，防全池被同号模型错误连坐熔断
+                                if kind != ErrKind::None {
+                                    state.pool.note_error(&picked.uid, kind);
+                                }
                                 // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                 if kind.unbinds_sticky() {
                                     state.trae_sticky.unbind_uid(&picked.uid);
@@ -2349,7 +2403,11 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                     }
                                 }
                                 let kind = classify_error(status, &resp_body);
-                                state.pool.note_error(&picked.uid, kind);
+                                // ErrKind::None（如 4001 模型配置缺失）属请求/模型级问题，
+                                // 与账号健康无关——不计入账号失败，防全池被同号模型错误连坐熔断
+                                if kind != ErrKind::None {
+                                    state.pool.note_error(&picked.uid, kind);
+                                }
                                 // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                 if kind.unbinds_sticky() {
                                     state.trae_sticky.unbind_uid(&picked.uid);
@@ -3094,6 +3152,11 @@ mod tests {
             qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
             qoder_sticky: super::super::wb_sticky::StickyStore::default(),
             trae_sticky: super::super::wb_sticky::StickyStore::default(),
+            zcode_pool: super::super::pool::ApiPool::new(),
+            zcode_enabled: std::sync::atomic::AtomicBool::new(true),
+            zcode_identity: None,
+            zcode_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            zcode_account_concurrency_limit: std::sync::atomic::AtomicU32::new(1),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
         });
         WlFixture { dir, state }

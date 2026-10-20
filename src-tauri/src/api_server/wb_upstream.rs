@@ -27,6 +27,22 @@ pub const WB_CLI_VERSION: &str = "2.63.2";
 pub const WB_REFRESH_URL: &str = "https://www.codebuddy.cn/v2/plugin/auth/token/refresh";
 /// 首字超时（F-34）：上游建连后 10s 内未产出任何字节 → 故障转移
 pub const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 首字超时（海外区，2026-10-19）：海外上游普遍存在**静默排队/prefill 等待**
+/// ——不发 10605 排队票，只是握着连接不吐首字节（实测首包 p50≈6.5s、p90≈14s、
+/// 尖峰 30s+，当日 20% 请求首包 >10s）。用国内 10s 判死会把「排队中」误判为
+/// 「账号故障」→ 换号重排 + 记 Server 冷却，逐步把海外池抽干（20:41 连报
+/// `no healthy account available (healthy=2)`）。海外放宽到 60s：排队等得起，
+/// 且仍远低于上游 300s 读超时，不影响连接回收。
+pub const FIRST_BYTE_TIMEOUT_GLOBAL: Duration = Duration::from_secs(60);
+
+/// 按区域取首字超时：国内沿用 10s，海外走放宽窗口。
+pub fn first_byte_timeout_for(global_region: bool) -> Duration {
+    if global_region {
+        FIRST_BYTE_TIMEOUT_GLOBAL
+    } else {
+        FIRST_BYTE_TIMEOUT
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct WbCreds {
@@ -41,7 +57,8 @@ pub struct WbCreds {
     pub domain: String,
     /// 企业 id（可空 → X-No-Enterprise-Id: 1）
     pub enterprise_id: String,
-    /// Global 区：domain 含 `.workbuddy.ai`（F-36 域名路由 §5.2）
+    /// Global 区：domain 属海外域族（`workbuddy.ai` / `codebuddy.ai`，
+    /// 判定统一走 `tasks::wb_common::is_global_region`，F-36 域名路由 §5.2）
     pub global_region: bool,
 }
 
@@ -174,10 +191,18 @@ impl InterruptibleLines {
     /// （正常流式出包不受限）；转发线程 detach（受 Agent 300s 读超时兜底
     /// 自然退出，不无限泄漏）。
     pub fn from_reader<R: Read + Send + 'static>(reader: R) -> Result<Self, ()> {
+        Self::from_reader_timeout(reader, FIRST_BYTE_TIMEOUT)
+    }
+
+    /// 同 from_reader，但首字窗口由调用方指定（海外排队区放宽）
+    pub fn from_reader_timeout<R: Read + Send + 'static>(
+        reader: R,
+        first_byte_timeout: Duration,
+    ) -> Result<Self, ()> {
         let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
         relay_lines(reader, tx);
         // 首字（可为空行/注释行，均视为"已开始产出"）
-        match rx.recv_timeout(FIRST_BYTE_TIMEOUT) {
+        match rx.recv_timeout(first_byte_timeout) {
             Ok(Ok(first)) => Ok(Self {
                 rx,
                 pending: Some(first),
@@ -239,7 +264,21 @@ impl Iterator for InterruptibleLines {
 pub fn lines_with_first_byte_timeout<R: Read + Send + 'static>(
     reader: R,
 ) -> Result<Box<dyn Iterator<Item = String> + Send>, ()> {
-    Ok(Box::new(InterruptibleLines::from_reader(reader)?))
+    Ok(Box::new(InterruptibleLines::from_reader_timeout(
+        reader,
+        FIRST_BYTE_TIMEOUT,
+    )?))
+}
+
+/// 同 lines_with_first_byte_timeout，但首字窗口按区域放宽（海外排队语义）
+pub fn lines_with_first_byte_timeout_for<R: Read + Send + 'static>(
+    reader: R,
+    global_region: bool,
+) -> Result<Box<dyn Iterator<Item = String> + Send>, ()> {
+    Ok(Box::new(InterruptibleLines::from_reader_timeout(
+        reader,
+        first_byte_timeout_for(global_region),
+    )?))
 }
 
 /// 同 lines_with_first_byte_timeout，但返回可中断行源：sse.rs 流式转换
@@ -304,7 +343,23 @@ pub struct RaceOutcome<T> {
 pub fn lines_with_first_byte_hedged<T>(
     primary: Box<dyn Read + Send>,
     hedge_delay_ms: u64,
+    spawn_backup: impl FnMut() -> Option<(Box<dyn Read + Send>, T)>,
+) -> Result<RaceOutcome<T>, ()> {
+    lines_with_first_byte_hedged_timeout(
+        primary,
+        hedge_delay_ms,
+        spawn_backup,
+        FIRST_BYTE_TIMEOUT,
+    )
+}
+
+/// 同 lines_with_first_byte_hedged，但首字窗口按区域放宽（海外排队语义）：
+/// 主请求与对冲请求各自使用 `first_byte_timeout`，对冲延迟仍收敛 [1s, 8s]。
+pub fn lines_with_first_byte_hedged_timeout<T>(
+    primary: Box<dyn Read + Send>,
+    hedge_delay_ms: u64,
     mut spawn_backup: impl FnMut() -> Option<(Box<dyn Read + Send>, T)>,
+    first_byte_timeout: Duration,
 ) -> Result<RaceOutcome<T>, ()> {
     use std::sync::mpsc::{Receiver, TryRecvError};
     use std::time::Instant;
@@ -332,7 +387,7 @@ pub fn lines_with_first_byte_hedged<T>(
     let Some((backup, hedge)) = spawn_backup() else {
         // 无可用对冲账号（含对冲建连失败，租约已由闭包 Drop 释放）：
         // 退回纯首字超时（剩余窗口）
-        let deadline = started + FIRST_BYTE_TIMEOUT;
+        let deadline = started + first_byte_timeout;
         return match rx1.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(Ok(first)) => Ok(RaceOutcome {
                 lines: chain_rest(first, rx1),
@@ -345,12 +400,12 @@ pub fn lines_with_first_byte_hedged<T>(
     let (tx2, rx2) = std::sync::mpsc::channel::<std::io::Result<String>>();
     relay_lines(backup, tx2);
 
-    // 阶段二：竞速。主请求维持原 10s 上限（started+FIRST_BYTE_TIMEOUT），
-    // 对冲请求自带完整 10s 首字窗口；20ms 轮询合并两个 std channel（无 select
-    // 原语，轮询开销可忽略）。任一侧 EOF/出错标记 dead；双 dead → Err
-    //（hedge 租约随局部变量 Drop 释放——修复双败路径计数泄漏）。
-    let primary_deadline = started + FIRST_BYTE_TIMEOUT;
-    let hedge_deadline = Instant::now() + FIRST_BYTE_TIMEOUT;
+    // 阶段二：竞速。主请求维持原首字上限（started+first_byte_timeout，海外为
+    // 放宽窗口以容纳静默排队），对冲请求自带完整首字窗口；20ms 轮询合并两个
+    // std channel（无 select 原语，轮询开销可忽略）。任一侧 EOF/出错标记 dead；
+    // 双 dead → Err（hedge 租约随局部变量 Drop 释放——修复双败路径计数泄漏）。
+    let primary_deadline = started + first_byte_timeout;
+    let hedge_deadline = Instant::now() + first_byte_timeout;
     let mut primary_dead = false;
     let mut hedge_dead = false;
     loop {
@@ -590,6 +645,26 @@ mod tests {
             enterprise_id: eid.into(),
             global_region: global,
         }
+    }
+
+    /// 海外静默排队语义（2026-10-19）：首字窗口按区域放宽，国内不得被一起放宽
+    /// ——国内 10s 是影子风控快速转移的关键，海外排队普遍 6–14s 需 60s 窗口。
+    #[test]
+    fn first_byte_timeout_is_regional() {
+        assert_eq!(
+            first_byte_timeout_for(false),
+            FIRST_BYTE_TIMEOUT,
+            "国内沿用 10s（首字超时故障转移语义不变）"
+        );
+        assert_eq!(
+            first_byte_timeout_for(true),
+            FIRST_BYTE_TIMEOUT_GLOBAL,
+            "海外走放宽窗口"
+        );
+        assert!(
+            FIRST_BYTE_TIMEOUT_GLOBAL > FIRST_BYTE_TIMEOUT,
+            "海外窗口必须严格大于国内，否则放宽无意义"
+        );
     }
 
     #[test]

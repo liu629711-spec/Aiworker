@@ -100,4 +100,6 @@ opt-level = 2
 [features]
 # 仅桌面端
 default = ["custom-protocol"]
+# 控制台排查版:保留终端窗口,panic/报错实时可见(配合 main.rs panic 黑匣子)
+console = []
 custom-protocol = ["tauri/custom-protocol"]

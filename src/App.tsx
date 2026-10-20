@@ -6,6 +6,7 @@ import Toaster from './components/Toaster';
 import { useAppStore } from './store';
 import { resolveTheme } from './lib/themes';
 import Dashboard from './pages/Dashboard';
+import QuotaCenter from './pages/QuotaCenter';
 import Accounts from './pages/Accounts';
 import Checkin from './pages/Checkin';
 import Logs from './pages/Logs';
@@ -16,6 +17,7 @@ import DoubaoAccounts from './pages/doubao/DoubaoAccounts';
 import DoubaoSettings from './pages/doubao/DoubaoSettings';
 import BuddyOverview from './pages/buddy/BuddyOverview';
 import BuddyAccounts from './pages/buddy/BuddyAccounts';
+import BuddySessions from './pages/buddy/BuddySessions';
 import BuddyCheckin from './pages/buddy/BuddyCheckin';
 // 积分看板（credits-dashboard-plan.md；平台拆分）：同一组件按 platform 渲染
 // Trae 页（credits 视图）、Buddy 页（buddy-credits 视图）、Qoder 页（qoder-credits 视图，替换旧 QoderCredits.tsx）
@@ -47,6 +49,8 @@ function renderView(view: string) {
       return <Logs />;
     case 'api-service':
       return <ApiService />;
+    case 'quota-center':
+      return <QuotaCenter />;
     case 'settings':
       return <Settings />;
     case 'doubao-overview':
@@ -59,6 +63,8 @@ function renderView(view: string) {
       return <BuddyOverview />;
     case 'buddy-accounts':
       return <BuddyAccounts />;
+    case 'buddy-sessions':
+      return <BuddySessions />;
     case 'buddy-checkin':
       return <BuddyCheckin />;
     case 'buddy-credits':

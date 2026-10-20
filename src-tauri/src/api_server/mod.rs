@@ -6,6 +6,7 @@ pub mod custom_models;
 pub mod custom_route;
 pub mod dispatch;
 pub mod efforts;
+pub mod free_usage;
 pub mod gateway_settings;
 pub mod models_sync;
 pub mod org_index;
@@ -27,6 +28,8 @@ pub mod wb_route;
 pub mod wb_sse;
 pub mod wb_sticky;
 pub mod wb_toolexec;
+pub mod zcode_catalog;
+pub mod zcode_route;
 pub mod wb_upstream;
 
 use std::sync::atomic::AtomicU64;
@@ -147,6 +150,23 @@ pub struct ApiSharedState {
     /// sticky_bindings 表，键命名空间 "t:" 隔离；会话→账号绑定供 Trae 取号粘住
     ///（显式 conversationId / 消息指纹双模式，TTL 经 trae_sticky_ttl_secs 配置）
     pub trae_sticky: wb_sticky::StickyStore,
+    // ── ZCode 上游（z.ai GLM OAuth 账号池，api.z.ai/api/anthropic）──────────
+    /// ZCode 上游账号池：与 Trae/WB/Qoder 并列的第四池；账号来自 zcode.sqlite
+    /// （zcode 域管理，网关只读）。无积分余额概念，调度只看冷却/禁用/在途。
+    /// 凭证正文不在池内（zai token 长期有效但可能被服务端吊销），请求时经
+    /// zcode_identity 回调解析最新值
+    pub zcode_pool: ApiPool,
+    /// ZCode 上游开关（api_pool.json.zcode_enabled；关闭时 GLM 模型不参与路由）
+    pub zcode_enabled: std::sync::atomic::AtomicBool,
+    /// ZCode 凭证解析回调（网关层无 AppState 引用，由启动方注入）：
+    /// 入参账号 id（zcode.sqlite accounts.id 字符串化），返回该账号最新的
+    /// zai access_token + device_mid。None（单测/未装配）时 ZCode 池不可路由
+    pub zcode_identity:
+        Option<std::sync::Arc<dyn Fn(&str) -> Result<crate::api_server::zcode_catalog::ZCodeCreds, String> + Send + Sync>>,
+    /// ZCode 池粘性 TTL 秒（per-pool，默认 300）：同 trae/wb/qoder 三参数族
+    pub zcode_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64,
+    /// ZCode 账号并发上限（api_pool.json.zcode_account_concurrency_limit，默认 1）
+    pub zcode_account_concurrency_limit: std::sync::atomic::AtomicU32,
     /// 实际绑定的监听地址（2026-10-12 审查 M3）：服务启动时从 gateway 配置读入
     /// 一次注入。auth 层的 /health 环回豁免判定改读本字段——与 server.rs 的 bind
     /// 物理同源，改配置未重启时不再出现「配置值 vs 实际监听值」分离导致的
@@ -214,6 +234,27 @@ impl ApiSharedState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((bucket, day));
+        // 免费模型用量计数（2026-10-17 额度中心）：按服务账号的区域查该区目录
+        // 判 rate==0（合并目录对同名模型 CN 优先，海外账号服务的免费模型会被
+        // CN 倍率误判——2026-10-17 实测 deepseek-v4.1-flash CN 0.11 / Global 0.00）
+        if ok {
+            let family = if is_wb { "buddy" } else { "trae" };
+            let region = if is_wb { self.wb_pool.uid_region(uid) } else { None };
+            let is_free = match region {
+                Some(g) => crate::api_server::wb_catalog::list_region(&self.data_dir, g)
+                    .iter()
+                    .any(|m| m.id == model.to_lowercase() && m.rate == 0.0),
+                None => crate::api_server::wb_catalog::find(
+                    &crate::api_server::wb_catalog::load(&self.data_dir),
+                    model,
+                )
+                .map(|m| m.rate == 0.0)
+                .unwrap_or(false),
+            };
+            if is_free {
+                free_usage::bump(&self.data_dir, family, uid, model);
+            }
+        }
     }
 
     /// 记录一次自定义模型请求用量（独立 custom_days 桶，与 Trae/WB 侧分账）；
@@ -323,6 +364,36 @@ impl ApiSharedState {
             &session.preview,
             &session.record_id,
         );
+        // 免费模型用量计数（qoder 目录 credits==0 的成功调用；按账号区域取目录）
+        if ok {
+            let region = self.qoder_pool.uid_region(uid);
+            let is_free = match region {
+                Some(g) => crate::tasks::qoder_upstream::catalog_for_region(
+                    if g { crate::tasks::qoder_upstream::QoderRegion::Global } else { crate::tasks::qoder_upstream::QoderRegion::Cn },
+                )
+                    .iter()
+                    .any(|m| {
+                        m.get("id").and_then(serde_json::Value::as_str)
+                            .map(|s| s.eq_ignore_ascii_case(model))
+                            .unwrap_or(false)
+                            && m.get("credits").and_then(serde_json::Value::as_str)
+                                .and_then(crate::tasks::qoder_upstream::credits_rate_of)
+                                .map(|r| r == 0.0)
+                                .unwrap_or(false)
+                    }),
+                None => {
+                    crate::tasks::qoder_upstream::resolve(model, crate::tasks::qoder_upstream::QoderRegion::Cn)
+                        .or_else(|| crate::tasks::qoder_upstream::resolve(model, crate::tasks::qoder_upstream::QoderRegion::Global))
+                        .and_then(|e| e.get("credits").and_then(serde_json::Value::as_str).map(str::to_string))
+                        .and_then(|s| crate::tasks::qoder_upstream::credits_rate_of(&s))
+                        .map(|r| r == 0.0)
+                        .unwrap_or(false)
+                }
+            };
+            if is_free {
+                free_usage::bump(&self.data_dir, "qoder", uid, model);
+            }
+        }
         self.usage_dirty
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -372,11 +443,15 @@ impl ApiSharedState {
     }
 
     /// 全量持久化收尾（服务 stop / 应用退出时调用）：
-    /// 用量脏队列 + api_keys 计数 + API 日志队列一次性排空
+    /// 用量脏队列 + api_keys 计数 + API 日志队列 + 三池运行态冷却一次性排空
     pub fn flush_pending_writes(&self) {
         self.flush_usage_dirty();
         api_keys::flush_dirty(&self.data_dir);
         self.logger.flush();
+        // P1：停机前把未落库的冷却运行态快照一次性排空（脏才有成本）
+        self.pool.flush_cooldown_snapshot();
+        self.wb_pool.flush_cooldown_snapshot();
+        self.qoder_pool.flush_cooldown_snapshot();
     }
 }
 
@@ -551,6 +626,19 @@ pub fn classify_error(status: u16, body: &str) -> ErrKind {
     if is_model_config_mismatch(body) {
         return ErrKind::None;
     }
+    // 11133/400001「request parameters were rejected by the model provider」
+    // （input_invalid）：上游对请求内容的拒绝，与账号健康无关。此前按 400 落
+    // Client（10 分钟冷却并计连续错误），buddy 单健康号池会在 3 次后整池熔断
+    // （实测 step-5-preview 一次 input_invalid 就让唯一健康号濒临禁用）。
+    {
+        let lower_body = body.to_lowercase();
+        if body.contains("\"code\":11133")
+            || body.contains("\"code\": 11133")
+            || lower_body.contains("request parameters were rejected")
+        {
+            return ErrKind::None;
+        }
+    }
     // 积分耗尽（issue #67）：短语命中 → 硬冷却，优先于状态码口径
     if is_credit_exhausted_error(body) {
         return ErrKind::HardCredit;
@@ -589,16 +677,24 @@ pub fn classify_solo_error(code: i64, msg: &str) -> ErrKind {
     if code == 4001 || msg_lower.contains("model config is empty") {
         return ErrKind::None;
     }
+    // 429/4008 前置（2026-10-20）：限流报文的措辞里常带「额度不足/频率限制」
+    // 之类的词，此前先判积分耗尽 → 整号 HardCredit 冻结到次日 04:00；协议
+    // 状态码 / 明确的频率业务码语义更硬，必须优先于文本短语。同
+    // qoder_upstream::classify_upstream_error 的 ③ 状态码特判口径。
+    if code == 429 || code == 4008 {
+        return ErrKind::SoftRate;
+    }
     // 积分耗尽（issue #67）：流内 message 短语 → 硬冷却（次日 04:00），
     // 避免落入 4008 SoftRate（60s）冷却后很快被再次选中、循环薅同一账号
     if is_credit_exhausted_error(msg) {
         return ErrKind::HardCredit;
     }
     // 4008: 请求频率超限（quota exceeded）→ 60 秒短冷却，避免误杀
-    if code == 4008
-        || msg_lower.contains("quota")
+    if msg_lower.contains("quota")
         || msg_lower.contains("exceeded")
-        || msg_lower.contains("rate")
+        || msg_lower.contains("rate limit")
+        || msg_lower.contains("rate-limit")
+        || msg_lower.contains("ratelimit")
     {
         return ErrKind::SoftRate;
     }
@@ -700,6 +796,43 @@ pub fn stream_runtime() -> &'static tokio::runtime::Runtime {
 }
 
 #[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    /// 429/4008 前置（2026-10-20）：限流报文常带「额度不足/频率限制」措辞，
+    /// 此前文本短语先判 → 整号 HardCredit 冻结到次日 04:00
+    #[test]
+    fn rate_codes_win_over_credit_words_in_message() {
+        assert!(matches!(
+            classify_solo_error(429, "请求频率过高，额度不足请稍后再试"),
+            ErrKind::SoftRate
+        ));
+        assert!(matches!(
+            classify_solo_error(4008, "额度过高触发限频"),
+            ErrKind::SoftRate
+        ));
+        // 非限流码仍按积分耗尽整号冷却（issue #67 原语义保留）
+        assert!(matches!(
+            classify_solo_error(500, "积分不足"),
+            ErrKind::HardCredit
+        ));
+    }
+
+    /// 限流词收窄：裸 "rate" 子串不得命中普通英文单词
+    #[test]
+    fn rate_substring_does_not_match_common_words() {
+        assert!(matches!(
+            classify_solo_error(400, "failed to prepare the payload"),
+            ErrKind::Client
+        ));
+        assert!(matches!(
+            classify_solo_error(400, "rate limit exceeded"),
+            ErrKind::SoftRate
+        ));
+    }
+}
+
+#[cfg(test)]
 mod inflight_tests {
     use super::*;
 
@@ -775,6 +908,11 @@ mod inflight_tests {
             qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
             qoder_sticky: wb_sticky::StickyStore::default(),
             trae_sticky: wb_sticky::StickyStore::default(),
+            zcode_pool: pool::ApiPool::new(),
+            zcode_enabled: std::sync::atomic::AtomicBool::new(true),
+            zcode_identity: None,
+            zcode_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(0),
+            zcode_account_concurrency_limit: std::sync::atomic::AtomicU32::new(1),
             listen_host: std::sync::Mutex::new("127.0.0.1".to_string()),
         };
         {

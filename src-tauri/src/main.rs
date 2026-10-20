@@ -1,5 +1,7 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// console feature：排查期用 `cargo build --release --features console` 编出控制台版，
+// panic/报错实时打到终端（配合 panic 黑匣子双保险）；常规版保持无窗口。
+#![cfg_attr(all(not(debug_assertions), not(feature = "console")), windows_subsystem = "windows")]
 
 mod commands;
 mod checkin_results;
@@ -259,7 +261,13 @@ fn main() {
             commands::api_server::pool_status,
             commands::api_server::wb_pool_status,
             commands::api_server::qoder_pool_status,
+            commands::api_server::zcode_pool_status,
             commands::api_server::qoder_catalog_sync,
+            commands::api_server::overseas_access_info,
+            commands::api_server::api_key_test,
+            commands::api_server::api_key_models,
+            commands::api_server::zcode_provider_write,
+            commands::api_server::free_usage_snapshot,
             commands::api_server::api_logs_list,
             commands::api_server::api_logs_detail,
             commands::api_server::api_logs_search,
@@ -459,8 +467,13 @@ fn main() {
         ])
         .setup(|app| {
             // zcode 域初始化(移植自 zai-claim):建独立库 zcode.sqlite、跑迁移、构建 API 客户端
-            let zstate = tauri::async_runtime::block_on(zcode::state::ZcodeState::init(app.handle()))?;
-            app.manage(zstate);
+            let zstate = std::sync::Arc::new(
+                tauri::async_runtime::block_on(zcode::state::ZcodeState::init(app.handle()))?,
+            );
+            app.manage(zstate.clone());
+            // 网关 ZCode 池桥：ZcodeState 入全局缓存——axum handler（无 tauri State
+            // 访问）里按需读账号凭证（池装配 + identity 回调两条路径）
+            commands::zcode_pool::register_zcode_state(zstate.clone());
             // zcode 检测器自动轮询:余额每 5s / 活动每 10min(不依赖任何窗口存活)
             {
                 use zcode::state::ZcodeState;

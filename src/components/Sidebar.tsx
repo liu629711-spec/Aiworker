@@ -15,6 +15,8 @@ import {
   Boxes,
   LayoutGrid,
   Terminal,
+  SwitchCamera,
+  Gauge,
 } from 'lucide-react';
 import { useAppStore } from '../store';
 import { cn } from '../lib/cn';
@@ -42,10 +44,12 @@ const DOUBAO_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'doubao-settings', label: '环境配置', icon: Settings },
 ];
 
-/** Buddy 应用菜单（workbuddy-product-design.md §3.7.0：五页应用级子导航，批次1） */
+/** Buddy 应用菜单（workbuddy-product-design.md §3.7.0：应用级子导航；
+ * buddy-sessions = 2026-10-16 由 ZCode 页 WorkBuddy 子视图移植：国内/海外登录态捕获与切换） */
 const BUDDY_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'buddy-overview', label: '概述', icon: LayoutDashboard },
   { key: 'buddy-accounts', label: '账号管理', icon: Users },
+  { key: 'buddy-sessions', label: '多账号会话', icon: SwitchCamera },
   { key: 'buddy-checkin', label: '签到与成长', icon: PlayCircle },
   { key: 'buddy-credits', label: '积分看板', icon: Coins },
   { key: 'buddy-api-service', label: '资源调度', icon: Server },
@@ -111,7 +115,7 @@ export default function Sidebar({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeApp, pinnedApp, settings?.hidden_apps]);
 
-  // 按当前应用切换菜单：Trae → 现有 6 页；豆包 → 3 页；Buddy → 6 页；Qoder → 6 页（F-80）
+  // 按当前应用切换菜单：Trae → 现有 6 页；豆包 → 3 页；Buddy → 7 页；Qoder → 6 页（F-80）
   const nav =
     activeApp === 'doubao'
       ? DOUBAO_NAV
@@ -193,6 +197,20 @@ export default function Sidebar({
         </div>
       </div>
       <div className="flex items-center justify-center gap-1 border-t border-slate-200 p-3 dark:border-zinc-800">
+        {/* 额度中心（全局页：跨家族积分/免费档/体检，不随应用切换） */}
+        <button
+          onClick={() => onNav('quota-center')}
+          className={cn(
+            'flex h-8 w-8 items-center justify-center rounded-lg transition active:scale-90',
+            view === 'quota-center'
+              ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
+              : 'text-slate-500 hover:bg-slate-100 hover:text-slate-700 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-200',
+          )}
+          aria-label="额度中心"
+          title="额度中心（跨家族积分 / 免费档用量 / 账号体检）"
+        >
+          <Gauge size={17} />
+        </button>
         {/* API 管理入口（统一网关 §5.1，原 Github 图标位置） */}
         <button
           onClick={() => setShowApiManager(true)}

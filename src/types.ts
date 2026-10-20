@@ -5,6 +5,7 @@ export type ViewKey =
   | 'dashboard'
   | 'accounts'
   | 'checkin'
+  | 'quota-center'
   | 'credits'
   | 'logs'
   | 'api-service'
@@ -16,6 +17,7 @@ export type ViewKey =
   // Buddy 应用页面（侧边栏应用切换 Tab → Buddy，批次1）
   | 'buddy-overview'
   | 'buddy-accounts'
+  | 'buddy-sessions'
   | 'buddy-checkin'
   | 'buddy-credits'
   | 'buddy-api-service'
@@ -672,6 +674,8 @@ export interface ModelOption {
 }
 
 export interface PoolStatus {
+  /** 账号所属区：true=海外（Key 区域约束候选标注/置灰依据） */
+  global_region?: boolean;
   uid: string;
   name: string;
   credits: number | null;
@@ -753,6 +757,14 @@ export interface ApiPoolFile {
   wb_tag_ids?: string[];
   /** Qoder 池标签筛选；空 = 不限 */
   qoder_tag_ids?: string[];
+  /** ZCode 上游开关（z.ai GLM 池）：开启后 GLM-5.3/GLM-5.3-Flash 可路由 ZCode 账号池（默认开） */
+  zcode_enabled?: boolean;
+  /** ZCode 池入池白名单（zcode accounts.id）；空 = 全部含凭证账号入池 */
+  zcode_enabled_uids?: string[];
+  /** ZCode 池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限） */
+  zcode_account_concurrency_limit?: number;
+  /** ZCode 池粘性 TTL 秒（per-pool 三参数之一，默认 300） */
+  zcode_pool_sticky_ttl_secs?: number;
 }
 
 /** CC Switch 协同状态（T5.7/F-43） */
@@ -825,6 +837,52 @@ export interface UsageModelLatencyView {
 }
 
 /** API Key 条目（data/api_keys.json；daily_limit=0 表示不限，T2；F-35 子 Key 体系批次3） */
+/** Key 连通性自测结果 */
+export interface ApiKeyTestResult {
+  ok: boolean;
+  requested?: string;
+  model?: string;
+  content?: string;
+  elapsed_ms?: number;
+  acct?: string;
+  uid?: string;
+  status?: number;
+  error?: string;
+}
+
+/** Key 生效范围模型清单（按池分组，带池前缀） */
+export interface KeyScopedModels {
+  trae: string[];
+  buddy: string[];
+  qoder: string[];
+}
+
+/** 免费模型用量计数快照：{family: {uid: {model: {count, last_success, exhausted_at, reset_at}}}} */
+export type FreeUsageSnapshot = Record<string, Record<string, Record<string, {
+  count?: number;
+  last_success?: string;
+  exhausted_at?: string;
+  reset_at?: string;
+}>>>;
+
+/** 海外号池接入信息（ZCode 页「海外号池」面板） */
+export interface OverseasModelLite {
+  id: string;
+  name: string;
+  /** Buddy=倍率数值；Qoder=credits 原文（"x0.00"） */
+  rate?: number;
+  credits?: string;
+}
+
+export interface OverseasAccessInfo {
+  /** 网关 OpenAI 兼容基址（http://host:port/v1） */
+  base_url: string;
+  /** Buddy 海外区模型清单 */
+  buddy: OverseasModelLite[];
+  /** Qoder 海外区模型清单 */
+  qoder: OverseasModelLite[];
+}
+
 export interface ApiKeyEntry {
   id: string;
   name: string;
@@ -847,6 +905,8 @@ export interface ApiKeyEntry {
    * 可带 `trae:`/`buddy:` 池前缀（专一锁定其归属池）
    */
   dedicated_account: string;
+  /** 号池区域约束（2026-10-17 海外接入）："" = 不限 | "cn" = 仅国内 | "global" = 仅海外（Buddy/Qoder 两池取号依据） */
+  region?: string;
   /** 资源池绑定（issue #25）："" = 跟随全局调度 | "trae" | "buddy" | "qoder" */
   bind_pool: string;
   /** 共享分组 id 白名单（shg_ 前缀）；空 = 不通过该维度限制。运行时实时展开并入
@@ -1108,8 +1168,24 @@ export interface WorkBuddyAccountView {
   note: string;
   credits_balance: number | null;
   credits_fetched_at: string | null;
+  /** 免费额度剩余 / 总量（免费包 = free-packages 接口来源；null = 无免费包） */
+  free_remaining: number | null;
+  free_total: number | null;
+  /** 免费额度下次刷新时刻（Unix 秒；免费包最早到期——按包周期发放，到期即刷新） */
+  free_next_reset_at: number | null;
+  /** 免费模型（目录 rate=0，不消耗积分）清单 + 各模型耗尽状态；null = 尚未采集 */
+  free_models: QoderFreeModel[] | null;
+  free_models_fetched_at: string | null;
+  /** 账号所属区（"overseas" / "domestic"）——号池隔离与免费模型分区展示依据 */
+  region?: string;
   /** 共享标签 tag id 列表（老后端缺省 undefined） */
   tags?: string[];
+  /** 凭证健康度（tasks::wb_health 推导）：healthy / expiring（24h 内过期）/ expired / dead（已被服务端吊销）/ no_credential */
+  credential_health?: string;
+  /** access token 剩余小时数（负值＝已过期；null＝无到期信息） */
+  credential_ttl_hours?: number | null;
+  /** 健康度一句话说明（处置指引，徽标 tooltip 可直接用） */
+  credential_hint?: string;
   /** 在线 = 本机 auth 文件当前生效账号 */
   is_current: boolean;
   has_credential: boolean;
@@ -1158,6 +1234,40 @@ export interface WorkBuddyScanResult {
   exists: boolean;
   /** 已在账号池中（再次导入 = 更新凭证而非新增；accounts.rs 导入按此 upsert） */
   already_in_pool?: boolean;
+}
+
+/* ===== WorkBuddy 多账号会话（buddy-sessions：国内/海外登录态捕获与切换） ===== */
+
+/** 从会话文件明文字段解析出的登录信息 */
+export interface WbSessionMeta {
+  uid: string;
+  uin: string | null;
+  domain: string | null;
+  /** domestic=国内(www.workbuddy.cn) / overseas=海外(www.workbuddy.ai) */
+  region: 'domestic' | 'overseas';
+}
+
+/** 已捕获的 WorkBuddy 账号（一份官方会话文件快照，zcode_wb_* 命令族） */
+export interface WbAccount {
+  id: number;
+  uid: string;
+  label: string | null;
+  uin: string | null;
+  region: string;
+  domain: string | null;
+  captured_at: number;
+  is_current: boolean;
+}
+
+/** WorkBuddy 当前状态（serde flatten：登录时 meta 字段平铺在顶层） */
+export interface WbStatus {
+  logged_in: boolean;
+  running: boolean;
+  exe_found: string | null;
+  uid?: string;
+  uin?: string | null;
+  domain?: string | null;
+  region?: 'domestic' | 'overseas';
 }
 
 export interface WorkBuddySettings {
@@ -1435,6 +1545,21 @@ export interface QoderDeviceProfile {
   umid: string;
 }
 
+/** 免费档模型（目录 rate=0，不消耗积分）：两端共用形态。
+ * 额度耗尽/恢复由上游额度错误码驱动记录（官方无查询剩余次数的接口）。 */
+export interface QoderFreeModel {
+  id: string;
+  name: string;
+  /** 倍率（恒 0：免费档） */
+  rate: number;
+  /** 地区归属：cn | global | ''（Qoder 双区特有；Buddy 域不提供该字段） */
+  region?: string;
+  /** 最近一次观测到额度耗尽时刻（"YYYY-MM-DD HH:MM:SS"；null = 未观测到） */
+  exhausted_at?: string | null;
+  /** 额度恢复时刻（从上游限额文案解析；null = 文案未携带/未观测到耗尽） */
+  reset_at?: string | null;
+}
+
 export interface QoderAccountView {
   id: string;
   uid: string;
@@ -1451,6 +1576,10 @@ export interface QoderAccountView {
   note: string;
   credits_balance: number | null;
   credits_fetched_at: string | null;
+  /** 免费档模型清单 + 额度耗尽状态（目录 rate=0 的模型快照） */
+  free_models: QoderFreeModel[] | null;
+  /** 免费额度信息刷新时刻（ISO8601） */
+  free_models_fetched_at: string | null;
   has_credential: boolean;
   /** 共享标签 tag id 列表（老后端缺省 undefined） */
   tags?: string[];
@@ -1460,6 +1589,8 @@ export interface QoderAccountView {
   fingerprint: string | null;
   /** 完整设备指纹（指纹查看弹框数据源） */
   device_profile: QoderDeviceProfile | null;
+  /** 账号所属区："cn"（默认）| "global"——海外徽标 + 免费档分区展示依据 */
+  region?: string;
 }
 
 export interface QoderSettings {
@@ -1520,13 +1651,27 @@ export interface QoderOauthDone {
 }
 
 /** IDE 存储账号发现/导入结果（qoder_ide_scan；脱敏不含 token） */
+export interface QoderIdeScanOne {
+  found: boolean;
+  imported: boolean;
+  updated: boolean;
+  account_id: string;
+  nickname: string;
+  reason: string;
+}
+
 export interface QoderIdeScanResult {
   found: boolean;
   imported: boolean;
   updated: boolean;
   account_id: string | null;
   nickname: string | null;
+  /** 双端扫描汇总明细（国内版/海外版逐端结论，2026-10-17） */
   reason: string;
+  /** 国内客户端（QoderCN）扫描明细（null = 数据目录不可达） */
+  cn?: QoderIdeScanOne | null;
+  /** 海外客户端（Qoder）扫描明细（发现登录态即导入并盖 global 区章） */
+  global?: QoderIdeScanOne | null;
 }
 
 /** Qoder CLI 登录状态（M4 status 只读桥；R-3 裁决无独立 CLI 凭证通道） */

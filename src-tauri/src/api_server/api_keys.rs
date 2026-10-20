@@ -63,8 +63,10 @@ pub struct ResolvedKey {
     /// 专一模式绑定的上游账号 uid（空 = allowed_accounts 首个）；混合白名单时
     /// 同样可带池前缀（专一锁定其归属池，排除另一池）
     pub dedicated_account: String,
-    /// 资源池绑定："" = 跟随全局调度 | "trae" | "buddy" | "qoder"
+    /// 资源池绑定："" = 跟随全局调度 | "trae" | "buddy" | "qoder" | "zcode"
     pub bind_pool: String,
+    /// 号池区域约束："" = 不限 | "cn" | "global"（仅 Buddy/Qoder 两池消费）
+    pub region: String,
     /// 共享分组 id 白名单（未展开；鉴权时经 org_index 展开并入 allowed_accounts）
     pub allowed_groups: Vec<String>,
     /// 共享标签 id 白名单（未展开；同上）
@@ -94,6 +96,10 @@ pub struct PoolConstraint {
     pub allowed: Option<std::collections::HashSet<String>>,
     /// 该池专一账号 uid（已去前缀；取号侧优先锁定不让位）
     pub dedicated: Option<String>,
+    /// 号池区域约束（2026-10-17 海外接入）：Some(true)=仅海外账号、Some(false)=
+    /// 仅国内账号、None=不限。取号侧覆盖/收窄模型区域推导——Key 是用户的显式
+    /// 意图（国内号池用国内 Key、海外号池用海外 Key 的硬隔离手段）
+    pub want_global: Option<bool>,
 }
 
 impl ResolvedKey {
@@ -105,6 +111,7 @@ impl ResolvedKey {
             schedule_mode: e.schedule_mode().to_string(),
             dedicated_account: e.dedicated_account.clone(),
             bind_pool: e.bind_pool.clone(),
+            region: e.region.clone(),
             allowed_groups: e.allowed_groups.clone(),
             allowed_tags: e.allowed_tags.clone(),
             org_constrained: false,
@@ -168,8 +175,19 @@ impl ResolvedKey {
     ///   其中白名单可空（空白名单 + 专一 = 不限账号但锁定专一，F-35 原语义）
     pub fn pool_constraints(&self, pool: &str) -> Option<PoolConstraint> {
         use std::collections::HashSet;
-        // 组/标签维度已配置时不得提前返回 None（空展开 = 该池排除，非「不限」）
-        if self.allowed_accounts.is_empty() && self.dedicated_account.is_empty() && !self.org_constrained {
+        // 区域约束（2026-10-17 海外接入）：仅对 Buddy/Qoder 两池生效（Trae 无区域概念）
+        let key_want_global = if pool == "buddy" || pool == "qoder" {
+            parse_region(&self.region)
+        } else {
+            None
+        };
+        // 组/标签维度已配置时不得提前返回 None（空展开 = 该池排除，非「不限」）；
+        // 仅区域约束（无白名单/专一/组标签）同样不得提前返回——区域是独立约束维度
+        if self.allowed_accounts.is_empty()
+            && self.dedicated_account.is_empty()
+            && !self.org_constrained
+            && key_want_global.is_none()
+        {
             return None;
         }
         // 专一模式生效的专一账号（空 → allowed 首个），解析归属池与裸 uid
@@ -202,13 +220,13 @@ impl ResolvedKey {
                 Some((dpool, duid)) if dpool == pool => {
                     let mut allowed = scoped;
                     allowed.insert(duid.clone());
-                    Some(PoolConstraint { allowed: Some(allowed), dedicated: Some(duid) })
+                    Some(PoolConstraint { allowed: Some(allowed), dedicated: Some(duid), want_global: key_want_global })
                 }
                 // 专一锁池：非归属池整体排除（预检判不健康 → 走归属池）
                 Some(_) => {
-                    Some(PoolConstraint { allowed: Some(HashSet::new()), dedicated: None })
+                    Some(PoolConstraint { allowed: Some(HashSet::new()), dedicated: None, want_global: key_want_global })
                 }
-                None => Some(PoolConstraint { allowed: Some(scoped), dedicated: None }),
+                None => Some(PoolConstraint { allowed: Some(scoped), dedicated: None, want_global: key_want_global }),
             }
         } else if self.constrains_pool(pool) {
             // 旧语义：constrains_pool 已判定本池受约束；白名单可空（issue #30
@@ -216,7 +234,10 @@ impl ResolvedKey {
             // 与重构前 wb_route/trae_pool_constraints 的独立提取行为一致）
             let allowed = (!self.allowed_accounts.is_empty())
                 .then(|| self.allowed_accounts.iter().cloned().collect());
-            Some(PoolConstraint { allowed, dedicated: dedicated.map(|(_, u)| u) })
+            Some(PoolConstraint { allowed, dedicated: dedicated.map(|(_, u)| u), want_global: key_want_global })
+        } else if key_want_global.is_some() {
+            // 仅区域约束（无白名单/专一/组标签）：区域单独生效（2026-10-17 海外接入）
+            Some(PoolConstraint { allowed: None, dedicated: None, want_global: key_want_global })
         } else {
             None
         }
@@ -229,6 +250,97 @@ pub fn parse_bind_pool(s: &str) -> Option<&'static str> {
         "trae" => Some("trae"),
         "buddy" => Some("buddy"),
         "qoder" => Some("qoder"),
+        "zcode" => Some("zcode"),
+        _ => None,
+    }
+}
+
+/// 海外号池专用 Key 预置（2026-10-17 海外接入）：Qoder/Buddy 各一把，
+/// `bind_pool` + `region=global` 双重钉死（池绑定选账号体系、区域约束选区内
+/// 账号）——国内号池用国内 Key、海外号池用海外 Key。幂等：kv 标记
+/// `overseas_pool_keys_provisioned` 置位后不再创建（用户删除后不复活；
+/// 同 id 已存在亦跳过，尊重手工重建）。
+pub fn ensure_overseas_pool_keys(data_dir: &Path) {
+    const FLAG: &str = "overseas_pool_keys_provisioned";
+    if crate::store::db(data_dir).kv_get::<bool>(FLAG) {
+        return;
+    }
+    let mut file = load(data_dir);
+    let mut changed = false;
+    // Key 值编译期固定（非运行时随机）：ZCode agent 的供应商配置直写需要
+    // 预知值；泄露面 = 本机回环网关，可在 Key 管理器随时重建
+    for (id, name, pool, key_value) in [
+        ("key-qoder-overseas", "Qoder 海外号池", "qoder", "ck_7016ba97effb9b665362018714025247"),
+        ("key-buddy-overseas", "Buddy 海外号池", "buddy", "ck_d3e237c95d72dc8ea5e7872ab0aaf7bf"),
+    ] {
+        if file.keys.iter().any(|k| k.id == id) {
+            continue;
+        }
+        file.keys.push(ApiKeyEntry {
+            id: id.into(),
+            name: name.into(),
+            key: key_value.into(),
+            enabled: true,
+            daily_limit: 0,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            used_date: String::new(),
+            used_today: 0,
+            allowed_accounts: vec![],
+            schedule_mode: "expire_first".into(),
+            dedicated_account: String::new(),
+            region: "global".into(),
+            bind_pool: pool.into(),
+            daily_stats: vec![],
+            allowed_groups: vec![],
+            allowed_tags: vec![],
+        });
+        changed = true;
+    }
+    if changed {
+        save(data_dir, &file);
+        crate::fs_utils::app_log(
+            data_dir,
+            "已预置海外号池专用 Key：Qoder/Buddy 各一把（bind_pool + region=global 双重钉死，API 管理弹窗可见）",
+        );
+    }
+    let _ = crate::store::db(data_dir).kv_set(FLAG, &true);
+}
+
+/// 一次性迁移（2026-10-17，用户裁决）：存量 Key（region 为空且非海外预置 Key）
+/// 统一补「仅国内」——国内号池用国内 Key、海外号池用海外 Key 的硬隔离收尾。
+/// Trae 池无区域概念，region=cn 对其无副作用。kv 标记幂等，用户之后可随时在
+/// Key 管理器改回。
+pub fn normalize_legacy_key_regions(data_dir: &Path) {
+    const FLAG: &str = "legacy_key_region_cn_applied";
+    if crate::store::db(data_dir).kv_get::<bool>(FLAG) {
+        return;
+    }
+    let mut file = load(data_dir);
+    let mut changed = false;
+    for k in file.keys.iter_mut() {
+        if k.region.is_empty() && k.id != "key-qoder-overseas" && k.id != "key-buddy-overseas" {
+            k.region = "cn".into();
+            changed = true;
+        }
+    }
+    if changed {
+        save(data_dir, &file);
+        crate::fs_utils::app_log(
+            data_dir,
+            "已将存量 Key 区域统一为「仅国内」（海外号池专用 Key 除外；用户裁决，Key 管理器可改回）",
+        );
+    }
+    let _ = crate::store::db(data_dir).kv_set(FLAG, &true);
+}
+
+/// 解析 region 字段为区域约束（""/非法 → None = 不限）
+pub fn parse_region(s: &str) -> Option<bool> {
+    match s.trim().to_lowercase().as_str() {
+        "global" | "overseas" => Some(true),
+        "cn" | "domestic" => Some(false),
         _ => None,
     }
 }
@@ -273,6 +385,11 @@ pub struct ApiKeyEntry {
     /// 专一模式绑定的上游账号 uid（空 = allowed_accounts 首个）
     #[serde(default)]
     pub dedicated_account: String,
+    /// 号池区域约束（2026-10-17 海外接入）："" = 不限 | "cn" = 仅国内账号 |
+    /// "global" = 仅海外账号。对 Buddy/Qoder 两池生效（取号侧 want_global），
+    /// 与 bind_pool 正交（池绑定选账号体系，区域约束选区内账号）
+    #[serde(default)]
+    pub region: String,
     /// 资源池绑定（issue #25）："" = 跟随全局调度 | "trae" | "buddy"。
     /// 绑定后选池优先级最高（覆盖会话粘性与全局策略），池内约束（白名单/专一）
     /// 随绑定池切换账号体系
@@ -674,6 +791,7 @@ mod tests {
             daily_stats: vec![],
             allowed_groups: vec![],
             allowed_tags: vec![],
+            region: String::new(),
         }
     }
 

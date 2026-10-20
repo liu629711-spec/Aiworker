@@ -66,6 +66,19 @@ pub fn default_template_map() -> Vec<(String, String)> {
             "You are an interactive agent in TraeCode that helps the USER with software engineering tasks.".to_string(),
             "You are an interactive agent running in TraeCode that helps the USER with software engineering tasks.".to_string(),
         ),
+        // ZCode harness（2026-10-19 实证拦截）：海外 WB 渠道 11128「request
+        // illegal」按请求指纹全量拦截，指纹样本首句即本客户端身份声明。两条
+        // 分别对应单句形态与「身份 + 通用助手句」连写形态（后者是 ZCode 主
+        // system 的实际开头，拦截日志逐字可见）；改写手法同其余规则——最小
+        // 一词改动即可脱离逐字风控名单，语义不变
+        (
+            "You are ZCode, an interactive coding agent".to_string(),
+            "You are ZCode, an interactive coding tool".to_string(),
+        ),
+        (
+            "You are an interactive ZCode agent that helps users with software engineering tasks.".to_string(),
+            "You are an interactive ZCode assistant that helps users with software engineering tasks.".to_string(),
+        ),
         // issue #57 预防性布防：REASONIX/DSH 等第三方客户端指纹句（无真实请求
         // 日志可查证，按常见开源 CLI harness 身份句先布防——未命中即无操作）。
         // 上线后从请求日志（debug）核实触发句，通过 KV wb_template_map.json
@@ -668,11 +681,39 @@ mod tests {
         assert_eq!(again.matches("FP_PROBE_FROM → FP_PROBE_TO").count(), 1);
     }
 
+    /// ZCode 身份句必须被默认表真实改写（2026-10-19 海外 WB 11128 全量拦截回归锁）。
+    /// 拦截样本首句逐字为 `You are ZCode, an interactive coding agent`——它此前不在
+    /// 19 条默认规则里，清洗开着也照样原样发出。锁两件事：规则存在、且改写结果
+    /// 与原文不同（防止有人误填成恒等替换让布防静默失效）。
+    #[test]
+    fn zcode_identity_sentences_are_rewritten() {
+        let templates = default_template_map();
+        let samples = [
+            "You are ZCode, an interactive coding agent",
+            "You are an interactive ZCode agent that helps users with software engineering tasks.",
+        ];
+        for from in samples {
+            let rule = templates
+                .iter()
+                .find(|(f, _)| f == from)
+                .unwrap_or_else(|| panic!("默认模板表缺少规则: {from}"));
+            assert_ne!(rule.1, *from, "规则不得是恒等替换（无改写 = 布防失效）: {from}");
+            let out = apply_template_map(from, &templates);
+            assert_ne!(out, from, "改写后仍与原文相同: {from}");
+            assert!(
+                !out.contains("You are ZCode, an interactive coding agent")
+                    && !out.contains(
+                        "You are an interactive ZCode agent that helps users with software engineering tasks."
+                    ),
+                "改写结果不得保留原指纹句: {out}"
+            );
+        }
+    }
+
     /// 11128 指纹样本提取（issue #99）：首条 system 文本（空白压缩、引号转义、
     /// 截断 300 字符）+ 工具名列表；非 JSON body 不 panic
     #[test]
-    fn fingerprint_sample_extracts_system_and_tools() {
-        let body = json!({
+    fn fingerprint_sample_extracts_system_and_tools() {        let body = json!({
             "messages": [
                 {"role":"system","content":"You are Claude Code, Anthropic's official CLI for Claude,  running\ninside the VS Code extension."},
                 {"role":"user","content":"hi"}

@@ -29,6 +29,7 @@ pub const ROW_TABLES: &[&str] = &[
     "qoder_tokens",
     "qoder_checkin_results",
     "qoder_credits_history",
+    "pool_cooldowns",
 ];
 
 const DDL: &[&str] = &[
@@ -101,6 +102,12 @@ const DDL: &[&str] = &[
         updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
     )",
     "CREATE TABLE IF NOT EXISTS qoder_credits_history (
+        pk         TEXT PRIMARY KEY,
+        data       TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    )",
+    // P1 网关三池运行态冷却持久化（pk = "{pool}:{uid}"，flusher 脏时整池快照落库）
+    "CREATE TABLE IF NOT EXISTS pool_cooldowns (
         pk         TEXT PRIMARY KEY,
         data       TEXT NOT NULL,
         updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))

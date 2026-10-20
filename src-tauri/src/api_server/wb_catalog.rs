@@ -1,10 +1,14 @@
 //! WorkBuddy 模型目录（T2.1/F-37 静态兜底层）
 //!
 //! §5.6 原则：
-//! - 静态兜底目录落 `wb_model_catalog.json`（缺失时以本文件内置表写入）；
+//! - 静态兜底目录落 kv（缺失时以本文件内置表写入）；
 //! - 能力声明永远读上游字段（inputModalities/supportedEfforts），勿硬编码——
-//!   本表仅作上游目录接口（`GET {chatBase}/console/enterprises/personal/models`，
-//!   批次 4 F-37 动态替换）不可用时的兜底；
+//!   本表仅作上游目录接口不可用时的兜底。上游源按区分叉（2026-10-17 实测）：
+//!   CN = `GET {chatBase}/console/enterprises/personal/models`（批次 4 F-37）；
+//!   Global = `GET {chatBase}/v3/config` 的 `data.models`（海外桌面客户端
+//!   产品配置同源，credits 计费倍率与客户端选择器一致）。注意 `/v2/enterprises/
+//!   personal/models` 是 **platform=CLI** 视图，倍率与桌面端不同（hy4-preview
+//!   在该视图 x0.00、桌面端 x0.29），不可作 Global 目录源——曾致账号页免费档错标。
 //! - `effort_override` 为实测修正层（hy3 系列仅 high 真正生效，v1.2），
 //!   优先级：修正层 > 客户端请求 > 上游默认。
 
@@ -38,6 +42,15 @@ pub struct WbModel {
     /// 积分倍率（展示用，成本模型按无缓存估算 §5.5 #10）
     #[serde(default)]
     pub rate: f64,
+    /// 所属区（"cn" / "global"；取号层据此只出该区账号——国内/海外号池
+    /// 逻辑隔离，国内模型不出海外号、反之亦然）。内置表 = "cn"（国内实测快照）；
+    /// 上游分区目录刷新时按区写入。
+    #[serde(default = "default_cn")]
+    pub region: String,
+}
+
+fn default_cn() -> String {
+    "cn".to_string()
 }
 
 impl WbModel {
@@ -99,6 +112,7 @@ pub fn builtin() -> Vec<WbModel> {
             supported_efforts: efforts.iter().map(|s| s.to_string()).collect(),
             effort_override: ov.map(str::to_string),
             rate,
+            region: default_cn(),
         }
     };
     vec![
@@ -120,6 +134,60 @@ pub fn builtin() -> Vec<WbModel> {
     ]
 }
 
+/// 海外区内置兜底目录（2026-10-17 从海外客户端 5.8.4 安装目录
+/// `resources/app.asar.unpacked/cli/product.json` 固化——客户端本地基础配置，
+/// 与远程 `/v3/config` 并集合并（远程同 id 优先）。仅收录带 credits 计费的
+/// 文本模型；`default-model`（Auto 智能路由，上游不标价）与图像/视频模型
+/// 不入库；gpt-6-astra 为 Pro 套餐锁定模型（试用账号不可用），按用户裁决
+/// 不收录展示。免费档：hy3 / step-5-preview / deepseek-v4.1-flash 0.00x。
+pub fn builtin_global() -> Vec<WbModel> {
+    let m = |id: &str,
+             display: &str,
+             ctx: u64,
+             mt: u64,
+             img: bool,
+             efforts: &[&str],
+             ov: Option<&str>,
+             rate: f64| {
+        WbModel {
+            id: id.to_string(),
+            display: display.to_string(),
+            context_length: ctx,
+            max_tokens: mt,
+            supports_image: img,
+            supported_efforts: efforts.iter().map(|s| s.to_string()).collect(),
+            effort_override: ov.map(str::to_string),
+            rate,
+            region: "global".to_string(),
+        }
+    };
+    vec![
+        m("fast-model", "Fast", 200_000, 32_000, true, &["medium"], None, 0.34),
+        m("balanced-model", "Balanced", 256_000, 32_000, true, &["medium"], None, 0.59),
+        m("primary-model", "Primary", 272_000, 72_000, true, &["high"], None, 1.70),
+        m("deep-model", "Deep", 176_000, 24_000, true, &[], None, 2.20),
+        m("deepseek-v4.1-flash", "Deepseek-V4.1-Flash", 1_000_000, 128_000, true, &["high"], None, 0.00),
+        m("deepseek-v4.1-flash-sg", "Deepseek-V4.1-Flash", 1_000_000, 128_000, true, &["high"], None, 0.03),
+        m("hy4-preview", "Hy4 preview", 1_000_000, 64_000, true, &["high"], None, 0.29),
+        m("hy3", "Hy3", 192_000, 64_000, true, &["low", "high"], None, 0.00),
+        // 海外免费档第三个（2026-10-17 用户实测客户端选择器：Hy3/Step-5-Preview/
+        // Deepseek-V4.1-Flash 均标 Free now；各海外配置源未下发，按实测收录）
+        m("step-5-preview", "Step-5-Preview", 1_000_000, 64_000, true, &["low", "medium", "high"], None, 0.00),
+        m("kimi-k2.8-preview", "Kimi-K2.8-Preview", 1_000_000, 32_000, true, &["low", "high", "max"], None, 0.77),
+        m("gpt-5.6-sol", "GPT-5.6-Sol", 1_000_000, 128_000, true, &["low", "medium", "high", "xhigh", "max"], None, 3.47),
+        m("gpt-5.6-terra", "GPT-5.6-Terra", 1_000_000, 128_000, true, &["low", "medium", "high", "xhigh", "max"], None, 1.39),
+        m("gpt-5.6-luna", "GPT-5.6-Luna", 1_000_000, 128_000, true, &["low", "medium", "high", "xhigh", "max"], None, 0.14),
+        m("gpt-5.5", "GPT-5.5", 1_000_000, 128_000, true, &["low", "medium", "high", "xhigh"], None, 3.31),
+        m("gpt-5.4", "GPT-5.4", 272_000, 72_000, true, &["low", "medium", "high", "xhigh"], None, 1.65),
+        m("gemini-3.5-flash", "Gemini-3.5-Flash", 1_000_000, 65_536, true, &["medium"], None, 0.99),
+        m("glm-5.3-flash", "GLM-5.3-Flash", 1_000_000, 32_000, true, &["low", "high", "max"], None, 0.06),
+        m("glm-5.3", "GLM-5.3", 1_000_000, 48_000, true, &["low", "high", "max"], None, 0.79),
+        m("glm-5.2", "GLM-5.2", 1_000_000, 48_000, true, &["high", "xhigh"], None, 0.79),
+        m("kimi-k3", "Kimi-K3", 1_000_000, 32_000, true, &["medium"], None, 1.62),
+        m("kimi-k2.6", "Kimi-K2.6", 256_000, 32_000, true, &["medium"], None, 0.52),
+    ]
+}
+
 /// 目录文件路径（data/wb_model_catalog.json，§3.8）。
 /// 数据文件统一 data/ 子目录（与 api_models/api_keys/api_usage 同层）；
 /// Buddy 侧不保历史（§9.4 #7）：旧根目录位置不迁移，缺失即内置兜底重建
@@ -128,6 +196,75 @@ pub fn builtin() -> Vec<WbModel> {
 /// 上游同步写入的目录（fetched_at 非空）不受影响。人工维护的目录请把 builtin_rev
 /// 手工改为当前值以退出重建。
 pub const BUILTIN_REV: u32 = 4;
+
+/// 目录 kv 存储键按区域拆分（修复「海外账号模型目录」）：CN 沿用存量键
+/// `wb_model_catalog`（兼容既有安装），Global 落新键 `wb_model_catalog_global`——
+/// 两区模型清单由上游各自下发（id/倍率/免费档均可不同），单份存储会让两区
+/// 互相覆盖（海外账号刷一次目录就把国内模型冲掉）。读取侧 [`load`] 合并两区。
+const KV_KEY_CN: &str = "wb_model_catalog";
+pub const KV_KEY_GLOBAL: &str = "wb_model_catalog_global";
+/// 合并结果热路径缓存键（dispatch 每请求读取；fetch_and_replace 写路径显式失效）
+const CACHE_KEY_MERGED: &str = "wb_model_catalog_merged";
+
+/// 单区目录读取：上游同步结果优先保留；旧版本内置表落盘的目录按新内置表重建
+/// （fetched_at 为空且 builtin_rev 低于当前值）。Global 键缺失/为空时落
+/// [`builtin_global`]（海外客户端 product.json 固化快照，非国内表冒充）。
+fn load_region(data_dir: &Path, global: bool) -> Vec<WbModel> {
+    let key = if global { KV_KEY_GLOBAL } else { KV_KEY_CN };
+    let read = || -> Option<Vec<WbModel>> {
+        let file = crate::store::db(data_dir)
+            .kv_get_raw(key)
+            .and_then(|t| serde_json::from_str::<WbCatalogFile>(&t).ok())?;
+        if file.models.is_empty() {
+            return None;
+        }
+        // 上游同步结果优先保留；否则旧版本内置表落盘的目录按新内置表重建
+        (file.fetched_at.is_some() || file.builtin_rev >= BUILTIN_REV).then_some(file.models)
+    };
+    if let Some(models) = read() {
+        return tag_region(models, global);
+    }
+    // 缺失时落盘各区内置表并返回（Global 表见 builtin_global 文档）
+    let builtin = if global { builtin_global() } else { builtin() };
+    let _ = crate::store::db(data_dir).kv_set(
+        key,
+        &WbCatalogFile {
+            models: builtin.clone(),
+            fetched_at: None,
+            builtin_rev: BUILTIN_REV,
+        },
+    );
+    builtin
+}
+
+/// 给目录条目打区标记（存量无 region 字段的记录统一按所在区补上；
+/// 上游分区目录若已带 region 则尊重原值——两侧恒为该区值）
+fn tag_region(models: Vec<WbModel>, global: bool) -> Vec<WbModel> {
+    let r = if global { "global" } else { "cn" };
+    models
+        .into_iter()
+        .map(|mut m| {
+            if m.region.is_empty() {
+                m.region = r.to_string();
+            }
+            m
+        })
+        .collect()
+}
+
+/// 两区目录合并：CN 在前（同 id CN 优先，保持存量行为），Global 独有条目追加
+/// ——dispatch 的 Buddy 源判定、统一模型目录、免费模型清单由此覆盖双区模型。
+fn merge_regions(cn: Vec<WbModel>, global: Vec<WbModel>) -> Vec<WbModel> {
+    let mut out = cn;
+    let seen: std::collections::HashSet<String> =
+        out.iter().map(|m| m.id.to_lowercase()).collect();
+    for m in global {
+        if !seen.contains(&m.id.to_lowercase()) {
+            out.push(m);
+        }
+    }
+    out
+}
 
 /// 目录文件结构（支持上游动态替换后的全量覆盖）
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -140,40 +277,73 @@ pub struct WbCatalogFile {
     pub builtin_rev: u32,
 }
 
-/// 加载目录：kv `wb_model_catalog` 优先（动态替换结果 / 人工维护），
-/// 缺失或为空时落盘内置表并返回内置表。
+/// 加载目录：CN 键 + Global 键合并（两区模型并集；同 id CN 优先），
+/// 任一区缺失/为空时按区兜底（CN 回内置表、Global 回空）。合并结果走
+/// 热路径缓存（`wb_model_catalog_merged`），fetch_and_replace 写路径显式失效。
 /// SQLite 化（P2）：原 data/wb_model_catalog.json → kv 键（热路径单行读取替代解析缓存）。
 pub fn load(data_dir: &Path) -> Vec<WbModel> {
-    // 热路径缓存（批次 A）：resolve_target / 目录聚合每请求读取（含缺失时内置表落盘副作用，
-    // 该副作用在缓存未命中时执行一次即被缓存结果覆盖）
-    super::config_cache::get_or_load(data_dir, "wb_model_catalog", || {
-        if let Some(file) = crate::store::db(data_dir).kv_get_raw("wb_model_catalog")
-            .and_then(|t| serde_json::from_str::<WbCatalogFile>(&t).ok())
-        {
-            if !file.models.is_empty() {
-                // 上游同步结果优先保留；否则旧版本内置表落盘的目录按新内置表重建
-                if file.fetched_at.is_some() || file.builtin_rev >= BUILTIN_REV {
-                    return file.models;
-                }
-            }
-        }
-        let builtin = builtin();
-        let _ = crate::store::db(data_dir).kv_set(
-            "wb_model_catalog",
-            &WbCatalogFile {
-                models: builtin.clone(),
-                fetched_at: None,
-                builtin_rev: BUILTIN_REV,
-            },
-        );
-        builtin
+    super::config_cache::get_or_load(data_dir, CACHE_KEY_MERGED, || {
+        merge_regions(load_region(data_dir, false), load_region(data_dir, true))
     })
+}
+
+/// 海外区目录只读视图（ZCode 页「海外号池」面板用）：load_region(true) 的
+/// pub 包装——合并读取（load）对同名模型 CN 优先，海外专属条目才可见；
+/// 本函数直接取海外区原始清单（含两区同名模型）
+pub fn list_global(data_dir: &Path) -> Vec<WbModel> {
+    list_region(data_dir, true)
+}
+
+/// 指定区域目录只读视图（合并读取对同名模型 CN 优先，区域口径须直读分区）
+pub fn list_region(data_dir: &Path, global: bool) -> Vec<WbModel> {
+    load_region(data_dir, global)
 }
 
 /// 大小写不敏感查找
 pub fn find<'a>(catalog: &'a [WbModel], model: &str) -> Option<&'a WbModel> {
     let lower = model.trim().to_lowercase();
     catalog.iter().find(|m| m.id == lower)
+}
+
+/// 模型 → 所属区（取号层号池隔离的依据）：Some(true)=海外、Some(false)=国内、
+/// None=目录未收录（别名/透传语义）→ 取号不限区（保持既有行为）。
+/// 双区同名模型合并时 CN 优先（merge_regions 语义），故命中即 CN。
+pub fn region_of(data_dir: &Path, model: &str) -> Option<bool> {
+    find(&load(data_dir), model).map(|m| m.region == "global")
+}
+
+/// 目录中免费模型清单（免费额度可见性，Buddy 域）。
+///
+/// 判定依据：目录 rate == 0.0（不消耗积分的限时免费档，实测 hy3 / step-5-preview）。
+/// 返回 [{id,name,rate}]——与 Qoder 域 free_tier_models 同形（便于前端统一渲染），
+/// rate 恒为 0.0。目录加载失败回退内置表（load 自身语义），因此本函数恒有结果。
+pub fn free_models(data_dir: &Path) -> Vec<Value> {
+    free_models_impl(&load(data_dir))
+}
+
+/// 指定区域的免费模型清单（账号页回写用）：海外账号只显示 Global 目录的
+/// 免费档，不再混入国内目录（两区免费模型/倍率由上游各自下发）。
+/// 实测口径（2026-10-17，海外桌面客户端 + `/v3/config`）：海外免费档 =
+/// hy3 / deepseek-v4.1-flash（hy4-preview 0.29x 不免费）；国内 = hy3 /
+/// step-5-preview。
+pub fn free_models_for(data_dir: &Path, global: bool) -> Vec<Value> {
+    free_models_impl(&load_region(data_dir, global))
+}
+
+fn free_models_impl(catalog: &[WbModel]) -> Vec<Value> {
+    catalog
+        .iter()
+        .filter(|m| m.rate == 0.0)
+        .map(|m| {
+            serde_json::json!({
+                "id": m.id,
+                "name": if m.display.is_empty() { m.id.clone() } else { m.display.clone() },
+                "rate": 0.0,
+                // 条目归属区（国内/海外目录不同，前端按区分组展示模型名）
+                "region": m.region,
+            })
+        })
+        .collect()
 }
 
 // ==================== T5.1/F-37 动态目录替换 ====================
@@ -304,22 +474,28 @@ fn model_from_item(item: &Value) -> Option<WbModel> {
         return None;
     };
     // 倍率：credits 字符串形如 "x0.05" / "x0.00 credits"（前缀倍数标记 + 可能的单位尾巴）；
-    // 数字形态或旧键（rate/ratio/price/creditRate）兜底
-    let rate = dig_f64(item, &["rate", "ratio", "price", "creditRate"]).unwrap_or_else(|| {
-        item.get("credits")
-            .and_then(|x| match x {
-                Value::Number(n) => n.as_f64(),
-                Value::String(s) => s
-                    .trim()
-                    .trim_start_matches(['x', 'X'])
-                    .trim()
-                    .split_whitespace()
-                    .next()
-                    .and_then(|n| n.parse().ok()),
-                _ => None,
-            })
-            .unwrap_or(0.0)
-    });
+    // 数字形态或旧键（rate/ratio/price/creditRate）兜底。
+    // credits 键存在但为空串（/v3/config 的 default-model/Auto 智能路由不标价）→
+    // 无计价信息，条目跳过：解析成 0.0 会混入免费档（rate==0 判定）。
+    let rate = match dig_f64(item, &["rate", "ratio", "price", "creditRate"]) {
+        Some(r) => r,
+        None => match item.get("credits") {
+            Some(Value::String(s)) if s.trim().is_empty() => return None,
+            other => other
+                .and_then(|x| match x {
+                    Value::Number(n) => n.as_f64(),
+                    Value::String(s) => s
+                        .trim()
+                        .trim_start_matches(['x', 'X'])
+                        .trim()
+                        .split_whitespace()
+                        .next()
+                        .and_then(|n| n.parse().ok()),
+                    _ => None,
+                })
+                .unwrap_or(0.0),
+        },
+    };
     // 档位：顶层旧键 → reasoning.supportedEfforts 数组 → reasoning.effort 固定单档（统一小写）
     let reasoning = item.get("reasoning");
     let mut supported_efforts = dig_strs(item, &["supportedEfforts", "supported_efforts", "efforts"]);
@@ -365,6 +541,9 @@ fn model_from_item(item: &Value) -> Option<WbModel> {
         effort_override: None, // 修正层仅人工/实测维护，不从上游读
         rate,
         id,
+        // 占位默认（cn）：实际区由调用方按本次拉取的分区盖章
+        // （fetch_and_replace 依 global_region 覆写为 "cn" / "global"）
+        region: default_cn(),
     })
 }
 
@@ -501,7 +680,18 @@ pub fn fetch_and_replace(
         enterprise_id: enterprise_id.to_string(),
         global_region,
     };
-    let url = format!("{}/console/enterprises/personal/models", creds.chat_base());
+    // 目录端点按区域分叉（2026-10-17 海外实测）：CN = `console/enterprises/
+    // personal/models`；Global = `/v3/config` 的 `data.models`（海外桌面客户端
+    // 产品配置同源，credits 计费倍率与客户端选择器一致；UA 需 CLI 形态，
+    // 浏览器 UA 被 12403 拒）。注意 `/v2/enterprises/personal/models` 是
+    // platform=CLI 视图，倍率与桌面端不同（hy4-preview x0.00 vs x0.29），
+    // 曾致账号页海外免费档错标，不可用。
+    let path = if global_region {
+        "/v3/config"
+    } else {
+        "/console/enterprises/personal/models"
+    };
+    let url = format!("{}{}", creds.chat_base(), path);
     let mut req = wb_agent().get(&url).timeout(std::time::Duration::from_secs(20));
     for (k, v) in build_chat_headers(&creds) {
         // 目录为 GET JSON：accept 覆盖 build_chat_headers 的 text/event-stream 默认
@@ -518,7 +708,13 @@ pub fn fetch_and_replace(
         }
         Err(e) => return Err(format!("目录请求失败: {e}")),
     };
-    let models = parse_upstream_catalog(&body);
+    let mut models = parse_upstream_catalog(&body);
+    // 按本次拉取的分区盖章：两区目录合并读取时依此判定条目归属区
+    // （模型只出本区账号，国内/海外号池逻辑隔离）
+    let region = if global_region { "global" } else { "cn" };
+    for m in &mut models {
+        m.region = region.to_string();
+    }
     if models.is_empty() {
         // 诊断增强：附响应体摘要（截 200 字符），定位 200 状态下「结构不符」的
         // 真实形态（200 错误信封 / 多层嵌套 / 端点变更），避免只有 0 模型无从下手
@@ -540,10 +736,23 @@ pub fn fetch_and_replace(
             models.len()
         ));
     }
+    // 海外区并集（客户端同语义：本地 product.json + 远程配置，远程同 id 优先）：
+    // 内置海外表补齐远程未下发的条目（如 gpt-6-astra），倍率以远程为准
+    if global_region {
+        let fetched: std::collections::HashSet<String> =
+            models.iter().map(|m| m.id.to_lowercase()).collect();
+        for b in builtin_global() {
+            if !fetched.contains(&b.id.to_lowercase()) {
+                models.push(b);
+            }
+        }
+    }
     let count = models.len();
+    // 分区落盘（修复「海外账号模型目录」）：两区各自一份，读取侧合并
+    let key = if global_region { KV_KEY_GLOBAL } else { KV_KEY_CN };
     crate::store::db(data_dir)
         .kv_set(
-            "wb_model_catalog",
+            key,
             &WbCatalogFile {
                 models,
                 fetched_at: Some(
@@ -556,8 +765,10 @@ pub fn fetch_and_replace(
             },
         )
         .map_err(|e| format!("写目录失败: {e}"))?;
-    // 写路径显式失效（批次 A）：目录替换即时生效
-    super::config_cache::invalidate(data_dir, "wb_model_catalog");
+    // 写路径显式失效（批次 A）：目录替换即时生效（两区源键 + 合并缓存键）
+    super::config_cache::invalidate(data_dir, KV_KEY_CN);
+    super::config_cache::invalidate(data_dir, KV_KEY_GLOBAL);
+    super::config_cache::invalidate(data_dir, CACHE_KEY_MERGED);
     Ok(count)
 }
 
@@ -573,6 +784,38 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), 15);
+    }
+
+    /// 免费模型提取（免费额度可见性）：恰为目录中 rate==0 的条目，
+    /// name 回退 id、rate 恒 0.0。合并目录 = CN 内置（hy3 / step-5-preview 0 倍率档）
+    /// ∪ Global 内置（hy3 / deepseek-v4.1-flash 0 倍率档，海外实测口径）。
+    #[test]
+    fn free_models_match_zero_rate_entries() {
+        let dir = std::env::temp_dir().join(format!("twa_wb_free_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let free = free_models(&dir);
+        let mut want: Vec<String> = builtin()
+            .iter()
+            .chain(builtin_global().iter())
+            .filter(|m| m.rate == 0.0)
+            .map(|m| m.id.clone())
+            .collect();
+        want.sort();
+        want.dedup();
+        let mut got: Vec<String> = free
+            .iter()
+            .filter_map(|m| m.get("id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        got.sort();
+        assert_eq!(got, want, "免费清单应恰为目录 rate=0 的条目");
+        assert!(!want.is_empty(), "内置表应至少有一个 0 倍率档（hy3/step-5-preview）");
+        for m in &free {
+            assert_eq!(m.get("rate").and_then(Value::as_f64), Some(0.0));
+            assert!(!m.get("id").and_then(Value::as_str).unwrap_or("").is_empty());
+            assert!(!m.get("name").and_then(Value::as_str).unwrap_or("").is_empty());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -604,6 +847,54 @@ mod tests {
         assert!(find(&c, "GLM-5.3").is_some());
         assert!(find(&c, "glm-5.3").is_some());
         assert!(find(&c, "not-a-model").is_none());
+    }
+
+    /// 分区目录（修复「海外账号模型目录」）：Global 键独立存储（CN 键不受影响），
+    /// load 合并两区（Global 独有条目追加、同 id CN 优先）；
+    /// Global 目录未刷新（键缺失）时 load_region(true) 落 [`builtin_global`]
+    /// （海外客户端 product.json 固化快照），不再返回空表
+    #[test]
+    fn regional_catalog_merge_and_isolation() {
+        let dir = std::env::temp_dir().join(format!("twa_wb_catalog_region_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let global_model = WbModel {
+            id: "global-only-model".into(),
+            display: "Global Only".into(),
+            context_length: 128_000,
+            max_tokens: 32_000,
+            supports_image: false,
+            supported_efforts: vec!["high".into()],
+            effort_override: None,
+            rate: 0.0,
+            region: "global".into(),
+        };
+        // 直接写 Global 键（模拟 fetch_and_replace(global=true) 落盘结果）
+        crate::store::db(&dir)
+            .kv_set(
+                KV_KEY_GLOBAL,
+                &WbCatalogFile {
+                    models: vec![global_model],
+                    fetched_at: Some(1_700_000_000),
+                    builtin_rev: BUILTIN_REV,
+                },
+            )
+            .unwrap();
+        super::super::config_cache::invalidate(&dir, CACHE_KEY_MERGED);
+        // 合并结果 = CN 内置表 + Global 独有条目
+        let merged = load(&dir);
+        assert!(find(&merged, "hy3").is_some(), "CN 目录条目保留");
+        assert!(find(&merged, "global-only-model").is_some(), "Global 独有模型并入");
+        assert_eq!(find(&merged, "global-only-model").unwrap().rate, 0.0);
+        // Global 键内容不回写 CN 键（两区隔离）
+        let cn_raw = crate::store::db(&dir).kv_get_raw(KV_KEY_CN).unwrap();
+        assert!(!cn_raw.contains("global-only-model"), "CN 键不得被 Global 内容污染");
+        // 区域过滤的免费模型：Global 区恰含该免费模型，CN 区不含
+        let g_free = free_models_for(&dir, true);
+        assert_eq!(g_free.len(), 1);
+        assert_eq!(g_free[0].get("id").and_then(Value::as_str), Some("global-only-model"));
+        let cn_free = free_models_for(&dir, false);
+        assert!(!cn_free.iter().any(|m| m.get("id").and_then(Value::as_str) == Some("global-only-model")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ==================== T5.1/F-37 动态解析 ====================
@@ -809,5 +1100,98 @@ mod tests {
         let out = parse_upstream_catalog(&body);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "ok-model");
+    }
+
+    #[test]
+    fn builtin_global_free_set_and_region() {
+        let g = builtin_global();
+        assert!(g.len() >= 20, "海外内置表应含客户端 product.json 全量文本模型");
+        let mut ids: Vec<&str> = g.iter().map(|m| m.id.as_str()).collect();
+        let n = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "id 不得重复");
+        assert!(g.iter().all(|m| m.region == "global"), "内置海外表全部盖 global 章");
+        // 实测口径（2026-10-17 海外客户端 + /v3/config）：免费档恰为 hy3 / deepseek-v4.1-flash；
+        // hy4-preview 0.29x 不免费（/v2 CLI 视图才误标 0.00）
+        let mut free: Vec<String> = g
+            .iter()
+            .filter(|m| m.rate == 0.0)
+            .map(|m| m.id.clone())
+            .collect();
+        free.sort();
+        assert_eq!(
+            free,
+            vec!["deepseek-v4.1-flash".to_string(), "hy3".to_string(), "step-5-preview".to_string()]
+        );
+        let hy4 = find(&g, "hy4-preview").unwrap();
+        assert!((hy4.rate - 0.29).abs() < 1e-9, "hy4-preview 内置倍率 = 客户端 0.29x");
+        assert!(find(&g, "gpt-6-astra").is_none(), "Pro 锁定模型不收录（用户裁决）");
+    }
+
+    #[test]
+    fn load_region_global_falls_back_to_builtin() {
+        let dir = std::env::temp_dir().join(format!("twa_wb_gfallback_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let g = load_region(&dir, true);
+        assert_eq!(g.len(), builtin_global().len(), "Global 键缺失 → 内置海外表");
+        assert!(g.iter().all(|m| m.region == "global"));
+        // 已落盘（builtin_rev 满足当前版本），二次读取一致
+        assert_eq!(load_region(&dir, true).len(), g.len());
+        let raw = crate::store::db(&dir).kv_get_raw(KV_KEY_GLOBAL).unwrap();
+        assert!(raw.contains("deepseek-v4.1-flash"), "内置海外表落盘供热路径缓存命中");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_upstream_catalog_2026_10_global_v3config_shape() {
+        // 2026-10-17 www.workbuddy.ai/v3/config 实测固化：data.models[]（credits
+        // 字符串倍率 + maxInputTokens/maxOutputTokens + reasoning.supportedEfforts），
+        // data.agents[].name=="cli" 的 models 白名单生效；default-model（Auto
+        // 智能路由）credits 为空串 → 无计价信息，跳过（防混入免费档）；
+        // deep-model / deepseek-v4.1-flash-sg 不在 cli 白名单 → 剔除（客户端同语义）
+        let body = serde_json::json!({
+            "code": 0, "msg": "OK", "requestId": "r1",
+            "data": {
+                "endpoint": "https://www.codebuddy.ai",
+                "platform": "CLI",
+                "deploymentType": "SaaS",
+                "agents": [
+                    {"commands": ["init"], "description": "cli agent", "name": "cli", "tags": ["cli", "default"],
+                     "models": ["default-model", "fast-model", "hy4-preview", "hy3", "deepseek-v4.1-flash", "kimi-k3"]},
+                    {"description": "general-purpose agent", "name": "general-purpose", "tools": []},
+                ],
+                "models": [
+                    {"credits": "", "id": "default-model", "isDefault": true, "name": "Auto",
+                     "maxInputTokens": 176000, "maxOutputTokens": 24000, "supportsImages": true},
+                    {"credits": "x0.34 credits", "id": "fast-model", "name": "Fast",
+                     "maxInputTokens": 200000, "maxOutputTokens": 32000, "supportsImages": true},
+                    {"credits": "x0.29", "id": "hy4-preview", "name": "Hy4 preview",
+                     "maxInputTokens": 1000000, "maxOutputTokens": 64000,
+                     "reasoning": {"supportedEfforts": ["high"]}, "supportsImages": true},
+                    {"credits": "x0.00", "id": "hy3", "name": "Hy3",
+                     "maxInputTokens": 192000, "maxOutputTokens": 64000,
+                     "reasoning": {"supportedEfforts": ["low", "high"]}, "supportsImages": true},
+                    {"credits": "x0.00", "id": "deepseek-v4.1-flash", "name": "Deepseek-V4.1-Flash",
+                     "maxInputTokens": 1000000, "maxOutputTokens": 128000, "supportsImages": true},
+                    {"credits": "x1.62", "id": "kimi-k3", "name": "Kimi-K3", "supportsImages": true},
+                    // 白名单外：不出现在结果
+                    {"credits": "x0.03", "id": "deepseek-v4.1-flash-sg", "name": "Deepseek-V4.1-Flash", "supportsImages": true},
+                ],
+            }
+        });
+        let out = parse_upstream_catalog(&body);
+        assert_eq!(out.len(), 5, "default-model（空 credits）跳过；sg 变体被白名单剔除");
+        assert!(out.iter().all(|m| m.id != "default-model"), "Auto 智能路由无标价，不入目录");
+        let hy4 = out.iter().find(|m| m.id == "hy4-preview").unwrap();
+        assert!((hy4.rate - 0.29).abs() < 1e-9, "SaaS 视图 hy4-preview = 0.29（非 /v2 CLI 视图的 0.00）");
+        assert_eq!(hy4.context_length, 1_000_000, "maxInputTokens → 上下文");
+        let hy3 = out.iter().find(|m| m.id == "hy3").unwrap();
+        assert!((hy3.rate - 0.0).abs() < 1e-9);
+        assert_eq!(hy3.supported_efforts, vec!["low", "high"]);
+        assert!(out.iter().all(|m| m.id != "deepseek-v4.1-flash-sg"), "cli 白名单外剔除");
+        let ds = out.iter().find(|m| m.id == "deepseek-v4.1-flash").unwrap();
+        assert!((ds.rate - 0.0).abs() < 1e-9, "海外免费档含 deepseek-v4.1-flash");
     }
 }

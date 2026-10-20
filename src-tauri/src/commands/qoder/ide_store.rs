@@ -30,7 +30,7 @@ use std::path::Path;
 use serde::Serialize;
 use tauri::State;
 
-use super::common::{account_id_of, ide_data_dir, with_pool_mut, QoderAccount};
+use super::common::{account_id_of, ide_data_dir, ide_data_dir_global, with_pool_mut, QoderAccount};
 use crate::state::AppState;
 use crate::tasks::qoder_common::{self, QoderCreds};
 use crate::tasks::qoder_device::QoderDeviceProfile;
@@ -220,6 +220,21 @@ pub struct QoderIdeScanResult {
     pub account_id: String,
     pub nickname: String,
     pub reason: String,
+    /// 国内客户端（QoderCN）扫描明细（2026-10-17 双端扩展；None = 数据目录不可达）
+    pub cn: Option<QoderIdeScanOne>,
+    /// 海外客户端（Qoder）扫描明细（发现登录态即导入并盖 global 区章）
+    pub global: Option<QoderIdeScanOne>,
+}
+
+/// 单客户端扫描结果（QoderCN=国内区 / Qoder=海外区各一份）
+#[derive(Clone, Default, serde::Serialize)]
+pub struct QoderIdeScanOne {
+    pub found: bool,
+    pub imported: bool,
+    pub updated: bool,
+    pub account_id: String,
+    pub nickname: String,
+    pub reason: String,
 }
 
 /// 扫描 IDE 存储当前登录账号并导入账号池（幂等：同 token 稳定同 id，重复=更新）。
@@ -233,134 +248,232 @@ pub fn qoder_ide_scan(
 ) -> Result<QoderIdeScanResult, String> {
     #[cfg(windows)]
     {
-        let data_dir = ide_data_dir().ok_or("无法定位 QoderCN 数据目录（APPDATA 缺失）")?;
-        let login = match scan_ide_login(&data_dir) {
-            Ok(l) => l,
-            Err(e) => {
-                return Ok(QoderIdeScanResult {
-                    found: false,
-                    reason: e,
-                    ..Default::default()
-                })
+        // 双端扫描（2026-10-17 海外接入）：QoderCN=国内客户端（cn 区）、
+        // Qoder=海外客户端（global 区）——两个独立产品，数据目录并列于
+        // %APPDATA% 下，登录态解密链路同构（Local State DPAPI + state.vscdb）。
+        // 各端独立导入并盖对应区域章；聚合结果海外优先（海外登录是本能力
+        // 的新增主场景），reason 汇总两端明细。
+        let cn = ide_data_dir()
+            .map(|d| scan_and_import_one(&state, runtime.inner(), &d, false, "QoderCN"));
+        let gl = ide_data_dir_global()
+            .map(|d| scan_and_import_one(&state, runtime.inner(), &d, true, "Qoder"));
+        // 一次热重载覆盖两端导入（fail-open 即时入池调度；服务未运行时 no-op）
+        crate::commands::api_server::reload_pools_if_running(&state, runtime.inner());
+        let summarize = |one: &Option<QoderIdeScanOne>, label: &str| -> String {
+            match one {
+                None => format!("{label}：数据目录不可达"),
+                Some(o) if !o.found => format!("{label}：{}", o.reason),
+                Some(o) => {
+                    let who = if o.nickname.is_empty() {
+                        o.account_id.clone()
+                    } else {
+                        o.nickname.clone()
+                    };
+                    let base = if o.imported {
+                        format!("新入池 {who}")
+                    } else if o.updated {
+                        format!("凭证已更新 {who}")
+                    } else {
+                        format!("已在池 {who}")
+                    };
+                    if o.reason.is_empty() { base } else { format!("{base}（但{}）", o.reason) }
+                }
             }
         };
-        if login.token.is_empty() {
+        let cn_found = cn.as_ref().is_some_and(|o| o.found);
+        let gl_found = gl.as_ref().is_some_and(|o| o.found);
+        if !cn_found && !gl_found {
+            let reason = [summarize(&cn, "国内版(QoderCN)"), summarize(&gl, "海外版(Qoder)")]
+                .join("；");
             return Ok(QoderIdeScanResult {
                 found: false,
-                reason: "登录态中无 token".into(),
+                reason,
+                cn,
+                global: gl,
                 ..Default::default()
             });
         }
-        let id = account_id_of(&login.token);
-        // I09：持锁读-改-写，防并发整池覆盖丢更新。
-        // P2 审查修复：入池匹配补 uid 兜底（对齐 oauth/data_io/PAT 导入的同款语义）——
-        // 同账号先经其他通道入池（token 派生 id 不同）后再扫描 IDE 时，uid 命中保留
-        // 原 id，防同 uid 重复账号；凭证按生效 id 落库，与池条目对齐
-        let (updated, nickname, effective_id) = with_pool_mut(&state, |accounts| {
-            if let Some(a) = accounts
-                .iter_mut()
-                .find(|a| a.id == id || (!login.uid.is_empty() && a.uid == login.uid))
-            {
-                // 已有账号保守回填：uid/nickname 只在为空时补，不覆盖用户手动改名
-                if a.uid.is_empty() && !login.uid.is_empty() {
-                    a.uid = login.uid.clone();
-                }
-                if a.nickname.is_empty() && !login.name.is_empty() {
-                    a.nickname = login.name.clone();
-                }
-                // P2 审查修复：credential_source 保守更新——id 命中即同 token、凭证本体
-                // 未变，仅来源字段为空时回填；uid 兜底命中且派生 id 不同 = 换了新凭证
-                // （其他通道 → IDE 登录），徽标随之更新（对齐 oauth.rs 同款判据）
-                if a.credential_source.is_empty() || a.id != id {
-                    a.credential_source = "ide_store".into();
-                }
-                // 到期时间过域钳制（与 creds_of 同口径：超 (0, now+10y] 视为无过期信息，
-                // 防服务端脏数据导致到期看板溢出/千年展示）。
-                // P3 审查修复：仅在解析出有效到期时间时覆盖（对齐 data_io merge 的
-                // is_some 才覆盖口径）——登录态无 expireTime/钳制失败时保留本地已知值
-                if let Some(sec) = login
-                    .expires_at_ms
-                    .and_then(qoder_common::clamp_expires_at)
-                    .map(|ms| ms / 1000)
-                {
-                    a.token_expires_at = Some(sec);
-                }
-                a.needs_relogin = false;
-                a.relogin_reason = String::new();
-                if a.device_profile.is_none() {
-                    a.device_profile = Some(QoderDeviceProfile::generate());
-                }
-                Ok((true, a.nickname.clone(), a.id.clone()))
-            } else {
-                let nickname = if login.name.is_empty() {
-                    format!("Qoder {}", &id[3..9])
-                } else {
-                    login.name.clone()
-                };
-                accounts.push(QoderAccount {
-                    id: id.clone(),
-                    uid: login.uid.clone(),
-                    nickname: nickname.clone(),
-                    credential_source: "ide_store".into(),
-                    token_expires_at: login
-                        .expires_at_ms
-                        .and_then(qoder_common::clamp_expires_at)
-                        .map(|ms| ms / 1000),
-                    // 入池即生成稳定指纹（§5.10：一次生成永不轮换）
-                    device_profile: Some(QoderDeviceProfile::generate()),
-                    ..Default::default()
-                });
-                Ok((false, nickname, id.clone()))
-            }
-        })?;
-        // 凭证入 token store（save_token_store 非空字段 merge，不抹掉存量字段）
-        let creds = QoderCreds {
-            access_token: login.token,
-            refresh_token: login.refresh_token,
-            expires_at_ms: login.expires_at_ms,
-            uid: login.uid,
-            nickname: login.name,
-            kind: "client".into(),
-            ..Default::default()
+        let any = |f: &dyn Fn(&QoderIdeScanOne) -> bool| -> bool {
+            cn.as_ref().map(&f).unwrap_or(false) || gl.as_ref().map(&f).unwrap_or(false)
         };
-        // 凭证按生效 id 落库（uid 兜底命中时为池内既有 id），与池条目对齐——
-        // 若按派生 id 落库则凭证与池条目错位，后续扫描/导入按 id 查不到新凭证。
-        // 审查修复：此时池条目已在 with_pool_mut 入账，落库失败再 Err 上抛会跳过
-        // 热重载、造成网关池与 DB 不一致——改为 reason 告警 + app.log 留痕，仍热重载
-        let mut reason = String::new();
-        if let Err(e) = qoder_common::save_token_store(&state, &effective_id, &creds) {
-            reason = format!("凭证落库失败: {e}");
-            crate::fs_utils::app_log(
-                &state.data_dir,
-                &format!("Qoder IDE 扫描：{reason}（账号 {effective_id}，池条目已入账）"),
-            );
-        }
-        // 审查修复：落库失败时不再写「已导入」成功日志（误导排查），改为告警措辞
-        if reason.is_empty() {
-            crate::fs_utils::app_log(&state.data_dir, &format!("Qoder IDE 存储账号已发现并导入: {effective_id}"));
-        } else {
-            crate::fs_utils::app_log(
-                &state.data_dir,
-                &format!("Qoder IDE 存储账号已发现并导入: {effective_id}，但 {reason}，网关本轮热重载可用、重启后凭证缺失"),
-            );
-        }
-        // 新账号/凭证变更联动网关池热重载（fail-open 即时入池调度；服务未运行时 no-op）
-        crate::commands::api_server::reload_pools_if_running(&state, runtime.inner());
+        // 主结果 = 海外优先（未发现海外登录态时取国内）
+        let primary = gl
+            .as_ref()
+            .filter(|o| o.found)
+            .or_else(|| cn.as_ref().filter(|o| o.found));
+        let (account_id, nickname) = primary
+            .map(|o| (o.account_id.clone(), o.nickname.clone()))
+            .unwrap_or_default();
+        let reason = [summarize(&cn, "国内版(QoderCN)"), summarize(&gl, "海外版(Qoder)")]
+            .join("；");
         Ok(QoderIdeScanResult {
             found: true,
-            imported: !updated,
-            updated,
-            account_id: effective_id,
+            imported: any(&|o| o.imported),
+            updated: any(&|o| o.updated),
+            account_id,
             nickname,
             reason,
+            cn,
+            global: gl,
         })
     }
-    #[cfg(not(windows))]
+    #[cfg(not(windows))]    #[cfg(not(windows))]
     {
         let _ = &state;
         // macOS 适配预留：macOS 分支实装后本分支删除——scan_ide_login 主流程
         // 跨平台复用，仅需补 Keychain 密钥获取（见模块头【跨平台审查】与 ide_aes_key 注释）
         Err("IDE 存储发现仅支持 Windows（DPAPI + AES-GCM）".into())
+    }
+}
+
+/// 单客户端扫描+导入（qoder_ide_scan 的双端循环体）：`global` 决定导入盖章
+///（池行 region + token store global_region，2026-10-17 海外接入）。登录态
+/// 解密链路两端同构；幂等语义同原单端版（同 token 稳定同 id，重复=更新）。
+#[cfg(windows)]
+fn scan_and_import_one(
+    state: &AppState,
+    runtime: &std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>,
+    data_dir: &std::path::Path,
+    global: bool,
+    client_label: &str,
+) -> QoderIdeScanOne {
+    let region = if global { "global" } else { "cn" };
+    let login = match scan_ide_login(data_dir) {
+        Ok(l) => l,
+        Err(e) => {
+            return QoderIdeScanOne {
+                found: false,
+                reason: e,
+                ..Default::default()
+            }
+        }
+    };
+    if login.token.is_empty() {
+        return QoderIdeScanOne {
+            found: false,
+            reason: "登录态中无 token".into(),
+            ..Default::default()
+        };
+    }
+    let id = account_id_of(&login.token);
+    // I09：持锁读-改-写，防并发整池覆盖丢更新。
+    // P2 审查修复：入池匹配补 uid 兜底（对齐 oauth/data_io/PAT 导入的同款语义）——
+    // 同账号先经其他通道入池（token 派生 id 不同）后再扫描 IDE 时，uid 命中保留
+    // 原 id，防同 uid 重复账号；凭证按生效 id 落库，与池条目对齐
+    let imported_updated = with_pool_mut(state, |accounts| {
+        if let Some(a) = accounts
+            .iter_mut()
+            .find(|a| a.id == id || (!login.uid.is_empty() && a.uid == login.uid))
+        {
+            // 已有账号保守回填：uid/nickname 只在为空时补，不覆盖用户手动改名
+            if a.uid.is_empty() && !login.uid.is_empty() {
+                a.uid = login.uid.clone();
+            }
+            if a.nickname.is_empty() && !login.name.is_empty() {
+                a.nickname = login.name.clone();
+            }
+            // P2 审查修复：credential_source 保守更新——id 命中即同 token、凭证本体
+            // 未变，仅来源字段为空时回填；uid 兜底命中且派生 id 不同 = 换了新凭证
+            // （其他通道 → IDE 登录），徽标随之更新（对齐 oauth.rs 同款判据）
+            if a.credential_source.is_empty() || a.id != id {
+                a.credential_source = "ide_store".into();
+            }
+            // 到期时间过域钳制（与 creds_of 同口径：超 (0, now+10y] 视为无过期信息，
+            // 防服务端脏数据导致到期看板溢出/千年展示）。
+            // P3 审查修复：仅在解析出有效到期时间时覆盖（对齐 data_io merge 的
+            // is_some 才覆盖口径）——登录态无 expireTime/钳制失败时保留本地已知值
+            if let Some(sec) = login
+                .expires_at_ms
+                .and_then(qoder_common::clamp_expires_at)
+                .map(|ms| ms / 1000)
+            {
+                a.token_expires_at = Some(sec);
+            }
+            a.needs_relogin = false;
+            a.relogin_reason = String::new();
+            // 区域盖章：登录态所在的客户端即区域权威（Qoder=海外 / QoderCN=国内），
+            // 重扫时随所在客户端刷新（账号换端登录场景以最近一次扫描为准）
+            a.region = region.to_string();
+            if a.device_profile.is_none() {
+                a.device_profile = Some(QoderDeviceProfile::generate());
+            }
+            Ok((false, a.nickname.clone(), a.id.clone()))
+        } else {
+            let nickname = if login.name.is_empty() {
+                format!("Qoder {}", &id[3..9])
+            } else {
+                login.name.clone()
+            };
+            accounts.push(QoderAccount {
+                id: id.clone(),
+                uid: login.uid.clone(),
+                nickname: nickname.clone(),
+                credential_source: "ide_store".into(),
+                region: region.to_string(),
+                token_expires_at: login
+                    .expires_at_ms
+                    .and_then(qoder_common::clamp_expires_at)
+                    .map(|ms| ms / 1000),
+                // 入池即生成稳定指纹（§5.10：一次生成永不轮换）
+                device_profile: Some(QoderDeviceProfile::generate()),
+                ..Default::default()
+            });
+            Ok((true, nickname, id.clone()))
+        }
+    });
+    let (imported, pool_nickname, effective_id) = match imported_updated {
+        Ok(v) => v,
+        Err(e) => {
+            return QoderIdeScanOne {
+                found: true,
+                reason: format!("入池失败: {e}"),
+                ..Default::default()
+            }
+        }
+    };
+    // 凭证入 token store（save_token_store 非空字段 merge，不抹掉存量字段）；
+    // global_region 随 creds 序列化落库——刷新/积分/对话的分区基址依据
+    let creds = QoderCreds {
+        access_token: login.token,
+        refresh_token: login.refresh_token,
+        expires_at_ms: login.expires_at_ms,
+        uid: login.uid,
+        nickname: login.name,
+        kind: "client".into(),
+        global_region: global,
+        ..Default::default()
+    };
+    // 凭证按生效 id 落库（uid 兜底命中时为池内既有 id），与池条目对齐——
+    // 若按派生 id 落库则凭证与池条目错位，后续扫描/导入按 id 查不到新凭证。
+    // 审查修复：落库失败再 Err 上抛会跳过热重载、造成网关池与 DB 不一致——
+    // 改为 reason 告警 + app.log 留痕，仍热重载
+    let mut reason = String::new();
+    if let Err(e) = qoder_common::save_token_store(state, &effective_id, &creds) {
+        reason = format!("凭证落库失败: {e}");
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!("[{client_label}] 扫描：{reason}（账号 {effective_id}，池条目已入账）"),
+        );
+    }
+    // 审查修复：落库失败时不再写「已导入」成功日志（误导排查），改为告警措辞
+    if reason.is_empty() {
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!("[{client_label}] 存储账号已发现并导入({region}): {effective_id}"),
+        );
+    } else {
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!("[{client_label}] 存储账号已发现并导入({region}): {effective_id}，但 {reason}，网关本轮热重载可用、重启后凭证缺失"),
+        );
+    }
+    QoderIdeScanOne {
+        found: true,
+        imported,
+        updated: !imported,
+        account_id: effective_id,
+        nickname: pool_nickname,
+        reason,
     }
 }
 

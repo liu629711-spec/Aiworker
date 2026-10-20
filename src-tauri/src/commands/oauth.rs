@@ -434,28 +434,64 @@ fn writeback_oauth_device(state: &AppState, uid: &str, device_id: &str) {
         return;
     }
     let store = crate::store::db(&state.data_dir);
-    // C3（审查）：整表 load→save 持 DEVICE_MAP_LOCK（叶子锁）——签到
-    // get_device_for 写回分支并发时防整表覆盖丢条目
-    let _g = crate::store::docs::DEVICE_MAP_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut map = crate::store::docs::device_map_load(&store);
-    let entry = map.entry(uid.to_string()).or_insert_with(|| {
-        let d = crate::commands::accounts::derive_device(uid);
-        DeviceEntry {
+    // C3（审查）：与签到 get_device_for 写回分支并发时防整表覆盖丢条目。
+    //
+    // **自死锁修复（2026-10-20）**：原实现外层先拿 DEVICE_MAP_LOCK，再调
+    // device_map_save（内部又拿同一把非重入锁）→ 同线程二次 lock 永久阻塞，
+    // OAuth 登录回写路径会直接卡死 UI 线程。锁定判定与日志文案在临界区外
+    // 先算好，临界区内只做原子读改写。
+    let derived = crate::commands::accounts::derive_device(uid);
+    // 临界区需要返回：是否锁定（决定日志口径）+ 保留的原设备号
+    let outcome = crate::store::docs::with_device_map(&store, |map| {
+        let entry = map.entry(uid.to_string()).or_insert_with(|| DeviceEntry {
             device_id: String::new(),
-            market_user_id: d.market_user_id,
-            session_id: d.session_id,
+            market_user_id: derived.market_user_id.clone(),
+            session_id: derived.session_id.clone(),
+            locked: false,
+        });
+        // 手动锁定（mint 脚本/手动分配的真实注册设备号）：OAuth 登录设备号必须与
+        // icube 签名私钥同源（F-78），会被回写成 icube did，会冲掉手动分配的
+        // 签到设备号（多账号每号一设备的分工）。锁定的条目保留原 device_id，
+        // 仅补全缺失的 market/session；登录本身不受影响。
+        if entry.locked {
+            if entry.market_user_id.is_none() {
+                entry.market_user_id = derived.market_user_id.clone();
+            }
+            if entry.session_id.is_none() {
+                entry.session_id = derived.session_id.clone();
+            }
+            return Ok(Some(entry.device_id.clone()));
         }
+        if entry.device_id != device_id {
+            entry.device_id = device_id.to_string();
+            return Ok(None);
+        }
+        // 设备号未变：无需写回
+        Ok(Some(String::new()))
     });
-    if entry.device_id != device_id {
-        entry.device_id = device_id.to_string();
+    match outcome {
+        Ok(Some(kept)) if !kept.is_empty() => {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "[OAuth登录] device_map[{uid}] 已锁定，保留手动设备号 {kept}（未回写 {device_id}）"
+                ),
+            );
+        }
+        Ok(Some(_)) => {}
         // 写回失败不阻断登录（下次登录重写，仅损失一次指纹同源）
-        let _ = crate::store::docs::device_map_save(&store, &map);
-        fs_utils::app_log(
-            &state.data_dir,
-            &format!("[OAuth登录] 回写 device_map[{uid}] device_id={device_id}（JWT 与签到设备指纹同源）"),
-        );
+        Ok(None) => {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("[OAuth登录] 回写 device_map[{uid}] device_id={device_id}（JWT 与签到设备指纹同源）"),
+            );
+        }
+        Err(e) => {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("[OAuth登录] device_map 回写失败（不阻断登录）: {e}"),
+            );
+        }
     }
 }
 
@@ -1713,6 +1749,7 @@ mod oauth_tests {
             device_id: device_id.to_string(),
             market_user_id: None,
             session_id: None,
+            locked: false,
         }
     }
 
@@ -1764,5 +1801,46 @@ mod oauth_tests {
         assert_eq!(select_credential_index(&creds, &counts), None);
         let counts2 = credential_binding_counts(&creds, &DeviceMap::new(), &[]);
         assert!(counts2.is_empty());
+    }
+
+    /// locked 条目（mint 脚本/手动分配的真实注册设备号）：OAuth 回写不得覆盖
+    /// device_id，仅补全缺失的 market/session；未锁定条目照常回写
+    #[test]
+    fn writeback_respects_locked_device_entry() {
+        use std::sync::Arc;
+        let d = std::env::temp_dir().join(format!("twa_oauth_lock_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let state = AppState {
+            data_dir: d.clone(),
+            jwt_refresh_lock: Arc::new(Mutex::new(())),
+            qoder_pool_lock: Arc::new(Mutex::new(())),
+            wb_pool_lock: Arc::new(Mutex::new(())),
+            doubao_pool_lock: Arc::new(Mutex::new(())),
+            group_defs_lock: Arc::new(Mutex::new(())),
+        };
+        let store = crate::store::db(&d);
+        let mut map = DeviceMap::new();
+        map.insert(
+            "123".to_string(),
+            DeviceEntry {
+                device_id: "744827358569716".into(),
+                market_user_id: Some("m1".into()),
+                session_id: Some("s1".into()),
+                locked: true,
+            },
+        );
+        crate::store::docs::device_map_save(&store, &map).unwrap();
+        // OAuth 回写 icube did：锁定条目必须原样保留
+        writeback_oauth_device(&state, "123", "1853105110786875");
+        let after = crate::store::docs::device_map_load(&store);
+        assert_eq!(after["123"].device_id, "744827358569716");
+        assert_eq!(after["123"].market_user_id.as_deref(), Some("m1"));
+        // 未锁定条目照常回写，且不带上 locked
+        writeback_oauth_device(&state, "456", "1853105110786875");
+        let after2 = crate::store::docs::device_map_load(&store);
+        assert_eq!(after2["456"].device_id, "1853105110786875");
+        assert!(!after2["456"].locked);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

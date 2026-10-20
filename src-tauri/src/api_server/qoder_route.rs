@@ -10,10 +10,11 @@
 //!    `make_qoder_request`（COSY 19 头签名）；
 //! 4. 分级重试：HTTP 层走 `retry_plan`（429/5xx/502 同号退避、401/403 换号）；
 //!    **排队（业务码 10605）同号退避优先**——首个进入排队的请求按上游建议
-//!    时长同号退避重试（≤3 次，超限放回调度轮换，防止占死并发槽）；并发场景
-//!    下若该模型已记录冷却则直接 break 换号（快速失败）；其余流内错误按
-//!    ErrMeta 分类映射 ErrKind 后换号；
-//! 5. 流式：首字超时 10s（`open_qoder_stream`）→ QoderTranslate 翻译为标准
+//!    时长同号退避重试（国内 ≤3 次 / 海外 ≤8 次，超限放回调度轮换，防止占死
+//!    并发槽）。排队按模型不按账号，**换号必然从头重排**，故海外放宽预算而非
+//!    换号；并发场景下若该模型已记录冷却且本区域无其他可选账号则快速失败；
+//!    其余流内错误按 ErrMeta 分类映射 ErrKind 后换号；
+//! 5. 流式：首字窗口按区域（国内 10s / **海外 60s**，`first_byte_timeout_for`）→ QoderTranslate 翻译为标准
 //!    OpenAI chunk → `wb_sse::stream_forward_ex`（keep-alive 15s + 断连三层
 //!    检测同构）；非流式：`aggregate_qoder` → 协议投影复用 wb_sse 转换器；
 //! 6. 用量记账（`record_usage_qoder` 独立 qoder 桶）+ 请求级日志。
@@ -26,6 +27,12 @@
 //! 兜住）。模型级冷却已补齐（审查修复）：排队/超限类错误记录 model → 冷却截止，
 //! dispatch 预检快速回退、执行路径跳过同号退避（见下方「模型级冷却」节）。
 //! 对冲接管后排队同号退避不适用（重试凭证/请求体属主账号，与生效账号不一致）。
+//!
+//! **首字超时不再按故障计错（2026-10-19）**：「未产出首字节」与「请求失败」是
+//! 两回事。海外上游普遍静默排队（不发 10605 排队票，只握连接不吐字节，实测首包
+//! p50≈6.5s / p90≈14s、当日 20% 请求 >10s），此前 10s 判死 → note_error(Server)
+//! 冷却 + 换号重排，逐步把海外池抽干（20:41 连报 `no healthy account available
+//! (healthy=2)`）。现首字超时仅放弃连接换号，不动账号健康度、不进冷却。
 //!
 //! 客户端断连：与 wb_route 同款三层检测（轮换/重试入口 tx.is_closed、停滞期
 //! next_event_polling 轮询、活跃流逐事件顶部检测）。
@@ -43,7 +50,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use super::retry::{retry_plan, RetryAction};
 use super::wb_sse;
 use super::wb_sticky::SessionKey;
-use super::wb_upstream::{lines_with_first_byte_hedged, lines_with_first_byte_timeout, InterruptibleLines};
+use super::wb_upstream::{
+    first_byte_timeout_for, lines_with_first_byte_hedged_timeout,
+    lines_with_first_byte_timeout_for, InterruptibleLines,
+};
 use super::{ApiSharedState, ErrKind, InflightGuard};
 use crate::api_server::routes::{anthropic_error, openai_error, Protocol, stream_msg_or_fallback};
 use crate::tasks::qoder_common::QoderCreds;
@@ -51,10 +61,24 @@ use crate::tasks::qoder_upstream::{self, ErrMeta, UpstreamKind};
 
 /// 排队同号重试上限（10605 按上游建议退避；超限放回调度轮换防占死并发槽）
 const QUEUE_RETRY_LIMIT: u32 = 3;
+/// 海外区排队同号重试上限（2026-10-19）：海外免费档排队是常态，3 次（≈92s）
+/// 打满就返回 429 对用户比一直等更糟——实测两次都是等了 92–97s 拿到报错。
+/// 海外放宽到 8 次（≈180s 预算），期间不换号（排队按模型不按账号，换号必然
+/// 从头重排）。国内沿用 3 次短预算。
+const QUEUE_RETRY_LIMIT_GLOBAL: u32 = 8;
 /// 排队退避缺省秒数（上游 retryAfterSeconds/waitTime 缺失时）
 const QUEUE_DEFAULT_BACKOFF_SECS: u64 = 5;
 /// 退避上限（上游建议值异常大时钳制）
 const QUEUE_BACKOFF_MAX_SECS: u64 = 30;
+
+/// 按区域取排队同号重试上限
+fn queue_retry_limit_for(want_global: bool) -> u32 {
+    if want_global {
+        QUEUE_RETRY_LIMIT_GLOBAL
+    } else {
+        QUEUE_RETRY_LIMIT
+    }
+}
 
 /// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
 fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
@@ -68,13 +92,23 @@ fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
 /// 静态表语义等价；挂 ApiSharedState 需改 server.rs（他人负责），静态 OnceLock
 /// 最小改动。失败次数仅由 Server 渐进冷却维护（issue #90 修复①），成功即随
 /// 条目清除。
-/// 备忘（审查 G6）：键为裸 model 名、无区域前缀，v1 恒 CN 区解析无歧义；
-/// 接线 Global 区时需加区域前缀（如 "global:{model}"）。表不做主动回收，
-/// 残留条目随冷却窗口自然过期，重启即清零。
+/// 备忘（审查 G6，2026-10-19 已落地）：键经 [cqk] 带区域前缀——海外 `g:{model}`、
+/// 国内裸名。表不做主动回收，残留条目随冷却窗口自然过期，重启即清零。
 static QODER_MODEL_COOLDOWNS: OnceLock<Mutex<HashMap<String, (Instant, u32)>>> = OnceLock::new();
 
 fn cooldown_map() -> &'static Mutex<HashMap<String, (Instant, u32)>> {
     QODER_MODEL_COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 冷却表键（2026-10-19 落地 G6 备忘）：海外区用 `g:{model}` 前缀、国内保持
+/// 裸名（历史在途条目与既有测试兼容）。同名模型两区各自冷却——海外号排队
+/// （上游 Global 区容量）不再把国内同名请求一起判死，反之亦然。
+fn cqk(model: &str, global: bool) -> String {
+    if global {
+        format!("g:{model}")
+    } else {
+        model.to_string()
+    }
 }
 
 /// Server 类（5xx/业务 504「上游服务异常」）渐进冷却参数（issue #90 修复①）：
@@ -89,14 +123,12 @@ const SERVER_COOLDOWN_MAX_SECS: u64 = 480;
 /// 记录模型级冷却：按本次排队退避时长（已钳制）设定截止时刻，保留既有连续
 /// 失败计数（排队退避与 Server 渐进冷却共用一张表）。冷却窗口内后续请求由
 /// dispatch 健康预检快速回退（多源）/显式 429（单源），执行路径跳过同号退避，
-/// 不再每请求空转 5s×3~30s×3。
-/// 备忘（审查 G6）：键为裸 model 名、无区域前缀（v1 恒 CN 区）；接线 Global
-/// 区时需加区域前缀，见 QODER_MODEL_COOLDOWNS 定义处备忘。
-fn note_model_cooldown(model: &str, secs: u64) {
+/// 不再每请求空转 5s×3~30s×3。`global` = 本次请求生效区域（键见 [cqk]）。
+fn note_model_cooldown(model: &str, secs: u64, global: bool) {
     cooldown_map()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .entry(model.to_string())
+        .entry(cqk(model, global))
         // 取较大者：既有 Server 渐进冷却窗口（可能远长于排队建议值）不得被
         // 本次建议值缩短（issue #90 修复①配套语义，queued_cooldown 测试固化）
         .and_modify(|(until, _)| {
@@ -115,11 +147,11 @@ fn note_model_cooldown(model: &str, secs: u64) {
 /// 调用次数递增，5 账号一次请求即可把窗口推到 480s，把「跨片段渐进」放大成
 /// 「单请求轮换放大」，恢复探测被拉长到 8 分钟。按片段计数后：同请求内换号
 /// （窗口未过期）不递增，探测节奏 = 冷却窗口（30s→60s→…→8min），成功即清。
-fn note_model_server_cooldown(model: &str) {
+fn note_model_server_cooldown(model: &str, global: bool) {
     cooldown_map()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .entry(model.to_string())
+        .entry(cqk(model, global))
         .and_modify(|(until, fails)| {
             // 既有窗口已过期 = 新一次失败片段 → 递增并重设窗口；未过期 =
             // 同片段内的换号/并发失败，窗口维持原截止时刻不后延（审查中等项：
@@ -153,10 +185,12 @@ fn note_model_server_cooldown(model: &str) {
         });
 }
 
-/// 模型冷却剩余秒数；None = 无冷却（过期残留条目同 wb 版语义按无冷却处理）
-pub fn model_cooling_remaining_secs(model: &str) -> Option<u64> {
+/// 模型冷却剩余秒数；None = 无冷却（过期残留条目同 wb 版语义按无冷却处理）。
+/// `global`：Some(true) 查海外键；None/Some(false) 按国内裸名键（区域未知按 CN
+/// ——与 dispatch 历史语义一致）。
+pub fn model_cooling_remaining_secs(model: &str, global: Option<bool>) -> Option<u64> {
     let map = cooldown_map().lock().unwrap_or_else(|e| e.into_inner());
-    let until = map.get(model)?;
+    let until = map.get(&cqk(model, global.unwrap_or(false)))?;
     let left = until.0.saturating_duration_since(Instant::now());
     if left.is_zero() {
         None
@@ -167,11 +201,11 @@ pub fn model_cooling_remaining_secs(model: &str) -> Option<u64> {
 
 /// 请求成功后清除该模型冷却（同 wb_route::clear_model_failure 语义）；连续
 /// 失败计数随条目一并清除（成功 = 该模型恢复服务，渐进冷却重新从基准值起步）
-fn clear_model_cooldown(model: &str) {
+fn clear_model_cooldown(model: &str, global: bool) {
     cooldown_map()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .remove(model);
+        .remove(&cqk(model, global));
 }
 
 /// last_error 时间戳（UTC+8，与 app 日志时间线同区，issue #90 修复②）：
@@ -184,6 +218,125 @@ fn now_cn_timestamp() -> String {
         .with_timezone(&cn)
         .format("%Y-%m-%d %H:%M:%S")
         .to_string()
+}
+
+/// 池内除 `uid` 之外是否还有**本请求作用域**（区域 ∩ Key 白名单）的可选账号。
+/// 模型级冷却按区域键记账、不区分账号，一个号撞限频会把该区整个模型判死；
+/// 调用方据此避免「有备选却直接 429 终止轮换」。区域过滤是修复 189s 假死的
+/// 关键（2026-10-19）：此前不传 want_global，国内健康号让海外请求误判「有
+/// 备选」→ 快退 429 永不触发，排队逐号退避到轮换耗尽（30s×3×号数）。
+fn pool_has_other_selectable(
+    state: &Arc<ApiSharedState>,
+    uid: &str,
+    allowed: Option<&std::collections::HashSet<String>>,
+    want_global: Option<bool>,
+) -> bool {
+    state
+        .qoder_pool
+        .selectable_stats_in_region_excluding(allowed, want_global, Some(uid))
+        .1
+        > 0
+}
+
+/// 记录「免费档模型额度耗尽」到账号池（免费额度可见性，Qoder 域）。
+///
+/// 触发：上游返回额度类业务码（QUOTA_CODES：110 每日用量上限 / 114 试用额度用完 /
+/// 115 免费用户配额用完 / 119 所选模型的免费额度用完 等）且账号该模型属免费档
+/// （目录 rate=0）。写入 qoder_pool 账号行的 `free_models[].exhausted_at`，
+/// 供账号页显示「已用完（时刻）」；后续刷新（目录/积分链路）按
+/// `merge_free_models` 重建时保留该历史。
+///
+/// 只在免费档模型上记录：付费模型额度不足属常规冷却（HardCredit 已有 04:00
+/// 恢复机制），标成「免费额度用完」会误导。目录查询失败（无免费档信息）时
+/// 静默跳过——不写比写错好。
+fn note_free_quota_exhausted(data_dir: &std::path::Path, uid: &str, model: &str) {
+    // 匹配口径：账号现有 free_models 快照为主（该账号实际区域已由回写固化），
+    // 目录现查为辅（快照尚未生成的首轮场景）。两侧任一命中即认定为免费档——
+    // 倍率由上游按区下发，按账号自己的快照判定比按全局清单更贴合
+    // 「这个账号的免费额度是否耗尽」这一语义。
+    let in_snapshot = {
+        let store = crate::store::db(data_dir);
+        let pool = crate::store::docs::qoder_pool_load(&store);
+        pool.get("accounts")
+            .and_then(Value::as_array)
+            .and_then(|accs| {
+                accs.iter()
+                    .find(|a| a.get("id").and_then(Value::as_str) == Some(uid))
+            })
+            .and_then(|a| a.get("free_models"))
+            .and_then(Value::as_array)
+            .map(|models| {
+                models.iter().any(|m| {
+                    m.get("id")
+                        .and_then(Value::as_str)
+                        .map(|id| id.eq_ignore_ascii_case(model))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    };
+    let in_catalog = qoder_upstream::free_tier_models().iter().any(|m| {
+        m.get("id")
+            .and_then(Value::as_str)
+            .map(|id| id.eq_ignore_ascii_case(model))
+            .unwrap_or(false)
+    });
+    if !in_snapshot && !in_catalog {
+        return;
+    }
+    // 持池锁读-改-写（与 credits 回写同锁域，防整池覆盖丢写）
+    let store = crate::store::db(data_dir);
+    let _g = crate::store::docs::qoder_pool_rmw_lock();
+    let mut pool = crate::store::docs::qoder_pool_load(&store);
+    let Some(accounts) = pool.get_mut("accounts").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let Some(a) = accounts
+        .iter_mut()
+        .find(|a| a.get("id").and_then(Value::as_str) == Some(uid))
+    else {
+        return;
+    };
+    let now = now_cn_timestamp();
+    let mut updated = false;
+    if let Some(models) = a.get_mut("free_models").and_then(Value::as_array_mut) {
+        for m in models.iter_mut() {
+            let hit = m
+                .get("id")
+                .and_then(Value::as_str)
+                .map(|id| id.eq_ignore_ascii_case(model))
+                .unwrap_or(false);
+            if hit {
+                m["exhausted_at"] = json!(now);
+                updated = true;
+                break;
+            }
+        }
+    }
+    if updated {
+        // 重置提示（119 文案语义「明天 00:00 再重试当前免费模型」）：把恢复时刻
+        // 写进快照供前端 FreeModelsCell 展示「MM-DD HH:MM 恢复」，额度中心同口径
+        let reset_str = super::pool::fmt_local_ts(super::pool::next_0000(now_ts()));
+        if let Some(models) = a.get_mut("free_models").and_then(Value::as_array_mut) {
+            for m in models.iter_mut() {
+                let hit = m
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(|id| id.eq_ignore_ascii_case(model))
+                    .unwrap_or(false);
+                if hit {
+                    m["reset_at"] = json!(reset_str);
+                }
+            }
+        }
+        let _ = crate::store::docs::qoder_pool_save(&store, &pool);
+        crate::fs_utils::app_log(
+            data_dir,
+            &format!("qoder: 免费额度耗尽已记录 uid={uid} model={model} at={now} reset={reset_str}"),
+        );
+        // 免费用量计数联动（额度中心）：计数归零 + 重置时刻
+        super::free_usage::mark_exhausted(data_dir, "qoder", uid, model, Some(&reset_str));
+    }
 }
 
 /// 排队/退避分段等待（审查修复）：长 sleep 切成 ≤500ms 片段逐段睡，每段后
@@ -353,21 +506,26 @@ fn entry_is_global_only(model: &str, entry: &Value) -> bool {
     if id.is_empty() {
         return false; // name/upstreamKey 命中且无 id 的边缘：保守放行
     }
-    let Some(listed) = qoder_upstream::list()
+    // 唯一直接证据：CN 侧**自有来源**（远程 CN 清单或 CN 兜底表）能否列出此 id。
+    // resolve(Cn) 会跨区回落（CN 缺失时返回 Global 条目），不能用它的命中来证明
+    // CN 可得；必须直查 CN 源清单。
+    // 事故复盘（2026-10-19）：旧 fail-closed 分支「resolve(Global) 与入参条目全等
+    // ⟹ 判 Global 专属」把两区都上架的 qwen3.8-flash 误判成 Global 独有——国内
+    // Key 全量硬 404（Qoder 目录同步被关闭、双区均回落兜底/远程条目一致时触发）。
+    qoder_upstream::catalog_for_region(qoder_upstream::QoderRegion::Cn)
         .into_iter()
-        .find(|m| m.get("id").and_then(Value::as_str) == Some(id))
-    else {
-        return false; // list 无此 id（按 name/upstreamKey 命中）：保守放行
-    };
-    if listed.get("region").and_then(Value::as_str) == Some("cn") {
-        return false; // 证据①：Global 侧确定无此 id
-    }
-    match qoder_upstream::resolve(model, qoder_upstream::QoderRegion::Global) {
-        // 证据②：两路命中不同 ⟹ CN 侧至少一源声明此 id（逐源可证，见上）
-        Some(g) if g != *entry => false,
-        // 全等：CN 侧确定性可得证据缺失，按 fail-closed 策略判专属（见③）
-        _ => true,
-    }
+        .any(|m| m.get("id").and_then(Value::as_str) == Some(id))
+        .then_some(false) // CN 源有此 id：两区都有，放行 CN
+        .unwrap_or_else(|| {
+            // CN 源无此 id：看 list() 合并视图的归属标注（Global 优先去重注入），
+            // 标注 "global" 即 Global 独有；无标注（name/upstreamKey 命中）保守放行
+            qoder_upstream::list()
+                .into_iter()
+                .find(|m| m.get("id").and_then(Value::as_str) == Some(id))
+                .and_then(|m| m.get("region").and_then(Value::as_str).map(String::from))
+                .map(|r| r == "global")
+                .unwrap_or(false)
+        })
 }
 
 /// 字符边界安全截断（自抄 wb_route::safe_slice，私有不可复用）：
@@ -442,12 +600,14 @@ fn race_qoder_first_byte(
     allowed: Option<&HashSet<String>>,
     dedicated: Option<&str>,
     primary_session_ids: &Option<(String, String, String)>,
+    want_global: bool,
 ) -> Result<QoderRaceWin, ()> {
     let hedge_ms = state
         .qoder_hedge_threshold_ms
         .load(std::sync::atomic::Ordering::Relaxed);
     if hedge_ms == 0 {
-        let lines = lines_with_first_byte_timeout(primary_reader)?;
+        // 首字窗口按区域：海外静默排队普遍 6–14s，10s 判死会把排队误判故障
+        let lines = lines_with_first_byte_timeout_for(primary_reader, want_global)?;
         return Ok(QoderRaceWin {
             lines,
             uid: primary_uid.to_string(),
@@ -467,7 +627,7 @@ fn race_qoder_first_byte(
     let spawn_backup = move || -> Option<(Box<dyn std::io::Read + Send>, QoderHedgeLease)> {
         let (picked2, ev) = state2
             .qoder_pool
-            .pick_excluding_constrained_ev(&tried2, allowed2.as_ref(), dedicated2.as_deref())?;
+            .pick_excluding_constrained_ev_region(&tried2, allowed2.as_ref(), dedicated2.as_deref(), Some(want_global))?;
         // F-77⑤ 可观测：对冲取号同样记录 busy 让位/降级事件
         if let Some(ev) = ev {
             state2.logger.log_sched_event(&ev);
@@ -481,7 +641,12 @@ fn race_qoder_first_byte(
         let reader2 = qoder_upstream::make_qoder_request(&creds2, &converted2, &mk2, &ms2).ok()?;
         Some((reader2, lease))
     };
-    match lines_with_first_byte_hedged(primary_reader, hedge_ms, spawn_backup) {
+    match lines_with_first_byte_hedged_timeout(
+        primary_reader,
+        hedge_ms,
+        spawn_backup,
+        first_byte_timeout_for(want_global),
+    ) {
         Ok(out) => {
             let uid = if out.takeover {
                 out.hedge
@@ -625,32 +790,25 @@ fn run_qoder_stream(
     let peek: Value = serde_json::from_slice(body_vec).unwrap_or(json!({}));
 
     // 目录条目（upstreamKey/config）：调度命中后目录刷新导致条目消失时按 404 透传。
-    // 区域边界（v1）：恒 CN 区解析 + CN 网关执行（QODER_CHAT_URL）——Global 区
-    // 条目仅经 resolve 双区兜底可见，实际请求仍打 gateway.qoder.com.cn；接线
-    // Global 区（api3.qoder.sh）时此处与 dispatch 源判定需一并按账号区域分流
-    let Some(entry) = qoder_upstream::resolve(model, qoder_upstream::QoderRegion::Cn) else {
-        let msg = format!("model {model} not in Qoder catalog");
-        state.logger.log_request(
-            "qoder", "POST", "/v1/chat/completions", model, true, 404, "-",
-            start_ts.elapsed().as_millis() as u64, &key_name, "", Some(&msg),
-        );
-        send_stream_error(tx, proto, 404, &msg);
-        return;
+    // 区域分流（2026-10-17 海外接入）：CN 优先（历史语义）；CN 缺失或命中
+    // Global 专属条目时回落 Global 目录 → want_global=true，选号只出海外账号、
+    // 对话走 api3.qoder.sh（make_qoder_request 按 creds 区域选网关）
+    let (entry, want_global) = match qoder_upstream::resolve(model, qoder_upstream::QoderRegion::Cn)
+    {
+        Some(e) if !entry_is_global_only(model, &e) => (e, false),
+        _ => match qoder_upstream::resolve(model, qoder_upstream::QoderRegion::Global) {
+            Some(g) => (g, true),
+            None => {
+                let msg = format!("model {model} not in Qoder catalog (cn + global)");
+                state.logger.log_request(
+                    "qoder", "POST", "/v1/chat/completions", model, true, 404, "-",
+                    start_ts.elapsed().as_millis() as u64, &key_name, "", Some(&msg),
+                );
+                send_stream_error(tx, proto, 404, &msg);
+                return;
+            }
+        },
     };
-    // 区域边界执行入口检查（审查修复）：resolve 双区兜底可能命中 Global 专属
-    // 条目——调度判活但 CN 网关执行必死，此处明确拒绝（404 可解析通道）而非
-    // 透传上游诡异报错
-    if entry_is_global_only(model, &entry) {
-        let msg = format!(
-            "upstream 404 error: model {model} only available in Qoder Global region, not yet supported"
-        );
-        state.logger.log_request(
-            "qoder", "POST", "/v1/chat/completions", model, true, 404, "-",
-            start_ts.elapsed().as_millis() as u64, &key_name, "", Some(&msg),
-        );
-        send_stream_error(tx, proto, 404, &msg);
-        return;
-    }
     let model_key = entry
         .get("upstreamKey")
         .and_then(Value::as_str)
@@ -663,9 +821,46 @@ fn run_qoder_stream(
         .to_string();
 
     // F-35 子 Key 约束（qoder 池作用域；匿名/无约束 Key 全空 → 走默认调度）
-    let (allowed_set, dedicated) = super::api_keys::constraints_for(&state.data_dir, key_id)
-        .and_then(|k| k.pool_constraints("qoder"))
-        .map_or((None, None), |c| (c.allowed, c.dedicated));
+    let (allowed_set, dedicated, key_want_global) =
+        super::api_keys::constraints_for(&state.data_dir, key_id)
+            .and_then(|k| k.pool_constraints("qoder"))
+            .map_or((None, None, None), |c| (c.allowed, c.dedicated, c.want_global));
+    // Key 区域约束覆盖模型推导（2026-10-18 修复海外池空池：「海外号池」Key 的
+    // region=global 此前在流式主路径被丢弃——只取了 allowed/dedicated，导致
+    // want_global 恒由模型目录推导；qwen3.8-flash 在 CN 目录也存在 → false →
+    // 选号只在国内号里转，海外号永不入选，国内号全冻结后整池 no_healthy）。
+    // 语义：显式 Some 优先；模型仅海外有（want_global=true）而 Key 限国内 →
+    // 硬冲突快速失败（不在错误区域浪费一次上游请求）。
+    let want_global = match key_want_global {
+        Some(false) if want_global => {
+            let msg = format!(
+                "upstream 404 error: model {model} only available in Qoder Global region, but current key is restricted to the CN pool"
+            );
+            state.logger.log_request(
+                "qoder", "POST", "/v1/chat/completions", model, true, 404, "-",
+                start_ts.elapsed().as_millis() as u64, &key_name, "", Some(&msg),
+            );
+            send_stream_error(tx, proto, 404, &msg);
+            return;
+        }
+        Some(true) if !want_global => {
+            // Key 限定海外但模型只在 CN 有 → 硬冲突；两区都有则按 Key 走海外
+            if qoder_upstream::resolve(model, qoder_upstream::QoderRegion::Global).is_none() {
+                let msg = format!(
+                    "upstream 404 error: model {model} only available in Qoder CN region, but current key is restricted to the Global pool"
+                );
+                state.logger.log_request(
+                    "qoder", "POST", "/v1/chat/completions", model, true, 404, "-",
+                    start_ts.elapsed().as_millis() as u64, &key_name, "", Some(&msg),
+                );
+                send_stream_error(tx, proto, 404, &msg);
+                return;
+            }
+            true
+        }
+        Some(k) => k,
+        None => want_global,
+    };
 
     // F-80-余 v2 会话粘性（开关关闭时恒 None，v1 轮换行为零变化）：粘性命中且
     // 账号在池 → 首选粘住账号（busy 且有空闲候选时让位，F-77④ 同构）；子 Key
@@ -676,20 +871,20 @@ fn run_qoder_stream(
         .qoder_sticky_enabled
         .load(std::sync::atomic::Ordering::Relaxed)
     {
-        state
-            .qoder_sticky
-            .resolve(&sticky_key, now_ts())
-            .and_then(|b| {
-                if allowed_set.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
-                    return None;
-                }
-                state.qoder_pool.pick_by_uid(&b.uid).map(|_| b.uid)
-            })
-    } else {
-        None
-    };
-    // 绑定回写用会话种子（仅落库留档；session 由 body 构造时按 uid+seed 派生）
-    let sticky_seed: String = peek
+                state
+                    .qoder_sticky
+                    .resolve(&sticky_key, now_ts())
+                    .and_then(|b| {
+                        if allowed_set.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
+                            return None;
+                        }
+                        state.qoder_pool.pick_by_uid_region(&b.uid, Some(want_global)).map(|_| b.uid)
+                    })
+            } else {
+                None
+            };
+            // 绑定回写用会话种子（仅落库留档；session 由 body 构造时按 uid+seed 派生）
+            let sticky_seed: String = peek
         .get("session_id")
         .and_then(Value::as_str)
         .or_else(|| peek.get("user").and_then(Value::as_str))
@@ -704,7 +899,7 @@ fn run_qoder_stream(
     let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
         state
             .qoder_pool
-            .pick_sticky_yield(u, allowed_set.as_ref())
+            .pick_sticky_yield_region(u, allowed_set.as_ref(), Some(want_global))
             .map(|(p, ev)| {
                 if let Some(ev) = ev {
                     state.logger.log_sched_event(&ev);
@@ -733,7 +928,7 @@ fn run_qoder_stream(
             Some(p) => p,
             None => match state
                 .qoder_pool
-                .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref())
+                .pick_excluding_constrained_ev_region(&tried, allowed_set.as_ref(), dedicated.as_deref(), Some(want_global))
             {
                 Some((p, ev)) => {
                     if let Some(ev) = ev {
@@ -748,7 +943,7 @@ fn run_qoder_stream(
                     // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
                     // wb_template_map.json），否则维持无健康账号文案；
                     // code 保持 no_healthy_account（客户端兼容）
-                    let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None);
+                    let (healthy_total, _) = state.qoder_pool.selectable_stats_in_region(None, Some(want_global));
                     let (exhaust_msg, exhaust_tag) =
                         super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
                     state.logger.log_request(
@@ -756,9 +951,30 @@ fn run_qoder_stream(
                         duration_ms, &key_name, "", Some(&exhaust_msg),
                     );
                     state.logger.log_debug_line(format!(
-                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=qoder{}",
+                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=qoder reasons=[{}]{}",
                         tried.len(),
                         empty_hits,
+                        // 可观测补齐（对齐 buddy 池）：此前 qoder 无健康账号时只报
+                        // tried 计数，无法区分「全在冷却 / 目标区域无可用号 / 被
+                        // Key 约束排除」——排查 503 时要靠猜
+                        state
+                            .qoder_pool
+                            .status_list()
+                            .iter()
+                            .map(|s| {
+                                let st = if s.disabled {
+                                    format!("disabled({})", s.cooldown_reason.as_deref().unwrap_or("-"))
+                                } else if s.hard_credit {
+                                    "hard_credit".to_string()
+                                } else if s.cooling {
+                                    format!("cooling({})", s.cooldown_reason.as_deref().unwrap_or("-"))
+                                } else {
+                                    s.state.clone()
+                                };
+                                format!("{}({})", s.name, st)
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", "),
                         // issue #99 ①：影子风控（空完成主导）收尾落原始指纹样本（三池同口径）
                         if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
                             format!(" 指纹样本: {}", super::wb_payload::fingerprint_sample(body_vec))
@@ -777,6 +993,24 @@ fn run_qoder_stream(
                 }
             },
         };
+        // 免费额度 (uid,model) 冷却判定（同 wb_route T5.3 语义，2026-10-19）：
+        // 该号仅在这个免费模型上被上游限到明天 00:00，账号本身健康。池内有
+        // 其他同区备选才换号；无备选（单号池）放行——让上游自己决定是否拒绝，
+        // 不伪造 503。
+        if state.qoder_pool.is_model_cooling(&picked.uid, model)
+            && state.qoder_pool.has_other_selectable_for_model(
+                &picked.uid,
+                allowed_set.as_ref(),
+                Some(want_global),
+            )
+        {
+            state.logger.log_sched_event(&format!(
+                "free_quota_skip uid={} model={} (该免费模型冷却至次日00:00)",
+                picked.uid, model
+            ));
+            tried.insert(picked.uid.clone());
+            continue;
+        }
         tried.insert(picked.uid.clone());
         // 当前账号排队重试计数（账号局部：换号自然重置）
         let mut queue_same: u32 = 0;
@@ -886,9 +1120,12 @@ fn run_qoder_stream(
                 &model_source,
             ) {
                 Ok(reader) => {
-                    // 首字超时 10s：超时视为上游故障 → 换号（同 run_wb_stream 语义）；
-                    // F-80-余 v2 慢请求竞速对冲：首字超阈值向第二账号发对冲请求，
-                    // 先出首字者胜（对冲关闭时与纯首字超时语义一致）
+                    // 首字窗口按区域（国内 10s / 海外 60s）：超时**不再按故障计错**——
+                    // 「未产出首字节」与「请求失败」是两回事：海外上游普遍静默排队
+                    //（无 10605 排队票，只握连接不吐字节），10s 判死曾把排队误判为
+                    // 账号故障 → note_error(Server) 冷却 + 换号重排，逐步抽干海外池
+                    //（2026-10-19 20:41 连报 no healthy account available healthy=2）。
+                    // 现仅做连接层面放弃 + 换号，不动账号健康度、不进冷却。
                     let err_slot: Arc<Mutex<Option<ErrMeta>>> = Arc::new(Mutex::new(None));
                     let mut race = match race_qoder_first_byte(
                         state,
@@ -902,10 +1139,17 @@ fn run_qoder_stream(
                         allowed_set.as_ref(),
                         dedicated.as_deref(),
                         &envelope_ids,
+                        want_global,
                     ) {
                         Ok(w) => w,
                         Err(()) => {
-                            state.qoder_pool.note_error(&picked.uid, ErrKind::Server);
+                            state.logger.log_sched_event(&format!(
+                                "first_byte_timeout uid={} model={} region={} ttfb_window={}ms（排队/无首字节，按上游慢处理：不计错不冷却）",
+                                picked.uid,
+                                model,
+                                if want_global { "global" } else { "cn" },
+                                ttfb_start.elapsed().as_millis(),
+                            ));
                             break;
                         }
                     };
@@ -946,7 +1190,7 @@ fn run_qoder_stream(
                                     // 凭证/请求体属主账号，与生效账号不一致，直接换号）；
                                     // 若该模型已被并发请求记入冷却，则直接 break 换号
                                     //（快速失败）
-                                    if !sent_any && !hedge_taken && queue_same < QUEUE_RETRY_LIMIT {
+                                    if !sent_any && !hedge_taken {
                                         let secs = meta
                                             .as_ref()
                                             .and_then(|m| m.queue.as_ref())
@@ -957,8 +1201,18 @@ fn run_qoder_stream(
                                         // 记录窗口供 dispatch 预检快速回退；已在冷却
                                         // 中（并发请求刚记录过）则直接终止轮换返回
                                         // 429，不再对池内每个账号硬打已知故障上游
-                                        //（原 break 换号会轮换到耗尽，逐账号真实请求）
-                                        if model_cooling_remaining_secs(model).is_some() {
+                                        //（原 break 换号会轮换到耗尽，逐账号真实请求）。
+                                        // 快退判定按本请求区域作用域（2026-10-19）：
+                                        // 此前不传 want_global，国内健康号让海外请求
+                                        // 误判「有备选」，快退永不触发。
+                                        if model_cooling_remaining_secs(model, Some(want_global)).is_some()
+                                            && !pool_has_other_selectable(
+                                                &state,
+                                                &win_uid,
+                                                allowed_set.as_ref(),
+                                                Some(want_global),
+                                            )
+                                        {
                                             let duration_ms =
                                                 start_ts.elapsed().as_millis() as u64;
                                             state.record_usage_qoder(
@@ -979,7 +1233,33 @@ fn run_qoder_stream(
                                             );
                                             return;
                                         }
-                                        note_model_cooldown(model, secs);
+                                        // 单账号退避打满 → 终止返回 429（189s 假死修复，
+                                        // 2026-10-19）：换号必然再排（排队按模型不按账号），
+                                        // 逐号 30s×3 轮换把海外池放大成 90s×号数后 503
+                                        //「no healthy account」（实测 503 189305ms 三连）。
+                                        // 明确 429 让客户端按 Retry 语义等待，优于静默空转。
+                                        if queue_same >= queue_retry_limit_for(want_global) {
+                                            let duration_ms =
+                                                start_ts.elapsed().as_millis() as u64;
+                                            state.record_usage_qoder(
+                                                model, &win_uid, key_id, false, true,
+                                                duration_ms, 0, 0, None, None, None,
+                                                &session_ctx(&peek),
+                                            );
+                                            state.logger.log_request(
+                                                "qoder", "POST", "/v1/chat/completions",
+                                                model, true, 429, &win_uid, duration_ms,
+                                                &key_name,
+                                                &state.qoder_pool.name_of(&win_uid),
+                                                Some("同号退避打满，终止轮换"),
+                                            );
+                                            send_stream_error(
+                                                tx, proto, 429,
+                                                &format!("model {model} queued, retry later"),
+                                            );
+                                            return;
+                                        }
+                                        note_model_cooldown(model, secs, want_global);
                                         queue_same += 1;
                                         if !sleep_interruptible(Duration::from_secs(secs), Some(tx)) {
                                             // 审查 M5：断连为请求终局，补记失败终态用量
@@ -992,10 +1272,10 @@ fn run_qoder_stream(
                                         }
                                         continue;
                                     }
-                                    // 超限/sent_any：不再 break 硬换号——内容已流出
-                                    // （sent_any=true）时换号重发会向同一 SSE 流拼接
-                                    // 第二份完整响应；交下方公共收尾（!sent_any→换号，
-                                    // sent_any→就地收尾），与其他错误分支口径一致
+                                    // sent_any：不再 break 硬换号——内容已流出时换号重发
+                                    // 会向同一 SSE 流拼接第二份完整响应；交下方公共收尾
+                                    //（!sent_any→换号，sent_any→就地收尾），与其他错误
+                                    // 分支口径一致；hedge_taken 同前直接落公共收尾换号
                                 }
                                 Some(kind) => {
                                     let ek = kind.to_err_kind();
@@ -1006,11 +1286,24 @@ fn run_qoder_stream(
                                             state.qoder_sticky.unbind_uid(&win_uid);
                                         }
                                     }
+                                    // 免费额度耗尽（114/115/119/「免费额度」文案）：
+                                    // 账号健康（积分照常可用），只按 (uid, model)
+                                    // 冷却到次日 00:00——整号 HardCredit 冻结把付费
+                                    // 路径一起误杀（2026-10-19 事故）。to_err_kind
+                                    // 已返回 None 不碰账号，这里补记录与冷却。
+                                    if kind == UpstreamKind::FreeQuota {
+                                        note_free_quota_exhausted(&state.data_dir, &win_uid, model);
+                                        state.qoder_pool.per_model_cooldown_until(
+                                            &win_uid,
+                                            model,
+                                            super::pool::next_0000(now_ts()),
+                                        );
+                                    }
                                     // issue #90 修复①：上游服务端异常（5xx/业务 504）纳入
                                     // 模型级渐进冷却——仅在内容未流出时记账（sent_any=true
                                     // 说明模型实际在服务，尾部错误帧不代表模型故障）
                                     if kind == UpstreamKind::Server && !sent_any {
-                                        note_model_server_cooldown(model);
+                                        note_model_server_cooldown(model, want_global);
                                     }
                                     // issue #90 修复②：last_error 带模型名 + 时刻（此前只有
                                     // uid/code/msg，无法定位是哪个模型、故障从何时开始）
@@ -1073,7 +1366,7 @@ fn run_qoder_stream(
                                 );
                                 return;
                             }
-                            clear_model_cooldown(model); // 审查修复：成功即清模型级冷却
+                            clear_model_cooldown(model, want_global); // 审查修复：成功即清模型级冷却
                             state.qoder_pool.note_success(&win_uid);
                             // 成功终局：记 usage（审查修复——原逐尝试记账已移除，
                             // 成功行在此统一落账）；M4：缓存读 tokens 旁路同落
@@ -1111,8 +1404,20 @@ fn run_qoder_stream(
                     }
                 }
                 Err((status, resp_body, retry_after)) => {
-                    // HTTP 层分级重试（429/5xx/502 同号退避；401/403/4xx 换号/终止）
-                    match retry_plan(status, &resp_body, same_attempt, retry_after) {
+                    // HTTP 层分级重试（429/5xx/502 同号退避；401/403/4xx 换号/终止）。
+                    // 429 且文案带精确重置时刻 = 该账号额度/频率已耗尽，同号重试必然
+                    // 继续失败：直接换号并冻结到上游给出的时刻（对齐 WB 同款处置）。
+                    let retry_action = if status == 429 {
+                        if let Some(ts) = super::wb_route::parse_quota_reset_at(&resp_body) {
+                            state.qoder_pool.cooldown_until(&picked.uid, ts);
+                            RetryAction::SwitchKey
+                        } else {
+                            retry_plan(status, &resp_body, same_attempt, retry_after)
+                        }
+                    } else {
+                        retry_plan(status, &resp_body, same_attempt, retry_after)
+                    };
+                    match retry_action {
                         RetryAction::RetrySame { delay_ms } => {
                             same_attempt += 1;
                             // 审查修复：分段 sleep + 断连感知（原整段 sleep 最长 60s，
@@ -1137,19 +1442,24 @@ fn run_qoder_stream(
                             // break 换号（快速失败，见下方冷却检查）
                             let classified =
                                 qoder_upstream::classify_upstream_error(status, &resp_body);
-                            if classified.kind == UpstreamKind::Queued
-                                && queue_same < QUEUE_RETRY_LIMIT
-                            {
-                                let secs = classified
-                                    .queue
-                                    .as_ref()
-                                    .and_then(|q| q.retry_after_secs)
-                                    .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS)
-                                    .clamp(1, QUEUE_BACKOFF_MAX_SECS);
-                                // 审查修复：模型级冷却（同流内 Queued 分支）——
-                                // 冷却中直接终止轮换返回 429，不再逐账号硬打
-                                if model_cooling_remaining_secs(model).is_some() {
+                            if classified.kind == UpstreamKind::Queued {
+                                // 同流内 Queued 分支：单号退避打满/冷却中 → 429 终止
+                                // 轮换（不再换号空转放大，189s 假死修复）；快退按区域
+                                if queue_same >= queue_retry_limit_for(want_global)
+                                    || (model_cooling_remaining_secs(model, Some(want_global)).is_some()
+                                        && !pool_has_other_selectable(
+                                            &state,
+                                            &picked.uid,
+                                            allowed_set.as_ref(),
+                                            Some(want_global),
+                                        ))
+                                {
                                     let duration_ms = start_ts.elapsed().as_millis() as u64;
+                                    let reason = if queue_same >= queue_retry_limit_for(want_global) {
+                                        "同号退避打满，终止轮换"
+                                    } else {
+                                        "模型冷却中，终止轮换"
+                                    };
                                     state.record_usage_qoder(
                                         model, &picked.uid, key_id, false, true,
                                         duration_ms, 0, 0, None, None, None,
@@ -1159,15 +1469,21 @@ fn run_qoder_stream(
                                         "qoder", "POST", "/v1/chat/completions", model, true,
                                         429, &picked.uid, duration_ms, &key_name,
                                         &state.qoder_pool.name_of(&picked.uid),
-                                        Some("模型冷却中，终止轮换"),
+                                        Some(reason),
                                     );
                                     send_stream_error(
                                         tx, proto, 429,
-                                        &format!("model {model} cooling down, retry later"),
+                                        &format!("model {model} queued, retry later"),
                                     );
                                     return;
                                 }
-                                note_model_cooldown(model, secs);
+                                let secs = classified
+                                    .queue
+                                    .as_ref()
+                                    .and_then(|q| q.retry_after_secs)
+                                    .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS)
+                                    .clamp(1, QUEUE_BACKOFF_MAX_SECS);
+                                note_model_cooldown(model, secs, want_global);
                                 queue_same += 1;
                                 if !sleep_interruptible(Duration::from_secs(secs), Some(tx)) {
                                     // 审查 M5：断连为请求终局，补记失败终态用量
@@ -1188,11 +1504,27 @@ fn run_qoder_stream(
                                     state.qoder_sticky.unbind_uid(&picked.uid);
                                 }
                             }
+                            // 免费档模型额度耗尽记录（免费额度可见性）：额度类是
+                            // 账号×模型维度的事实，池冷却只按账号记，「哪个账号的
+                            // 免费模型还能用」此前无观测
+                            if classified.kind == UpstreamKind::Quota {
+                                note_free_quota_exhausted(&state.data_dir, &picked.uid, model);
+                            }
+                            // 免费额度类（114/115/119）：to_err_kind 已返回 None
+                            // 不整号冻结，这里按 (uid,model) 冷却到次日 00:00
+                            if classified.kind == UpstreamKind::FreeQuota {
+                                note_free_quota_exhausted(&state.data_dir, &picked.uid, model);
+                                state.qoder_pool.per_model_cooldown_until(
+                                    &picked.uid,
+                                    model,
+                                    super::pool::next_0000(now_ts()),
+                                );
+                            }
                             // issue #90 修复①：HTTP 层 5xx（含 504）换号前记模型级
                             // 渐进冷却——否则 504 只逐账号轮换硬打，dispatch 预检
                             // 永不触发跨池回退（issue #90 主诉场景）
                             if classified.kind == UpstreamKind::Server {
-                                note_model_server_cooldown(model);
+                                note_model_server_cooldown(model, want_global);
                             }
                             *safe_lock(&state.last_error) = Some(format!(
                                 "qoder uid={} model={} status={} body={} at {}",
@@ -1256,19 +1588,22 @@ pub async fn qoder_aggregate_chat(
         let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
         let peek: Value = serde_json::from_slice(&body_vec).unwrap_or(json!({}));
 
-        // 区域边界（v1）：恒 CN 区解析，同 run_qoder_stream 注释（Global 区未接线）
-        let Some(entry) = qoder_upstream::resolve(&model, qoder_upstream::QoderRegion::Cn) else {
-            // 审查修复：走 "upstream {status} error:" 可解析通道——非流式错误
-            // 解析按前缀提取状态码，裸消息此前落 503，与流式 404 语义不一致
-            return Err(format!("upstream 404 error: model {model} not in Qoder catalog"));
-        };
-        // 区域边界执行入口检查（审查修复）：同 run_qoder_stream，Global 专属
-        // 条目调度判活但 CN 网关执行必死，明确拒绝而非透传上游诡异报错
-        if entry_is_global_only(&model, &entry) {
-            return Err(format!(
-                "upstream 404 error: model {model} only available in Qoder Global region, not yet supported"
-            ));
-        }
+        // 区域分流（2026-10-17 海外接入）：同 run_qoder_stream——CN 优先，
+        // CN 缺失/Global 专属条目回落 Global 目录，选号只出该区账号
+        let (entry, want_global) =
+            match qoder_upstream::resolve(&model, qoder_upstream::QoderRegion::Cn) {
+                Some(e) if !entry_is_global_only(&model, &e) => (e, false),
+                _ => match qoder_upstream::resolve(&model, qoder_upstream::QoderRegion::Global) {
+                    Some(g) => (g, true),
+                    // 审查修复：走 "upstream {status} error:" 可解析通道——非流式错误
+                    // 解析按前缀提取状态码，裸消息此前落 503，与流式 404 语义不一致
+                    None => {
+                        return Err(format!(
+                            "upstream 404 error: model {model} not in Qoder catalog (cn + global)"
+                        ))
+                    }
+                },
+            };
         let model_key = entry
             .get("upstreamKey")
             .and_then(Value::as_str)
@@ -1280,10 +1615,28 @@ pub async fn qoder_aggregate_chat(
             .unwrap_or("system")
             .to_string();
 
-        let (allowed_set, dedicated) =
+        let (allowed_set, dedicated, key_want) =
             super::api_keys::constraints_for(&state.data_dir, &key_id)
                 .and_then(|k| k.pool_constraints("qoder"))
-                .map_or((None, None), |c| (c.allowed, c.dedicated));
+                .map_or((None, None, None), |c| (c.allowed, c.dedicated, c.want_global));
+        // Key 区域约束显式覆盖；硬冲突快速失败（同流式路径）
+        let want_global = match key_want {
+            Some(false) if want_global => {
+                return Err(format!(
+                    "upstream 404 error: model {model} only available in Qoder Global region, but current key is restricted to the CN pool"
+                ));
+            }
+            Some(true) if !want_global => {
+                if qoder_upstream::resolve(&model, qoder_upstream::QoderRegion::Global).is_none() {
+                    return Err(format!(
+                        "upstream 404 error: model {model} only available in Qoder CN region, but current key is restricted to the Global pool"
+                    ));
+                }
+                true
+            }
+            Some(k) => k,
+            None => want_global,
+        };
 
         // F-80-余 v2 会话粘性（同 run_qoder_stream；开关关闭恒 None 保持 v1 行为）
         let sticky_key = SessionKey::from_body(&peek);
@@ -1291,18 +1644,18 @@ pub async fn qoder_aggregate_chat(
             .qoder_sticky_enabled
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            state
-                .qoder_sticky
-                .resolve(&sticky_key, now_ts())
-                .and_then(|b| {
-                    if allowed_set.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
-                        return None;
-                    }
-                    state.qoder_pool.pick_by_uid(&b.uid).map(|_| b.uid)
-                })
-        } else {
-            None
-        };
+        state
+            .qoder_sticky
+            .resolve(&sticky_key, now_ts())
+            .and_then(|b| {
+                if allowed_set.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
+                    return None;
+                }
+                state.qoder_pool.pick_by_uid_region(&b.uid, Some(want_global)).map(|_| b.uid)
+            })
+    } else {
+        None
+    };
         let sticky_seed: String = peek
             .get("session_id")
             .and_then(Value::as_str)
@@ -1313,7 +1666,7 @@ pub async fn qoder_aggregate_chat(
         let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
             state
                 .qoder_pool
-                .pick_sticky_yield(u, allowed_set.as_ref())
+                .pick_sticky_yield_region(u, allowed_set.as_ref(), Some(want_global))
                 .map(|(p, ev)| {
                     if let Some(ev) = ev {
                         state.logger.log_sched_event(&ev);
@@ -1329,10 +1682,11 @@ pub async fn qoder_aggregate_chat(
             // ── 取号：粘性命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
             let picked = match first_pick.take() {
                 Some(p) => p,
-                None => match state.qoder_pool.pick_excluding_constrained_ev(
+                None => match state.qoder_pool.pick_excluding_constrained_ev_region(
                     &tried,
                     allowed_set.as_ref(),
                     dedicated.as_deref(),
+                    Some(want_global),
                 ) {
                     Some((p, ev)) => {
                         if let Some(ev) = ev {
@@ -1356,7 +1710,7 @@ pub async fn qoder_aggregate_chat(
                             &session_ctx(&peek),
                         );
                         // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
-                        let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None);
+                        let (healthy_total, _) = state.qoder_pool.selectable_stats_in_region(None, Some(want_global));
                         let (exhaust_msg, exhaust_tag) =
                             super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
                         // issue #99 ①：影子风控收尾落原始指纹样本（非流式路径无收尾
@@ -1373,6 +1727,21 @@ pub async fn qoder_aggregate_chat(
                     }
                 },
             };
+            // 免费额度 (uid,model) 冷却判定（同流式路径，池内无备选时放行）
+            if state.qoder_pool.is_model_cooling(&picked.uid, &model)
+                && state.qoder_pool.has_other_selectable_for_model(
+                    &picked.uid,
+                    allowed_set.as_ref(),
+                    Some(want_global),
+                )
+            {
+                state.logger.log_sched_event(&format!(
+                    "free_quota_skip uid={} model={} (该免费模型冷却至次日00:00)",
+                    picked.uid, model
+                ));
+                tried.insert(picked.uid.clone());
+                continue;
+            }
             tried.insert(picked.uid.clone());
             // 当前账号排队重试计数（账号局部：换号自然重置）
             let mut queue_same: u32 = 0;
@@ -1443,8 +1812,9 @@ pub async fn qoder_aggregate_chat(
                 ) {
                     Ok(reader) => {
                         let err_slot: Arc<Mutex<Option<ErrMeta>>> = Arc::new(Mutex::new(None));
-                        // 首字超时 10s + F-80-余 v2 竞速对冲（对冲关闭时与纯首字
-                        // 超时语义一致）：超时/双败视为上游故障 → 换号
+                        // 首字窗口按区域（国内 10s / 海外 60s）+ 竞速对冲；
+                        // 超时/双败**不再按故障计错**（同流式分支）：未产出首字节 ≠
+                        // 请求失败，海外静默排队记账冷却会抽干池子，故仅放弃换号
                         let mut race = match race_qoder_first_byte(
                             &state,
                             &picked.uid,
@@ -1457,10 +1827,16 @@ pub async fn qoder_aggregate_chat(
                             allowed_set.as_ref(),
                             dedicated.as_deref(),
                             &envelope_ids,
+                            want_global,
                         ) {
                             Ok(w) => w,
                             Err(()) => {
-                                state.qoder_pool.note_error(&picked.uid, ErrKind::Server);
+                                state.logger.log_sched_event(&format!(
+                                    "first_byte_timeout uid={} model={} region={}（排队/无首字节，不计错不冷却）",
+                                    picked.uid,
+                                    &model,
+                                    if want_global { "global" } else { "cn" },
+                                ));
                                 break;
                             }
                         };
@@ -1498,7 +1874,7 @@ pub async fn qoder_aggregate_chat(
                                     original_credits,
                                     &session_ctx_from_ids(&peek, win_session_ids.as_ref()),
                                 );
-                                clear_model_cooldown(&model); // 审查修复：成功即清模型级冷却
+                                clear_model_cooldown(&model, want_global); // 审查修复：成功即清模型级冷却
                                 state.qoder_pool.note_success(&win_uid);
                                 // F-80-余 v2：绑定粘性会话（开关开启时；同流式路径）
                                 if state
@@ -1523,9 +1899,10 @@ pub async fn qoder_aggregate_chat(
                                 match meta.as_ref().map(|m| m.kind) {
                                     Some(UpstreamKind::Queued) => {
                                         // 排队：同号退避重试为主（对冲接管后不适用，
-                                        // 同流式路径——直接换号）；模型已在冷却中
-                                        // 则 break 换号（快速失败，见下方冷却检查）
-                                        if !hedge_taken && queue_same < QUEUE_RETRY_LIMIT {
+                                        // 同流式路径——直接换号）。退避打满/模型冷却中
+                                        // 不再 break 换号（超限换号是 189s 逐号放大源），
+                                        // 直接终止轮换 429（见下方判定）
+                                        if !hedge_taken {
                                             let secs = meta
                                                 .as_ref()
                                                 .and_then(|m| m.queue.as_ref())
@@ -1533,9 +1910,24 @@ pub async fn qoder_aggregate_chat(
                                                 .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS)
                                                 .clamp(1, QUEUE_BACKOFF_MAX_SECS);
                                             // 审查修复：模型级冷却（同流式分支）——
-                                            // 冷却中直接终止轮换返回 429（upstream
-                                            // 前缀借助端点状态码透传映射），不再逐账号硬打
-                                            if model_cooling_remaining_secs(&model).is_some() {
+                                            // 冷却中/单号退避打满直接终止轮换返回
+                                            // 429（upstream 前缀借助端点状态码透传
+                                            // 映射），不再逐账号硬打空转放大（189s
+                                            // 假死修复）；快退判定按本请求区域作用域
+                                            if queue_same >= queue_retry_limit_for(want_global)
+                                                || (model_cooling_remaining_secs(&model, Some(want_global)).is_some()
+                                                    && !pool_has_other_selectable(
+                                                        &state,
+                                                        &win_uid,
+                                                        allowed_set.as_ref(),
+                                                        Some(want_global),
+                                                    ))
+                                            {
+                                                let reason = if queue_same >= queue_retry_limit_for(want_global) {
+                                                    "同号退避打满，终止轮换"
+                                                } else {
+                                                    "模型冷却中，终止轮换"
+                                                };
                                                 state.record_usage_qoder(
                                                     &model, &win_uid, &key_id, false, stream,
                                                     duration_ms, 0, 0, None, None, None,
@@ -1546,13 +1938,13 @@ pub async fn qoder_aggregate_chat(
                                                     &model, stream, 429, &win_uid, duration_ms,
                                                     Some(ttfb_ms), &key_name,
                                                     &state.qoder_pool.name_of(&win_uid),
-                                                    Some("模型冷却中，终止轮换"),
+                                                    Some(reason),
                                                 );
                                                 return Err(format!(
-                                                    "upstream 429 error: model {model} cooling down, retry later"
+                                                    "upstream 429 error: model {model} queued, retry later"
                                                 ));
                                             }
-                                            note_model_cooldown(&model, secs);
+                                            note_model_cooldown(&model, secs, want_global);
                                             queue_same += 1;
                                             // 统一走 sleep_interruptible(None)：分段等待，
                                             // 与流式实现口径一致（非流式无下行通道传 None，
@@ -1571,9 +1963,19 @@ pub async fn qoder_aggregate_chat(
                                                 state.qoder_sticky.unbind_uid(&win_uid);
                                             }
                                         }
+                                        // 免费额度耗尽：同流式分支（(uid,model) 冷却，
+                                        // 不整号冻结）
+                                        if kind == UpstreamKind::FreeQuota {
+                                            note_free_quota_exhausted(&state.data_dir, &win_uid, &model);
+                                            state.qoder_pool.per_model_cooldown_until(
+                                                &win_uid,
+                                                &model,
+                                                super::pool::next_0000(now_ts()),
+                                            );
+                                        }
                                         // issue #90 修复①：同流式分支（非流式无部分流出概念）
                                         if kind == UpstreamKind::Server {
-                                            note_model_server_cooldown(&model);
+                                            note_model_server_cooldown(&model, want_global);
                                         }
                                     }
                                     None => {
@@ -1611,7 +2013,18 @@ pub async fn qoder_aggregate_chat(
                         }
                     }
                     Err((status, resp_body, retry_after)) => {
-                        match retry_plan(status, &resp_body, same_attempt, retry_after) {
+                        // 同流式路径：带重置时刻的 429 直接换号 + 冻结账号
+                        let retry_action = if status == 429 {
+                            if let Some(ts) = super::wb_route::parse_quota_reset_at(&resp_body) {
+                                state.qoder_pool.cooldown_until(&picked.uid, ts);
+                                RetryAction::SwitchKey
+                            } else {
+                                retry_plan(status, &resp_body, same_attempt, retry_after)
+                            }
+                        } else {
+                            retry_plan(status, &resp_body, same_attempt, retry_after)
+                        };
+                        match retry_action {
                             RetryAction::RetrySame { delay_ms } => {
                                 same_attempt += 1;
                                 sleep_interruptible(
@@ -1623,18 +2036,23 @@ pub async fn qoder_aggregate_chat(
                             RetryAction::SwitchKey => {
                                 let classified =
                                     qoder_upstream::classify_upstream_error(status, &resp_body);
-                                if classified.kind == UpstreamKind::Queued
-                                    && queue_same < QUEUE_RETRY_LIMIT
-                                {
-                                    let secs = classified
-                                        .queue
-                                        .as_ref()
-                                        .and_then(|q| q.retry_after_secs)
-                                        .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS)
-                                        .clamp(1, QUEUE_BACKOFF_MAX_SECS);
-                                    // 审查修复：模型级冷却（同流式分支）——冷却中
-                                    // 直接终止轮换返回 429，不再逐账号硬打
-                                    if model_cooling_remaining_secs(&model).is_some() {
+                                if classified.kind == UpstreamKind::Queued {
+                                    // 同流式分支：退避打满/模型冷却中（按区域作用域）
+                                    // → 429 终止轮换，不再换号空转放大（189s 假死修复）
+                                    if queue_same >= queue_retry_limit_for(want_global)
+                                        || (model_cooling_remaining_secs(&model, Some(want_global)).is_some()
+                                            && !pool_has_other_selectable(
+                                                &state,
+                                                &picked.uid,
+                                                allowed_set.as_ref(),
+                                                Some(want_global),
+                                            ))
+                                    {
+                                        let reason = if queue_same >= queue_retry_limit_for(want_global) {
+                                            "同号退避打满，终止轮换"
+                                        } else {
+                                            "模型冷却中，终止轮换"
+                                        };
                                         state.record_usage_qoder(&model, &picked.uid, &key_id,
                                             false, stream,
                                             start_ts.elapsed().as_millis() as u64, 0, 0,
@@ -1644,13 +2062,19 @@ pub async fn qoder_aggregate_chat(
                                             stream, 429, &picked.uid,
                                             start_ts.elapsed().as_millis() as u64, &key_name,
                                             &state.qoder_pool.name_of(&picked.uid),
-                                            Some("模型冷却中，终止轮换"),
+                                            Some(reason),
                                         );
                                         return Err(format!(
-                                            "upstream 429 error: model {model} cooling down, retry later"
+                                            "upstream 429 error: model {model} queued, retry later"
                                         ));
                                     }
-                                    note_model_cooldown(&model, secs);
+                                    let secs = classified
+                                        .queue
+                                        .as_ref()
+                                        .and_then(|q| q.retry_after_secs)
+                                        .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS)
+                                        .clamp(1, QUEUE_BACKOFF_MAX_SECS);
+                                    note_model_cooldown(&model, secs, want_global);
                                     queue_same += 1;
                                     // 审查 Low：对齐同函数其余非流式退避点，统一走
                                     // sleep_interruptible(None)（分段等待，非流式无
@@ -1666,9 +2090,23 @@ pub async fn qoder_aggregate_chat(
                                         state.qoder_sticky.unbind_uid(&picked.uid);
                                     }
                                 }
+                                // 免费档模型额度耗尽记录（免费额度可见性）：同流式分支
+                                if classified.kind == UpstreamKind::Quota {
+                                    note_free_quota_exhausted(&state.data_dir, &picked.uid, &model);
+                                }
+                                // 免费额度类（114/115/119）：(uid,model) 冷却到次日
+                                // 00:00，不整号冻结（同流式 HTTP 分支）
+                                if classified.kind == UpstreamKind::FreeQuota {
+                                    note_free_quota_exhausted(&state.data_dir, &picked.uid, &model);
+                                    state.qoder_pool.per_model_cooldown_until(
+                                        &picked.uid,
+                                        &model,
+                                        super::pool::next_0000(now_ts()),
+                                    );
+                                }
                                 // issue #90 修复①：同流式 HTTP 分支（5xx 换号前记模型级冷却）
                                 if classified.kind == UpstreamKind::Server {
-                                    note_model_server_cooldown(&model);
+                                    note_model_server_cooldown(&model, want_global);
                                 }
                                 *safe_lock(&state.last_error) = Some(format!(
                                     "qoder uid={} model={} status={} body={} at {}",
@@ -1838,15 +2276,15 @@ mod tests {
             "t90-prog-{}",
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
-        assert!(model_cooling_remaining_secs(&model).is_none());
+        assert!(model_cooling_remaining_secs(&model, None).is_none());
         // 片段 1：基准 30s
-        note_model_server_cooldown(&model);
-        let r1 = model_cooling_remaining_secs(&model).unwrap();
+        note_model_server_cooldown(&model, false);
+        let r1 = model_cooling_remaining_secs(&model, None).unwrap();
         assert!(r1 > 28 && r1 <= 30, "首次失败应为 30s 基准，实际 {r1}");
         // 同片段内连续记账（一次请求逐账号换号场景，窗口未过期）：
         // 不递增片段数，窗口仅延长（剩余仍 ≈30s，绝不翻倍）
         for _ in 0..4 {
-            note_model_server_cooldown(&model);
+            note_model_server_cooldown(&model, false);
         }
         let (_, fails) = *cooldown_map()
             .lock()
@@ -1859,8 +2297,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(model.clone(), (Instant::now() - Duration::from_secs(1), 1));
-        note_model_server_cooldown(&model);
-        let r2 = model_cooling_remaining_secs(&model).unwrap();
+        note_model_server_cooldown(&model, false);
+        let r2 = model_cooling_remaining_secs(&model, None).unwrap();
         assert!(r2 > 55 && r2 <= 60, "过期后新片段应翻倍至 60s，实际 {r2}");
         // 连续失败片段至封顶：窗口恒 ≤ 480s
         for _ in 0..10 {
@@ -1874,13 +2312,13 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(model.clone(), (Instant::now() - Duration::from_secs(1), cur.1));
-            note_model_server_cooldown(&model);
+            note_model_server_cooldown(&model, false);
         }
-        let capped = model_cooling_remaining_secs(&model).unwrap();
+        let capped = model_cooling_remaining_secs(&model, None).unwrap();
         assert!(capped <= SERVER_COOLDOWN_MAX_SECS, "冷却窗口应封顶 480s，实际 {capped}");
         // 成功清除 → 无冷却（片段计数随之归零）
-        clear_model_cooldown(&model);
-        assert!(model_cooling_remaining_secs(&model).is_none());
+        clear_model_cooldown(&model, false);
+        assert!(model_cooling_remaining_secs(&model, None).is_none());
     }
 
     /// 排队退避（note_model_cooldown）不缩短既有 Server 冷却窗口：排队建议值
@@ -1893,17 +2331,17 @@ mod tests {
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         // 两次 Server 失败（同一片段内）→ 窗口维持基准 ~30s 不后延
-        note_model_server_cooldown(&model);
-        note_model_server_cooldown(&model);
-        let before = model_cooling_remaining_secs(&model).unwrap();
+        note_model_server_cooldown(&model, false);
+        note_model_server_cooldown(&model, false);
+        let before = model_cooling_remaining_secs(&model, None).unwrap();
         // 排队退避建议 5s：不得把 60s 窗口缩短
-        note_model_cooldown(&model, 5);
-        let after = model_cooling_remaining_secs(&model).unwrap();
+        note_model_cooldown(&model, 5, false);
+        let after = model_cooling_remaining_secs(&model, None).unwrap();
         assert!(
             after >= before.saturating_sub(1),
             "排队建议值不得缩短既有 Server 窗口（{before} → {after}）"
         );
-        clear_model_cooldown(&model);
+        clear_model_cooldown(&model, false);
     }
 
     /// 回归：排队退避先插入 fails=0 条目（note_model_cooldown 的 or_insert 路径），
@@ -1917,10 +2355,10 @@ mod tests {
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         // 排队退避先落条目：fails = 0
-        note_model_cooldown(&model, 5);
+        note_model_cooldown(&model, 5, false);
         // Server 失败：窗口未过期（5s 内）不递增计数，基准 30s 兜底
-        note_model_server_cooldown(&model);
-        let r = model_cooling_remaining_secs(&model).unwrap();
+        note_model_server_cooldown(&model, false);
+        let r = model_cooling_remaining_secs(&model, None).unwrap();
         assert!(r > 28 && r <= 30, "fails=0 时应为 30s 基准窗口，实际 {r}");
         let (_, fails) = *cooldown_map()
             .lock()
@@ -1928,7 +2366,51 @@ mod tests {
             .get(&model)
             .unwrap();
         assert_eq!(fails, 0, "窗口未过期不得递增失败计数");
-        clear_model_cooldown(&model);
+        clear_model_cooldown(&model, false);
+    }
+
+    /// 区域键隔离（189s 假死修复配套，2026-10-19）：海外区排队冷却记在
+    /// `g:{model}`，不得污染国内同名模型（反之亦然）；国内键保持裸名兼容。
+    #[test]
+    fn region_cooldown_keys_are_isolated() {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let model = format!(
+            "t-reg-{}",
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        // 海外区记冷却：Some(true)/Some(false) 各自独立，None 按国内裸名查
+        note_model_cooldown(&model, 30, true);
+        assert!(
+            model_cooling_remaining_secs(&model, Some(true)).is_some(),
+            "海外键应命中冷却"
+        );
+        assert!(
+            model_cooling_remaining_secs(&model, Some(false)).is_none(),
+            "国内同名不得被海外冷却误伤"
+        );
+        assert!(
+            model_cooling_remaining_secs(&model, None).is_none(),
+            "None 视作国内，不得命中海外键"
+        );
+        // 国内区再记冷却：两区各自独立
+        note_model_cooldown(&model, 30, false);
+        assert!(model_cooling_remaining_secs(&model, Some(false)).is_some());
+        // 清除只清各自区域键
+        clear_model_cooldown(&model, false);
+        assert!(model_cooling_remaining_secs(&model, Some(false)).is_none());
+        assert!(
+            model_cooling_remaining_secs(&model, Some(true)).is_some(),
+            "清国内不得连带清海外"
+        );
+        clear_model_cooldown(&model, true);
+        assert!(model_cooling_remaining_secs(&model, Some(true)).is_none());
+    }
+
+    /// cqk 键形态：国内裸名（历史条目兼容）、海外加 `g:` 前缀。
+    #[test]
+    fn cqk_key_shape() {
+        assert_eq!(cqk("Qwen3.8-Flash", false), "Qwen3.8-Flash");
+        assert_eq!(cqk("Qwen3.8-Flash", true), "g:Qwen3.8-Flash");
     }
 
     /// issue #82 T2.3：credits 复数优先（新版字段），单数 credit 为旧版兜底
@@ -2065,8 +2547,12 @@ mod tests {
             .expect("CN 远程目录应命中");
         assert!(!entry_is_global_only("TwaG4Same", &entry));
 
-        // ④ 两区同名且同值（旧「同名必异」假设被打破的场景）：确定性证据缺失
-        //    → 策略性判专属（fail-closed，行为与旧版一致、依据改为显式策略）
+        // ④ 两区同名且同值（两区远程条目一致）：resolve(Cn) 已命中 CN 条目 =
+        //    CN 侧确定可得该模型；Global 侧同样命中只能证明两区都有。
+        //    事故复盘（2026-10-19）：旧 fail-closed 分支在此判 Global 专属，把
+        //    两区都上架的 qwen3.8-flash 对国内 Key 硬 404（目录同步被关闭期间
+        //    全量触发）。现改为放行 CN——判定 Global 专属的唯一证据是证据①
+        //    （list 中 Global 侧确定无此 id）。
         qoder_upstream::adopt_remote(
             qoder_upstream::QoderRegion::Global,
             &json!({"statusCodeValue": 200,
@@ -2075,6 +2561,23 @@ mod tests {
         .unwrap();
         let entry = qoder_upstream::resolve("TwaG4Same", qoder_upstream::QoderRegion::Cn)
             .expect("CN 远程目录应命中");
-        assert!(entry_is_global_only("TwaG4Same", &entry));
+        assert!(!entry_is_global_only("TwaG4Same", &entry), "两区同名同值 = 两区都有，CN Key 必须放行");
+
+        // ⑤ 真正的 Global 专属：CN 源（远程 CN + CN 兜底表）均无此 id，
+        //    list() 合并视图标注 region=global → 判 Global 独有，国内 Key 硬 404。
+        qoder_upstream::catalog_test_reset();
+        qoder_upstream::adopt_remote(
+            qoder_upstream::QoderRegion::Global,
+            &json!({"statusCodeValue": 200,
+                    "chat": [remote_entry("twa4g_key", "TwaG4GlobalOnly", 0.7)]}),
+        )
+        .unwrap();
+        let entry =
+            qoder_upstream::resolve("TwaG4GlobalOnly", qoder_upstream::QoderRegion::Cn)
+                .expect("Global 独有条目经双区回落应命中");
+        assert!(
+            entry_is_global_only("TwaG4GlobalOnly", &entry),
+            "CN 源（远程+兜底）均无此 id 且 list 标注 global → 判 Global 专属"
+        );
     }
 }

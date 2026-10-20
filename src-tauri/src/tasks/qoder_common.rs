@@ -80,6 +80,11 @@ pub struct QoderCreds {
     pub machine_id: String,
     #[serde(default)]
     pub machine_token: String,
+    /// 账号所属区（false=国内 / true=海外）：刷新/userinfo/plan 走分区 openapi
+    /// 基址、对话走分区网关的依据。token store 记录 `global_region` 键驱动，
+    /// 存量记录缺省 false（国内）——海外账号由区域化设备流登录时写入。
+    #[serde(default)]
+    pub global_region: bool,
 }
 
 // 手写脱敏 Debug（derive(Debug) 会把 access_token/refresh_token/pat/machine_token
@@ -98,7 +103,19 @@ impl std::fmt::Debug for QoderCreds {
             .field("refresh_expires_at_ms", &self.refresh_expires_at_ms)
             .field("machine_id", &self.machine_id)
             .field("machine_token", &mask(&self.machine_token))
+            .field("global_region", &self.global_region)
             .finish()
+    }
+}
+
+/// openapi 基址按区分叉（2026-10-17 海外实测）：两区报文同构（同一 NotFound
+/// 信封），仅主机不同——CN `openapi.qoder.com.cn` / Global `openapi.qoder.sh`。
+/// 设备流轮询、令牌刷新、userinfo/plan 全部走本函数取基址。
+pub fn open_api_base(global: bool) -> &'static str {
+    if global {
+        "https://openapi.qoder.sh"
+    } else {
+        OPEN_API_BASE
     }
 }
 
@@ -149,6 +166,9 @@ pub fn creds_of(source: &Value) -> QoderCreds {
         .and_then(clamp_expires_at),
         machine_id: s_of(fs_utils::dig(source, &["machine_id", "machineId", "cosy_machine_id"])),
         machine_token: s_of(fs_utils::dig(source, &["machine_token", "machineToken", "cosy_machine_token"])),
+        global_region: fs_utils::dig(source, &["global_region", "globalRegion"])
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     }
 }
 
@@ -478,19 +498,131 @@ pub struct NativeRiskIdentity {
 /// 随包分发的原生身份工具：`resources\umid\runtime-info.exe`（配 sgsdk.dll）。
 /// 客户端桥以 `spawn(exe, [env, "--account-stdin"])` + stdin `{account}.` 调用；
 /// 实测无参直跑同样输出真值且与账号参数无关（机器恒定，exit 0 瞬时返回）。
+///
+/// 安装目录发现（2026-10-16 修复）：主客户端可装任意盘符（本机实测 `D:\Qoder CN`），
+/// 旧实现只认 `%LOCALAPPDATA%\Programs\Qoder CN\` 写死路径 → 找不到 exe → 设备头回落
+/// machine_id 派生假号 → 服务端判「当前参与用户太多（缺少设备标识）」拒签到。
+/// 现改为：写死路径优先，未命中再扫注册表 Uninstall 三根（与 switcher/locate.rs
+/// registry_locate 同口径），从 InstallLocation / UninstallString / DisplayIcon
+/// 反推安装目录，拼 `resources\umid\runtime-info.exe` 探测存在性。
+/// 「Qoder IDE」（VS Code 分叉）不携带 umid 组件，按名字排除防串台。
 fn runtime_info_exe_path() -> Option<std::path::PathBuf> {
-    let local = std::env::var_os("LOCALAPPDATA")?;
-    let p = std::path::Path::new(&local)
-        .join("Programs")
-        .join("Qoder CN")
-        .join("resources")
-        .join("umid")
-        .join("runtime-info.exe");
-    if p.is_file() {
-        Some(p)
-    } else {
-        None
+    const UMID_REL: &str = "resources\\umid\\runtime-info.exe";
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let p = std::path::Path::new(&local).join("Programs").join("Qoder CN").join(UMID_REL);
+        if p.is_file() {
+            return Some(p);
+        }
     }
+    registry_umid_candidates(UMID_REL)
+        .into_iter()
+        .find(|p| p.is_file())
+}
+
+/// 注册表发现携带 umid 的 Qoder 主客户端安装目录（cfg 分支见 [`registry_umid_candidates_raw`]）。
+#[cfg(windows)]
+fn registry_umid_candidates(rel: &str) -> Vec<std::path::PathBuf> {
+    registry_umid_candidates_raw(rel)
+}
+
+/// 非 Windows：无注册表可查，仅返回空（写死路径分支已覆盖常规安装）。
+#[cfg(not(windows))]
+fn registry_umid_candidates(_rel: &str) -> Vec<std::path::PathBuf> {
+    Vec::new()
+}
+
+/// 从卸载表项的字段值反推安装目录（纯函数便于单测）：
+/// - InstallLocation 直接给目录；
+/// - UninstallString（`"D:\Qoder CN\Uninstall Qoder CN.exe" /currentuser`）取首段
+///   去引号后的父目录；
+/// - DisplayIcon（`D:\Qoder CN\uninstallerIcon.ico`）取父目录。
+/// 返回去重后的候选目录。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn install_dirs_from_uninstall_entry(
+    install_location: Option<&str>,
+    uninstall_string: Option<&str>,
+    display_icon: Option<&str>,
+) -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(loc) = install_location.map(str::trim).filter(|s| !s.is_empty()) {
+        let d = std::path::PathBuf::from(loc);
+        if !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
+    if let Some(us) = uninstall_string {
+        // 引号包裹的可执行路径，或裸路径 + 参数——取到最后一个 .exe 为止
+        let trimmed = us.trim();
+        let exe = if let Some(rest) = trimmed.strip_prefix('"') {
+            rest.split('"').next().unwrap_or("")
+        } else {
+            // 裸形态按大小写不敏感找 ".exe"（含）截断，尾部参数丢弃
+            match trimmed.to_lowercase().rfind(".exe") {
+                Some(i) => &trimmed[..i + 4],
+                None => trimmed,
+            }
+        };
+        if let Some(parent) = std::path::Path::new(exe).parent() {
+            let d = parent.to_path_buf();
+            if !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+    }
+    if let Some(icon) = display_icon {
+        let base = icon.split(',').next().unwrap_or(icon).trim();
+        if !base.is_empty() {
+            if let Some(parent) = std::path::Path::new(base).parent() {
+                let d = parent.to_path_buf();
+                if !dirs.contains(&d) {
+                    dirs.push(d);
+                }
+            }
+        }
+    }
+    dirs
+}
+
+/// 卸载表中 Qoder 主客户端条目的名字匹配（大小写不敏感）：含 "qoder" 且非 "qoder ide"
+///（VS Code 分叉不带 umid）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_qoder_main_client(display_name: &str) -> bool {
+    let low = display_name.to_lowercase();
+    low.contains("qoder") && !low.contains("ide")
+}
+
+/// 注册表扫描实现：HKLM 64/32 + HKCU Uninstall 三根（对齐 switcher/locate.rs），
+/// 命中主客户端条目后按三种字段反推安装目录并拼 umid 相对路径。
+#[cfg(windows)]
+fn registry_umid_candidates_raw(rel: &str) -> Vec<std::path::PathBuf> {
+    use windows_registry::{CURRENT_USER, LOCAL_MACHINE};
+    let mut out = Vec::new();
+    let roots = [
+        (LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
+        (LOCAL_MACHINE, "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
+        (CURRENT_USER, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
+    ];
+    for (root, sub) in roots {
+        let Ok(uninstall) = root.open(sub) else { continue };
+        let Ok(key_iter) = uninstall.keys() else { continue };
+        for key in key_iter {
+            let Ok(item) = uninstall.open(&key) else { continue };
+            let Ok(display) = item.get_string("DisplayName") else { continue };
+            if !is_qoder_main_client(&display) {
+                continue;
+            }
+            let loc = item.get_string("InstallLocation").ok();
+            let us = item.get_string("UninstallString").ok();
+            let icon = item.get_string("DisplayIcon").ok();
+            for dir in install_dirs_from_uninstall_entry(loc.as_deref(), us.as_deref(), icon.as_deref()) {
+                let p = dir.join(rel);
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// 解析 runtime-info.exe stdout：优先整段 JSON，失败再按客户端桥的 '.' 分隔符
@@ -735,7 +867,11 @@ pub fn refresh_token_once_ex(
     // 刷新端点不带 Authorization（下方 retain 移除；鉴权完全靠 body 中的 refresh_token）+ Cosy 头
     let mut h = build_auth_headers(creds);
     h.retain(|(k, _)| k != "Authorization");
-    let url = format!("{OPEN_API_BASE}{}", refresh_endpoint_for(&creds.refresh_token));
+    let url = format!(
+        "{}{}",
+        open_api_base(creds.global_region),
+        refresh_endpoint_for(&creds.refresh_token)
+    );
     let (status, body) = post_json(
         agent,
         &url,
@@ -789,7 +925,7 @@ pub fn refresh_token_once_ex(
 /// （R-13 侦察注：设计文档 L553 写 GET，但实现一直以 POST 在用且未被证伪——
 /// 端点真实方法未实测，若后续发现 404/405 再切 get_json。）
 pub fn fetch_userinfo(agent: &ureq::Agent, creds: &QoderCreds) -> (Option<String>, Option<String>) {
-    let url = format!("{OPEN_API_BASE}/api/v1/userinfo");
+    let url = format!("{}/api/v1/userinfo", open_api_base(creds.global_region));
     let (status, body) = post_json(agent, &url, &build_auth_headers(creds), &serde_json::json!({}));
     if status != 200 {
         return (None, None);
@@ -846,7 +982,7 @@ pub fn need_plan_fetch(row_ok: bool, stored_plan: &str) -> bool {
 /// 实测响应：{"user_type":"personal_professional_trial","plan_tier_name":"Pro Trial",
 ///           "is_personal_version":true,"is_paid_plan":false,...,"end_date":1791673619906}
 pub fn fetch_plan(agent: &ureq::Agent, creds: &QoderCreds) -> (Option<String>, Option<String>, Option<i64>) {
-    let url = format!("{OPEN_API_BASE}/api/v2/user/plan");
+    let url = format!("{}/api/v2/user/plan", open_api_base(creds.global_region));
     let (status, body, _raw) = get_json(agent, &url, &build_auth_headers(creds));
     if status != 200 {
         return (None, None, None);
@@ -1569,6 +1705,53 @@ mod tests {
                 .is_none(),
             "空 machineToken 拒绝"
         );
+    }
+
+    /// 卸载表名字匹配：主客户端命中，"Qoder IDE"（VS Code 分叉，不带 umid）排除
+    #[test]
+    fn is_qoder_main_client_命中主客户端排除ide分叉() {
+        assert!(is_qoder_main_client("Qoder CN 0.4.8"));
+        assert!(is_qoder_main_client("qoder"));
+        assert!(is_qoder_main_client("Qoder 0.4.8"));
+        assert!(!is_qoder_main_client("Qoder IDE (User)"), "IDE 分叉不携带 umid，排除");
+        assert!(!is_qoder_main_client("Visual Studio"));
+        assert!(!is_qoder_main_client(""));
+    }
+
+    /// 卸载表字段 → 安装目录反推：InstallLocation / 引号 UninstallString / 裸路径
+    /// UninstallString / DisplayIcon 去 ",N" 索引，四类来源去重合并（2026-10-16 修复）
+    #[test]
+    fn install_dirs_from_uninstall_entry_四类来源去重() {
+        // 引号包裹 UninstallString + 尾部参数，父目录 = D:\Qoder CN
+        let dirs = install_dirs_from_uninstall_entry(
+            Some("D:\\Qoder CN\\"),
+            Some("\"D:\\Qoder CN\\Uninstall Qoder CN.exe\" /currentuser"),
+            Some("D:\\Qoder CN\\uninstallerIcon.ico"),
+        );
+        // InstallLocation 归一：尾反斜杠有无都落到同一目录名比较（此处不裁剪，原样）
+        assert!(dirs.iter().any(|d| d.to_string_lossy().contains("Qoder CN")), "{dirs:?}");
+        // DisplayIcon 与 InstallLocation 指向同一安装目录 → 去重生效，不产生 3 份
+        assert!(dirs.len() >= 1);
+        // 裸 UninstallString（无引号、带参数）：截到 .exe 为止取父目录
+        let bare = install_dirs_from_uninstall_entry(
+            None,
+            Some("E:\\Apps\\Qoder CN\\Uninstall Qoder CN.exe /S"),
+            None,
+        );
+        assert_eq!(
+            bare.first().map(|p| p.to_string_lossy().to_string()),
+            Some("E:\\Apps\\Qoder CN".to_string()),
+            "裸路径应截 .exe 并取父目录"
+        );
+        // DisplayIcon 带 ",0" 索引后缀也能解析父目录
+        let icon = install_dirs_from_uninstall_entry(None, None, Some("C:\\Program Files\\Qoder CN\\Qoder.exe,0"));
+        assert_eq!(
+            icon.first().map(|p| p.to_string_lossy().to_string()),
+            Some("C:\\Program Files\\Qoder CN".to_string())
+        );
+        // 三字段全空 → 无候选
+        assert!(install_dirs_from_uninstall_entry(None, None, None).is_empty());
+        assert!(install_dirs_from_uninstall_entry(Some("  "), Some(""), Some("")).is_empty());
     }
 
     /// R-6 抓包固化：clientId 为 PAT 派生的稳定 UUID 格式串

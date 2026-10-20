@@ -2,3 +2,11 @@ node_modules/
 dist/
 src-tauri/target/
 *.log
+tauri.dev.conf.json
+temp/
+backups/
+.tmp-screens/
+nul
+release/
+.workbuddy/
+.zcode/

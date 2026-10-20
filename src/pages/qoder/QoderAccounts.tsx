@@ -11,6 +11,7 @@ import {
   ExternalLink,
   Fingerprint,
   FolderCog,
+  ChevronDown,
   Globe,
   HelpCircle,
   History,
@@ -21,6 +22,7 @@ import {
   RefreshCw,
   ScanSearch,
   ShieldAlert,
+  Sparkles,
   Tags,
   Terminal,
   TerminalSquare,
@@ -113,6 +115,61 @@ function FingerprintBadge({ a, onOpen }: { a: QoderAccountView; onOpen: (a: Qode
   );
 }
 
+/** 免费档模型徽标 + 悬停明细（免费额度可见性）。
+ *
+ * 数据源：账号 free_models（目录 0 倍率模型快照，随积分刷新回写）。
+ * exhausted_at（额度错误码驱动记录）非空 → 标注「已用完（时刻）」，
+ * 是「哪个账号的免费模型还能用」的唯一可靠信号（官方无 API 可查剩余次数）。
+ * 未采集（free_models 为 null）显式显示「未采集」，区别于「无免费模型」。
+ */
+function FreeModelsCell({ a }: { a: QoderAccountView }) {
+  const models = a.free_models ?? null;
+  if (models == null) {
+    return (
+      <span className="text-xs text-slate-300 dark:text-zinc-600" title="尚未采集（首次积分刷新后回写）">
+        —
+      </span>
+    );
+  }
+  if (models.length === 0) {
+    return (
+      <span className="text-xs text-slate-300 dark:text-zinc-600" title="当前目录无 0 倍率（免费档）模型">
+        无
+      </span>
+    );
+  }
+  const exhausted = models.filter((m) => m.exhausted_at);
+  const title = [
+    ...models.map((m) => {
+      if (!m.exhausted_at) return `${m.name}（${m.region || '—'}）：可用`;
+      const reset = m.reset_at ? `，${m.reset_at} 恢复` : '';
+      return `${m.name}（${m.region || '—'}）：已用完 ${m.exhausted_at}${reset}`;
+    }),
+    a.free_models_fetched_at ? `刷新于 ${a.free_models_fetched_at}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+  const resetHint = exhausted
+    .map((m) => (m.reset_at ? `${m.name} ${m.reset_at.slice(5, 16)} 恢复` : ''))
+    .filter(Boolean)
+    .join('、');
+  // 展示口径对齐 Buddy 域：逐模型名称徽标（可用绿/已用完琥珀，悬停见详情），
+  // 不再只给 N/N 计数——两区免费档目录不同，模型名才是可执行信息
+  return (
+    <div className="flex flex-col items-start gap-0.5" title={title}>
+      {models.map((m) => (
+        <Badge key={`${m.region || 'cn'}:${m.id}`} tone={m.exhausted_at ? 'amber' : 'green'}>
+          <Sparkles size={10} className="mr-1" />
+          {m.name}
+        </Badge>
+      ))}
+      {resetHint && (
+        <span className="text-[10px] text-slate-400">{resetHint}</span>
+      )}
+    </div>
+  );
+}
+
 /** 快照大小异步格式化（对齐 SnapshotModal SizeText 模式） */
 function SizeText({ bytes }: { bytes: number }) {
   const [text, setText] = useState('');
@@ -168,6 +225,7 @@ export default function QoderAccounts() {
   const [fpViewing, setFpViewing] = useState<QoderAccountView | null>(null);
   // OAuth 设备流登录（进度弹窗；事件契约对齐 BuddyAccounts wb-oauth 模式）
   const [oauthRunning, setOauthRunning] = useState(false);
+  const [oauthRegionMenu, setOauthRegionMenu] = useState(false);
   // OAuth 兼容模式开关（2026-10-02 审查预案）：上次授权超时后置 true，下一次点击
   // 改用不带 client_id 的授权 URL；成功后复位。ref 而非 state：不触发重渲染
   const oauthCompatRef = useRef(false);
@@ -415,9 +473,10 @@ export default function QoderAccounts() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [snapBusy]);
 
-  const startOauth = async () => {
+  const startOauth = async (region: 'cn' | 'global' = 'cn') => {
     setOauthRunning(true);
     setOauthCanceling(false);
+    setOauthRegionMenu(false);
     // 兼容模式（上次授权超时后自动切换）：授权 URL 不带 client_id（预案见 qoder_oauth.rs）
     const compat = oauthCompatRef.current;
     setOauthMsg(compat ? '正在打开 Qoder 授权页（兼容模式）…' : '正在打开 Qoder 授权页…');
@@ -425,7 +484,9 @@ export default function QoderAccounts() {
     setOauthUrl(null);
     setShowOauth(true);
     try {
-      await api.qoder.oauthLogin(compat);
+      // 区域随登录入口盖章（2026-10-17 海外接入）：海外版走 qoder.com 授权页，
+      // 账号入池即标 global（免费档分区/网关分区全链路依据）
+      await api.qoder.oauthLogin(compat, region);
     } catch (err) {
       setOauthRunning(false);
       setOauthCanceling(false);
@@ -456,19 +517,13 @@ export default function QoderAccounts() {
     setScanningIde(true);
     try {
       const r = await api.qoder.ideScan();
-      // 审查修复：凭证落库失败时后端返回 imported/updated=true 且 reason 非空，
-      // success 分支须降级为 warn 展示 reason，否则错误仅 app.log 留痕、用户不可见
-      const credWarn = r.reason ? `，但${r.reason}` : '';
-      if (r.imported) {
-        const msg = `已从 IDE 本地存储导入账号：${r.nickname || r.account_id}${credWarn}`;
-        pushToast(credWarn ? 'warn' : 'success', msg);
-      } else if (r.updated) {
-        const msg = `IDE 登录态匹配已有账号，凭证已更新：${r.nickname || r.account_id}${credWarn}`;
-        pushToast(credWarn ? 'warn' : 'success', msg);
-      } else if (r.found) {
-        pushToast('info', r.reason || '已发现 IDE 登录态，无需变更');
+      // 双端扫描（2026-10-17）：国内 QoderCN + 海外 Qoder 各扫一份，reason 已含
+      // 逐端结论汇总；落库失败等告警也并入 reason，统一以汇总文案展示
+      if (r.found) {
+        const label = r.imported ? '扫描本地账号：新入池' : r.updated ? '扫描本地账号：凭证已更新' : '扫描本地账号：已在池';
+        pushToast(r.reason.includes('但') ? 'warn' : r.imported ? 'success' : 'info', `${label} — ${r.reason}`);
       } else {
-        pushToast('warn', r.reason || '未在 Qoder IDE 本地存储发现登录态');
+        pushToast('warn', r.reason || '未在 Qoder / QoderCN 本地存储发现登录态');
       }
       void refresh();
     } catch (err) {
@@ -785,14 +840,38 @@ export default function QoderAccounts() {
             <button onClick={() => void refresh()} className="btn-outline" disabled={loading}>
               <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> 刷新
             </button>
-            <button
-              className="btn-outline"
-              disabled={oauthRunning}
-              onClick={() => void startOauth()}
-              title="模拟客户端设备流：浏览器授权后自动获取 dt- 凭证入池"
-            >
-              {oauthRunning ? <Loader2 size={15} className="animate-spin" /> : <Globe size={15} />} OAuth登录
-            </button>
+            <div className="relative">
+              <button
+                className="btn-outline"
+                disabled={oauthRunning}
+                onClick={() => setOauthRegionMenu((v) => !v)}
+                title="模拟客户端设备流：浏览器授权后自动获取 dt- 凭证入池；选择登录区域（国内版 / 海外版）"
+              >
+                {oauthRunning ? <Loader2 size={15} className="animate-spin" /> : <Globe size={15} />} OAuth登录 <ChevronDown size={13} className="opacity-60" />
+              </button>
+              {oauthRegionMenu && (
+                <>
+                  {/* 透明遮罩：点击菜单外任意处关闭 */}
+                  <div className="fixed inset-0 z-10" onClick={() => setOauthRegionMenu(false)} />
+                  <div className="absolute left-0 top-full z-20 mt-1 w-56 overflow-hidden rounded-lg border border-slate-200 bg-white py-1 shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                    <button
+                      className="block w-full px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-100 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                      onClick={() => void startOauth('cn')}
+                    >
+                      <span className="font-medium">国内版登录</span>
+                      <span className="block text-xs text-slate-400">qoder.cn / openapi.qoder.com.cn</span>
+                    </button>
+                    <button
+                      className="block w-full px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-100 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                      onClick={() => void startOauth('global')}
+                    >
+                      <span className="font-medium">海外版登录</span>
+                      <span className="block text-xs text-slate-400">qoder.com / api3.qoder.sh（Global 区账号）</span>
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
             <button
               className="btn-outline"
               disabled={scanningIde || oauthRunning}
@@ -927,6 +1006,12 @@ export default function QoderAccounts() {
                   <th className="px-4 py-2 text-left">Token 状态</th>
                   <th className="px-4 py-2 text-left">设备指纹</th>
                   <th className="px-4 py-2 text-right">积分余额</th>
+                  <th
+                    className="px-4 py-2 text-left"
+                    title="免费档模型（目录 0 倍率）：显示可用状态；额度耗尽由上游错误码驱动标注"
+                  >
+                    免费模型
+                  </th>
                   <th className="px-4 py-2 text-right">操作</th>
                 </tr>
               </thead>
@@ -941,6 +1026,11 @@ export default function QoderAccounts() {
                     <td className="px-4 py-3">
                       <div className="flex flex-wrap items-center gap-1.5">
                         <span className="font-medium">{a.nickname || a.id}</span>
+                        {a.region === 'global' && (
+                          <Badge tone="violet" title="海外区账号（api3.qoder.sh 网关）">
+                            海外
+                          </Badge>
+                        )}
                         {/* 客户端当前登录标记：本机 auth.v1.dat/state.vscdb 解密 uid 与池匹配（对齐 Trae 双徽标） */}
                         {liveLogins?.work && (a.id === liveLogins.work || a.uid === liveLogins.work) && (
                           <Badge tone="violet" title="当前 Qoder Work 客户端登录的账号">
@@ -986,6 +1076,9 @@ export default function QoderAccounts() {
                     <td className="px-4 py-3"><FingerprintBadge a={a} onOpen={setFpViewing} /></td>
                     <td className="px-4 py-3 text-right tabular-nums text-xs">
                       {a.credits_balance != null ? a.credits_balance.toLocaleString() : '-'}
+                    </td>
+                    <td className="px-4 py-3">
+                      <FreeModelsCell a={a} />
                     </td>
                     <td className="px-4 py-3 text-right">
                       <div className="flex justify-end gap-1">

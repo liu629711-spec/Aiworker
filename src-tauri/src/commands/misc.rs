@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 
 use crate::jwt;
-use crate::models::{CreditRecord, DeviceMap, Settings};
+use crate::models::{CreditRecord, Settings};
 use crate::state::AppState;
 use crate::store::migrate::TraeWorkMigrationReport;
 
@@ -19,11 +19,14 @@ pub const INVITE_LINK: &str =
 
 #[tauri::command]
 pub fn device_reset(state: State<AppState>, user_id: String) -> Result<(), String> {
-    // SQLite 化（P3）：device_map.json → device_map 表
+    // SQLite 化（P3）：device_map.json → device_map 表。
+    // 持锁读改写（2026-10-19 修正）：旧版在锁外 load→save，与 OAuth 回写/
+    // 签到写回并发时用旧快照整表覆盖，丢别人刚写入的设备指纹条目。
     let store = crate::store::db(&state.data_dir);
-    let mut map: DeviceMap = crate::store::docs::device_map_load(&store);
-    map.remove(&user_id);
-    crate::store::docs::device_map_save(&store, &map)?;
+    crate::store::docs::with_device_map(&store, |map| {
+        map.remove(&user_id);
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -715,10 +718,48 @@ pub fn logs_clear(state: State<AppState>, log_type: String) -> Result<u32, Strin
             Err(e) => return Err(format!("删除 {fname} 失败: {e}")),
         }
     }
+    // proxy_req_*.log 及轮转分片（2026-10-19 补）：抓包流水只有 100MB 分片滚动、
+    // 无按日期删除，实测可累积到 212MB/11 个文件，而此前清理清单完全不覆盖它，
+    // 用户没有任何 UI 出口可回收这块磁盘。
+    if log_type == "all" || log_type == "proxy_req" {
+        removed += remove_proxy_req_logs(&state.path("logs"))?;
+    }
     crate::fs_utils::app_log(
         &state.data_dir,
         &format!("已清理日志: {log_type}（删除 {removed} 个文件）"),
     );
+    Ok(removed)
+}
+
+/// 删除 logs/ 下的全部 `proxy_req_*.log`（含同日轮转分片 `.log.N`）。
+/// 抓包流水由 device_proxy 的 logger 每 100MB 换一个分片序号持续追加，
+/// 本身没有保留期概念——用户点「清理」即视为全部可回收。
+/// 返回删除的文件数；单文件删除失败（占用中/权限）记跳过不中断，
+/// 由返回值如实反映实际清理量。
+fn remove_proxy_req_logs(log_dir: &std::path::Path) -> Result<u32, String> {
+    let mut removed = 0u32;
+    let rd = match std::fs::read_dir(log_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(format!("读取日志目录失败: {e}")),
+    };
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // 与 proxy_logs 列表同口径：proxy_req_ 前缀 + .log / .log.N 后缀
+        let is_target = name.starts_with("proxy_req_")
+            && (name.ends_with(".log")
+                || name.rsplit('.').next().map(|s| s.chars().all(|c| c.is_ascii_digit()) && s.len() <= 4).unwrap_or(false)
+                    && name.contains(".log."));
+        if !is_target {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => continue, // 占用中/无权限：跳过，不影响其余文件
+        }
+    }
     Ok(removed)
 }
 

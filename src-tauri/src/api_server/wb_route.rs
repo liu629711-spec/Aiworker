@@ -50,6 +50,114 @@ fn now_ts() -> i64 {
         .unwrap_or(0)
 }
 
+/// 记录「免费模型额度耗尽」到账号池（免费额度可见性，Buddy 域，对齐 Qoder 侧
+/// `note_free_quota_exhausted`）。
+///
+/// 触发：某账号在某模型上命中额度类错误（HardCredit）且该模型属免费档
+/// （目录 rate=0，实测 hy3 / step-5-preview）。写入 wb_accounts 行的
+/// `free_models[].exhausted_at`（耗尽时刻）与 `reset_at`（下次恢复时刻，
+/// 从上游限额文案解析——WB 6004 类文案含「将在 YYYY-MM-DD HH:MM:SS UTC+8 重置」），
+/// 供账号页显示「已用完（时刻，X 后恢复）」——回答「多个号池里哪个号在这个
+/// 免费模型上还有额度」。
+///
+/// 只在免费档模型上记录：付费模型额度不足属常规冷却（HardCredit 已有恢复机制），
+/// 标成「免费模型额度用完」会误导。目录加载失败由 free_models 内部回退内置表兜底。
+fn note_free_model_exhausted(data_dir: &std::path::Path, uid: &str, model: &str, msg: Option<&str>) {
+    // 命中判定：账号既有快照为主（该账号已采集过的免费模型清单），目录现查为辅
+    //（快照尚未生成的首轮场景）——两侧任一命中即认定为免费模型
+    let store = crate::store::db(data_dir);
+    let in_snapshot = crate::store::docs::wb_pool_load(&store)
+        .get("accounts")
+        .and_then(Value::as_array)
+        .and_then(|accs| {
+            accs.iter()
+                .find(|a| a.get("id").and_then(Value::as_str) == Some(uid))
+        })
+        .and_then(|a| a.get("free_models"))
+        .and_then(Value::as_array)
+        .map(|models| {
+            models.iter().any(|m| {
+                m.get("id")
+                    .and_then(Value::as_str)
+                    .map(|id| id.eq_ignore_ascii_case(model))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    let in_catalog = super::wb_catalog::free_models(data_dir).iter().any(|m| {
+        m.get("id")
+            .and_then(Value::as_str)
+            .map(|id| id.eq_ignore_ascii_case(model))
+            .unwrap_or(false)
+    });
+    if !in_snapshot && !in_catalog {
+        return;
+    }
+    // 持池锁读-改-写（与 credits 回写同锁域，防整池覆盖丢写）
+    let _g = crate::store::docs::wb_pool_rmw_lock();
+    let mut pool = crate::store::docs::wb_pool_load(&store);
+    let Some(accounts) = pool.get_mut("accounts").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let Some(a) = accounts
+        .iter_mut()
+        .find(|a| a.get("id").and_then(Value::as_str) == Some(uid))
+    else {
+        return;
+    };
+    let now = crate::fs_utils::now_iso()[..19].replace('T', " ");
+    // 快照不存在时按目录现查先建清单（首轮场景：请求先于采集到达）
+    if a.get("free_models").and_then(Value::as_array).is_none() {
+        let fresh = super::wb_catalog::free_models(data_dir);
+        if !fresh.is_empty() {
+            a["free_models"] = json!(fresh);
+            a["free_models_fetched_at"] = json!(crate::fs_utils::now_iso());
+        }
+    }
+    let mut updated = false;
+    // 恢复时刻（可选）：上游限额文案携带精确重置时间（parse_quota_reset_at）
+    let reset_at = msg.and_then(parse_quota_reset_at);
+    if let Some(models) = a.get_mut("free_models").and_then(Value::as_array_mut) {
+        for m in models.iter_mut() {
+            let hit = m
+                .get("id")
+                .and_then(Value::as_str)
+                .map(|id| id.eq_ignore_ascii_case(model))
+                .unwrap_or(false);
+            if hit {
+                m["exhausted_at"] = json!(now);
+                if let Some(ts) = reset_at {
+                    // Unix 秒 → "YYYY-MM-DD HH:MM:SS"（UTC+8，与 exhausted_at 同形态）
+                    use chrono::TimeZone;
+                    let txt = chrono::FixedOffset::east_opt(8 * 3600)
+                        .and_then(|cn| cn.timestamp_opt(ts, 0).single())
+                        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string());
+                    if let Some(txt) = txt {
+                        m["reset_at"] = json!(txt);
+                    }
+                }
+                updated = true;
+                break;
+            }
+        }
+    }
+    if updated {
+        let _ = crate::store::docs::wb_pool_save(&store, &pool);
+        crate::fs_utils::app_log(
+            data_dir,
+            &format!("buddy: 免费模型额度耗尽已记录 uid={uid} model={model} at={now}"),
+        );
+        // 免费用量计数联动（额度中心）：计数归零 + 恢复时间
+        let reset_txt = reset_at.and_then(|ts| {
+            use chrono::TimeZone;
+            chrono::FixedOffset::east_opt(8 * 3600)
+                .and_then(|cn| cn.timestamp_opt(ts, 0).single())
+                .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+        });
+        super::free_usage::mark_exhausted(data_dir, "buddy", uid, model, reset_txt.as_deref());
+    }
+}
+
 /// 生成上游 conversation_id（粘性绑定的第二段：客户端会话 → 上游会话）
 pub(crate) fn gen_conv_id() -> String {
     let nanos = std::time::SystemTime::now()
@@ -69,6 +177,12 @@ pub(crate) fn gen_conv_id() -> String {
 
 // ==================== 模型级冷却（T2.7/F-34） ====================
 
+/// 匿名路径模型级冷却上限（修复3）：uid 未归因时即便上游文案带「次日重置」
+/// 精确时刻，全局模型锁也封顶 10 分钟——不可归因的日额度语义本属账号级冻结
+///（uid 已知路径走 pool.cooldown_until 到精确时刻），模型级长锁只会整池停摆
+///（实测旧版锁 19 小时，期间全部请求调度层 1ms 秒拒 429）。
+const MODEL_COOLDOWN_MAX_SECS: i64 = 600;
+
 /// 模型是否处于冷却中；返回剩余秒数
 pub fn model_cooling_remaining(state: &ApiSharedState, model: &str) -> Option<i64> {
     let map = safe_lock(&state.model_cooldowns);
@@ -81,30 +195,67 @@ pub fn model_cooling_remaining(state: &ApiSharedState, model: &str) -> Option<i6
     }
 }
 
-/// 记录一次模型级失败：渐进退避 10→20→40s（封顶 40s，成功请求后清除）。
-/// 带错误消息时先尝试解析精确恢复时刻（note_model_failure_ex）。
-pub fn note_model_failure(state: &ApiSharedState, model: &str) {
-    note_model_failure_ex(state, model, None);
+/// 429 文案是否明示「仅该模型受限，可切换其他模型继续使用」——上游语义为
+/// **模型级**限频，账号本身健康。SoftRate 遇到此类文案不得整号冷却：
+/// 单账号区域池（海外 Buddy 仅 1 号）会被一个模型的限流毒死成整池 503，
+/// 且 step-5-preview/hy3 等无关模型一并冻结（2026-10-19 实测 deepseek-v4.1-flash
+/// 429 → 全海外池不可用）。模型级冷却交 note_account_model_failure 按
+/// (uid, model) 记录；账号级日额度（不带「可切换」文案）仍走整号冷却。
+/// 与 note_account_model_failure 的 per_model 判定同源（同一对文案短语）。
+pub(crate) fn soft_rate_model_only(msg: &str) -> bool {
+    msg.contains("切换其他模型") || msg.contains("switch to the other model")
 }
 
-/// 记录一次模型级失败（带可选上游错误消息）：
+/// 记录一次模型级失败：渐进退避 10→20→40s（封顶 40s，成功请求后清除）。
+/// 带错误消息时先尝试解析精确恢复时刻（note_account_model_failure）。
+pub fn note_model_failure(state: &ApiSharedState, model: &str) {
+    note_account_model_failure(state, model, None, None);
+}
+
+/// 记录一次失败（带可选上游错误消息与涉事账号 uid）：
 /// ① 消息含「将在 YYYY-MM-DD HH:MM:SS UTC+8 重置」文案（WB 6004 限额，agent2api
-///    errors.rs 情报互证 2026-10-03）→ 冷却至精确恢复时刻（钳制 ≤7 天防异常值）；
-/// ② 解析失败/无消息 → 既有渐进退避。后续不可解析的失败取「渐进退避 vs 既有
-///    冷却截止」的较大者——账号实际仍被限额到恢复时刻，不能被 10s 渐进值缩短。
-pub fn note_model_failure_ex(state: &ApiSharedState, model: &str, msg: Option<&str>) {
+///    errors.rs 情报互证 2026-10-03）→ 这是**账号级日额度**而非全池故障：只把该账号
+///    冻结到恢复时刻（`cooldown_until`，取号 `healthy` 自然排除），**不设模型级冷却**
+///    ——下一个请求立刻由池内其他账号顶上。修复旧版「一个账号爆量 → 整个模型全局
+///    冷却 19 小时、之后所有账号的请求都在调度层被快速 429」的停摆问题；
+/// ② 解析失败/无消息 → 既有模型级渐进退避（取「渐进退避 vs 既有冷却截止」较大者）。
+/// `uid` 为 None 时（匿名/未取号路径）退回模型级旧语义（冷却到精确恢复时刻）。
+pub fn note_account_model_failure(
+    state: &ApiSharedState,
+    model: &str,
+    msg: Option<&str>,
+    uid: Option<&str>,
+) {
+    if let Some(ts) = msg.and_then(parse_quota_reset_at) {
+        if let Some(uid) = uid {
+            // 区分两种限额语义（用户实测 6004 诉求）：
+            // ① 文案含「切换其他模型继续使用」(中英两形) = 上游明示**仅该模型**
+            //    频率受限，其他模型（含积分模型）照常可用 → 按 (uid, model) 冻结；
+            // ② 否则为账号级日额度（不带可切换语义）→ 整号冻结到恢复时刻。
+            // 一刀切按模型会让真·日额度账号的其他模型继续被选中、反复 429。
+            let per_model = msg.map(soft_rate_model_only).unwrap_or(false);
+            if per_model {
+                state.wb_pool.per_model_cooldown_until(uid, model, ts);
+            } else {
+                state.wb_pool.cooldown_until(uid, ts);
+            }
+            return;
+        }
+        // 匿名/未取号路径：只能按模型降级冷却（不能绑定具体 uid）。
+        // 封顶到 [MODEL_COOLDOWN_MAX_SECS] 防止停摆，同时允许后续调用走
+        // note_account_model_failure_by_model(uid) 做更细粒度的逐账号解冻。
+        let mut map = safe_lock(&state.model_cooldowns);
+        let (prev_until, fails) = map.get(model).copied().unwrap_or((0, 0));
+        let until = ts.min(now_ts() + MODEL_COOLDOWN_MAX_SECS).max(prev_until);
+        map.insert(model.to_string(), (until, fails + 1));
+        return;
+    }
     let mut map = safe_lock(&state.model_cooldowns);
     let (prev_until, fails) = map.get(model).copied().unwrap_or((0, 0));
     let fails = fails + 1;
     let now = now_ts();
-    let until = match msg.and_then(parse_quota_reset_at) {
-        Some(ts) => ts,
-        None => {
-            let delay = 10i64 << (fails - 1).min(2); // 10/20/40
-            (now + delay).max(prev_until)
-        }
-    };
-    map.insert(model.to_string(), (until, fails));
+    let delay = 10i64 << (fails - 1).min(2); // 10/20/40
+    map.insert(model.to_string(), ((now + delay).max(prev_until), fails));
 }
 
 /// 从限额文案解析精确恢复时刻（agent2api parse_quota_reset_at 同源语义）：
@@ -122,25 +273,44 @@ pub(crate) fn parse_quota_reset_at(msg: &str) -> Option<i64> {
         let anchor = msg[from..].find("UTC+8")? + from;
         from = anchor + "UTC+8".len();
         if anchor >= DT_LEN {
-            // 从锚点紧前方回扫，最多 48 字节（文案前缀长度）
+            // 在锚点紧前方扫描日期时间（最多 48 字节前缀）。**双向扫描**：锚点与时刻
+            // 之间的间距上游不固定——中文「将在 X UTC+8」紧邻，英文「... reset at
+            // X UTC+8」中间隔一个空格。只往回扫会漏掉 `anchor-DT_LEN` 右侧的合法
+            // 起点（2026-10-18 实测：WB 6004 英文频率限额文案漏解析 → 账号只吃到
+            // 60s 短冷却而非官方 reset 时刻，冷却结束后继续打上游连续 429）。
             let start_limit = anchor.saturating_sub(48);
-            let mut i = anchor - DT_LEN;
+            let ideal = anchor.saturating_sub(DT_LEN);
+            // ① 向左回扫（间距 < DT_LEN 的文案形态）
+            let mut i = ideal;
             loop {
                 if let Some(ts) = try_parse_dt(bytes, i) {
-                    let now = now_ts();
-                    // 未来且 ≤7 天才可信（解析到过去时刻/异常远期 = 该时刻不是恢复时刻）
-                    if ts > now && ts - now <= 7 * 24 * 3600 {
+                    if future_within_week(ts) {
                         return Some(ts);
                     }
-                    break; // 此锚点解析出的时刻不可信 → 换下一个锚点
                 }
                 if i == start_limit {
                     break;
                 }
                 i -= 1;
             }
+            // ② 向右扫（间距 ≥ DT_LEN，即锚点前不止一个分隔符）
+            let mut j = ideal + 1;
+            while j + DT_LEN <= anchor {
+                if let Some(ts) = try_parse_dt(bytes, j) {
+                    if future_within_week(ts) {
+                        return Some(ts);
+                    }
+                }
+                j += 1;
+            }
         }
     }
+}
+
+/// 未来且 ≤7 天才可信（解析到过去时刻/异常远期 = 该时刻不是恢复时刻）
+fn future_within_week(ts: i64) -> bool {
+    let now = now_ts();
+    ts > now && ts - now <= 7 * 24 * 3600
 }
 
 /// 在 bytes[i..] 处匹配 `dddd-dd-dd dd:dd:dd` 并按 UTC+8 解析为 Unix 秒
@@ -221,6 +391,13 @@ pub fn load_templates(state: &ApiSharedState) -> Vec<(String, String)> {
 /// message 关键词判定（积分耗尽标记词表集中维护，F-33）
 pub fn classify_wb_error(code: i64, msg: &str) -> ErrKind {
     let lower = msg.to_lowercase();
+    // 11133/400001「request parameters were rejected by the model provider」
+    // （input_invalid）：上游对**请求内容**的拒绝，与账号健康无关。此前落
+    // Client（10 分钟冷却 + 计 err_count），buddy 池仅一个健康号时会连续
+    // 熔断整池——错误分类应是 None（不冷却、不计数），由调用方原样透传客户端。
+    if code == 11133 || lower.contains("request parameters were rejected") {
+        return ErrKind::None;
+    }
     if code == 401 || lower.contains("unauthorized") || lower.contains("token expired") {
         return ErrKind::SessionDead;
     }
@@ -230,11 +407,27 @@ pub fn classify_wb_error(code: i64, msg: &str) -> ErrKind {
     if lower.contains("insufficient credit")
         || lower.contains("积分不足")
         || lower.contains("额度不足")
-        || lower.contains("quota exceeded")
     {
         return ErrKind::HardCredit;
     }
-    if code == 429 || lower.contains("rate") || lower.contains("too many") || lower.contains("限频") {
+    if code == 429
+        // 限流词收窄（2026-10-20）：裸 "rate" 子串会命中 prepare/separate/
+        // generated/moderation 等普通英文单词，把无关错误判成限频并给账号加
+        // rate_trips（退避翻倍到 30 分钟）。限频只认明确的 rate limit 语汇。
+        || lower.contains("rate limit")
+        || lower.contains("rate-limit")
+        || lower.contains("ratelimit")
+        || lower.contains("too many")
+        || lower.contains("限频")
+        || lower.contains("频率")
+        // P0-2 口径统一：英文 "quota exceeded" 与 HTTP 路径（mod.rs
+        // is_credit_exhausted_error 有意排除该词）、Trae 4008 一致归频率限流。
+        // 6004「使用量已超出频率限制…可切换其他模型」正是此类——整号 HardCredit
+        // 冻结到次日 04:00 会误杀同账号的积分模型，精确冻结由并行的
+        // note_account_model_failure 按重置时刻/按模型语义负责。
+        || lower.contains("quota exceeded")
+        || lower.contains("usage limit")
+    {
         return ErrKind::SoftRate;
     }
     if code >= 500 {
@@ -301,6 +494,7 @@ fn race_first_byte(
     tried: &HashSet<String>,
     allowed: Option<&HashSet<String>>,
     dedicated: Option<&str>,
+    want_global: Option<bool>,
 ) -> Result<RaceWin, ()> {
     let hedge_ms = state.wb_hedge_threshold_ms.load(std::sync::atomic::Ordering::Relaxed);
     if hedge_ms == 0 {
@@ -315,11 +509,12 @@ fn race_first_byte(
     let tried2 = tried.clone();
     let allowed2 = allowed.cloned();
     let dedicated2 = dedicated.map(str::to_string);
+    let want_global2 = want_global;
     let body = converted.to_vec();
     let spawn_backup = move || -> Option<(Box<dyn Read + Send>, HedgeLease)> {
         let (picked2, ev) = state2
             .wb_pool
-            .pick_excluding_constrained_ev(&tried2, allowed2.as_ref(), dedicated2.as_deref())?;
+            .pick_excluding_constrained_ev_region(&tried2, allowed2.as_ref(), dedicated2.as_deref(), want_global2)?;
         // F-77⑤ 可观测：对冲取号同样记录 busy 让位/降级事件
         if let Some(ev) = ev {
             state2.logger.log_sched_event(&ev);
@@ -509,10 +704,16 @@ fn run_wb_stream(
     // issue #25 资源池绑定：仅当 Key 约束作用域含 buddy 池时应用（绑定 trae 的
     // Key 白名单指 Trae 账号，不得误过滤 WB 池）。
     // issue #30 混合白名单：按前缀作用域提取 Buddy 条目（空集 = 排除，不得过滤）
-    let (allowed_set, dedicated) = super::api_keys::constraints_for(&state.data_dir, key_id)
+    let (allowed_set, dedicated, key_want) = super::api_keys::constraints_for(&state.data_dir, key_id)
         .and_then(|k| k.pool_constraints("buddy"))
-        .map_or((None, None), |c| (c.allowed, c.dedicated));
+        .map_or((None, None, None), |c| (c.allowed, c.dedicated, c.want_global));
 
+    // 区域判定（国内/海外号池隔离）：按模型所属区取本区账号——国内模型不出
+    // 海外号、海外模型不出国内号（上游按账号区校验模型权限，跨区必失败）。
+    // 未知模型（不在目录）不过滤，保持旧透传语义。
+    // Key 区域约束（2026-10-17 海外接入）显式覆盖模型推导：国内号池用国内 Key、
+    // 海外号池用海外 Key 的硬隔离手段
+    let want_global = key_want.or_else(|| super::wb_catalog::region_of(&state.data_dir, model));
     // 粘性首轮：命中绑定且账号 healthy → 锁定账号与上游会话（双段分配）；
     // 子 Key 限定上游不含粘性账号时忽略粘性
     let sticky0: Option<(String, String)> = state
@@ -524,7 +725,7 @@ fn run_wb_stream(
             }
             state
                 .wb_pool
-                .pick_by_uid(&b.uid)
+                .pick_by_uid_region(&b.uid, want_global)
                 .map(|_| (b.uid, b.conv_id))
         });
     let sticky_uid: Option<String> = sticky0.as_ref().map(|(u, _)| u.clone());
@@ -532,13 +733,28 @@ fn run_wb_stream(
         .as_ref()
         .map(|(_, c)| c.clone())
         .unwrap_or_default();
+    // T5.3 按模型冷却（上游 6004「可切换其他模型继续使用」）：被限的只是
+    // 该账号在这个模型上的额度，其他模型（含积分）照常可用。
+    // 实现要点（2026-10-19 修正）：冷却是**状态**，tried 是「本轮已试过且失败」
+    // 的**事件**集合，两者不能混。旧版把 model_cooled 预注入 tried，池内仅剩
+    // 一个账号时会把唯一账号也排除 → 假 503 no_healthy_account（账号明明是
+    // 健康的，只是这一个模型在冷却）。现在改为取到号之后再判断：
+    // 该模型冷却中 + 池内确有其他备选 → 记入 tried 换号；
+    // 该模型冷却中 + 无其他备选 → **放行**，让上游自己决定是否拒绝。
+    // 冷却名单（可观测/诊断）仍保留，但不参与取号过滤。
+    let model_cooled: HashSet<String> =
+        state.wb_pool.model_cooled_uids(&model).into_iter().collect();
+
     // 首选：粘性 > 专一绑定 > 调度策略（F-77④：粘性账号 busy 且有空闲候选时让位）
     let mut first_pick: Option<PickedAccount> = sticky0
         .as_ref()
         .and_then(|(u, _)| {
+            if model_cooled.contains(u.as_str()) {
+                return None;
+            }
             state
                 .wb_pool
-                .pick_sticky_yield(u, allowed_set.as_ref())
+                .pick_sticky_yield_region(u, allowed_set.as_ref(), want_global)
                 .map(|(p, ev)| {
                     if let Some(ev) = ev {
                         state.logger.log_sched_event(&ev);
@@ -546,8 +762,13 @@ fn run_wb_stream(
                     p
                 })
         })
-        .or_else(|| dedicated.as_deref().and_then(|uid| state.wb_pool.pick_by_uid(uid)));
+        .or_else(|| {
+            dedicated
+                .as_deref()
+                .and_then(|uid| state.wb_pool.pick_by_uid_region(uid, want_global))
+        });
 
+    // tried 只装「本轮已试过且失败」的账号（原语义）；按模型冷却在取到号后判断
     let mut tried: HashSet<String> = HashSet::new();
     let mut refreshed: HashSet<String> = HashSet::new(); // 401 刷新每账号一次
     let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
@@ -565,7 +786,10 @@ fn run_wb_stream(
         // ── 取号：粘性/专一命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
         let picked = match first_pick.take() {
             Some(p) => p,
-            None => match state.wb_pool.pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref()) {
+            None => match state
+                .wb_pool
+                .pick_excluding_constrained_ev_region(&tried, allowed_set.as_ref(), dedicated.as_deref(), want_global)
+            {
                 Some((p, ev)) => {
                     // F-77⑤ 可观测：busy_yield / busy_fallback 调度事件
                     if let Some(ev) = ev {
@@ -579,7 +803,9 @@ fn run_wb_stream(
                     // 审查 P2：轮换耗尽收尾对齐 routes.rs（issue #57 可观测）——
                     // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
                     // wb_template_map.json），否则维持原文案；code 保持 no_healthy_account
-                    let (healthy_total, _) = state.wb_pool.selectable_stats_in(None);
+                    let (healthy_total, _) = state
+                        .wb_pool
+                        .selectable_stats_in_region(None, want_global);
                     let (exhaust_msg, exhaust_tag) =
                         super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
                     state.logger.log_request(
@@ -617,6 +843,23 @@ fn run_wb_stream(
                 }
             },
         };
+        // T5.3 按模型冷却判定（取到号之后）：该账号只是**这个模型**被上游限流，
+        // 账号本身健康、其他模型照常可用。因此仅当池内确有其他账号能顶上时才
+        // 换号；否则放行——否则等于把账号停了，表现为假 503。
+        if state.wb_pool.is_model_cooling(&picked.uid, model)
+            && state.wb_pool.has_other_selectable_for_model(
+                &picked.uid,
+                allowed_set.as_ref(),
+                want_global,
+            )
+        {
+            state.logger.log_sched_event(&format!(
+                "model_cooldown_skip uid={} model={} (池内有其他账号顶上)",
+                picked.uid, model
+            ));
+            tried.insert(picked.uid.clone());
+            continue;
+        }
         tried.insert(picked.uid.clone());
         // F-77 账号级在途计数：取号即绑定（重试换号时 bind_account 自动解绑旧账号）。
         // 审查 P1-4 TOCTOU 收紧：普通候选 CAS 复核「在途 < 并发上限」，已满则
@@ -684,6 +927,7 @@ fn run_wb_stream(
                         &tried,
                         allowed_set.as_ref(),
                         dedicated.as_deref(),
+                        want_global,
                     ) {
                         Ok(w) => w,
                         Err(()) => {
@@ -749,8 +993,20 @@ fn run_wb_stream(
                             }
                             let kind = classify_wb_error(code, &msg);
                             if kind != ErrKind::None {
-                                state.wb_pool.note_error(win_uid, kind);
-                                note_model_failure_ex(state, model, Some(&msg));
+                                // 模型级 429（「可切换其他模型」文案）不整号冷却：
+                                // 单账号区域池会被一个模型的限流毒死成整池 503
+                                if !(kind == ErrKind::SoftRate && soft_rate_model_only(&msg)) {
+                                    state.wb_pool.note_error(win_uid, kind);
+                                }
+                                note_account_model_failure(state, model, Some(&msg), Some(win_uid));
+                                // 免费模型额度耗尽记录（免费额度可见性）：额度类错误
+                                // 是「账号×模型」维度的事实，池冷却只按账号记，
+                                // 「哪个号在这个免费模型上还有额度」此前无观测
+                                if kind == ErrKind::HardCredit {
+                                    note_free_model_exhausted(
+                                        &state.data_dir, win_uid, model, Some(&msg),
+                                    );
+                                }
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} code={} msg={}", win_uid, code, msg));
                                 // issue #67：硬冷却/禁用类错误解绑该账号粘性
@@ -835,8 +1091,18 @@ fn run_wb_stream(
                             );
                         }
                     }
-                    // 分级重试策略表（T2.2/F-33 v1.2）
-                    match retry_plan(status, &resp_body, same_attempt, retry_after) {
+                    // 分级重试策略表（T2.2/F-33 v1.2）。
+                    // 429 且文案带精确重置时刻 = 日额度/频率已耗尽，重试无意义
+                    // （同非流式路径注释）：直接换号，由后续 note_account_model_failure
+                    // 把该账号冻结到上游给出的时刻。
+                    let retry_action = if status == 429
+                        && parse_quota_reset_at(&resp_body).is_some()
+                    {
+                        RetryAction::SwitchKey
+                    } else {
+                        retry_plan(status, &resp_body, same_attempt, retry_after)
+                    };
+                    match retry_action {
                         RetryAction::RetrySame { delay_ms } => {
                             same_attempt += 1;
                             std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(60_000)));
@@ -872,12 +1138,29 @@ fn run_wb_stream(
                                 }
                             }
                             let kind = classify_error(status, &resp_body);
-                            state.wb_pool.note_error(&picked.uid, kind);
+                            // ErrKind::None（如 4001 模型配置缺失）属请求/模型级问题，
+                            // 与账号健康无关——不计入账号失败，防全池被同号模型错误连坐熔断
+                            // 模型级 429（「可切换其他模型」文案）不整号冷却（同流内路径）
+                            if kind != ErrKind::None
+                                && !(kind == ErrKind::SoftRate
+                                    && upstream_msg(&resp_body)
+                                        .as_deref()
+                                        .is_some_and(|m| soft_rate_model_only(m)))
+                            {
+                                state.wb_pool.note_error(&picked.uid, kind);
+                            }
                             // issue #67：硬冷却/禁用类错误解绑该账号粘性
                             if kind.unbinds_sticky() {
                                 state.wb_sticky.unbind_uid(&picked.uid);
                             }
-                            note_model_failure_ex(state, model, upstream_msg(&resp_body).as_deref());
+                            note_account_model_failure(state, model, upstream_msg(&resp_body).as_deref(), Some(&picked.uid));
+                            // 免费模型额度耗尽记录（免费额度可见性）：非流式路径
+                            if kind == ErrKind::HardCredit {
+                                note_free_model_exhausted(
+                                    &state.data_dir, &picked.uid, model,
+                                    upstream_msg(&resp_body).as_deref(),
+                                );
+                            }
                             *safe_lock(&state.last_error) = Some(format!(
                                 "wb uid={} status={} body={}",
                                 picked.uid,
@@ -894,6 +1177,15 @@ fn run_wb_stream(
                         }
                         RetryAction::Fatal => {
                             let msg = format!("upstream {} error: {}", status, safe_slice(&resp_body, 300));
+                            // Fatal 只代表「本次请求换号无意义」，不等于账号没问题：
+                            // 若报文里带着精确重置时刻（额度类 4xx 也常这么写），仍要把
+                            // 该账号冻结到上游给的时刻，否则下一次请求会重新选中它、再
+                            // Fatal 一次（审计发现此前 Fatal 分支完全不记录账号状态）。
+                            note_account_model_failure(
+                                state, model,
+                                upstream_msg(&resp_body).as_deref(),
+                                Some(&picked.uid),
+                            );
                             // 终态记账对齐 SwitchKey/耗尽收尾（审查 F3）：Fatal 是请求
                             // 终局，此前仅 log_request 导致用量统计页缺口
                             state.record_usage(true, model, &picked.uid, key_id, false, true,
@@ -943,10 +1235,12 @@ pub async fn wb_aggregate_chat(
         let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
 
         // F-35 子 Key 约束（与非流式同款；issue #30 混合白名单按前缀作用域分池）
-        let (allowed_set, dedicated) = super::api_keys::constraints_for(&state.data_dir, &key_id)
+        let (allowed_set, dedicated, key_want) = super::api_keys::constraints_for(&state.data_dir, &key_id)
             .and_then(|k| k.pool_constraints("buddy"))
-            .map_or((None, None), |c| (c.allowed, c.dedicated));
+            .map_or((None, None, None), |c| (c.allowed, c.dedicated, c.want_global));
 
+        // 区域判定（国内/海外号池隔离，同流式路径）；Key 区域约束显式覆盖
+        let want_global = key_want.or_else(|| super::wb_catalog::region_of(&state.data_dir, &model));
         let sticky0: Option<(String, String)> = state
             .wb_sticky
             .resolve(&sticky_key, now_ts())
@@ -956,10 +1250,13 @@ pub async fn wb_aggregate_chat(
                 }
                 state
                     .wb_pool
-                    .pick_by_uid(&b.uid)
+                    .pick_by_uid_region(&b.uid, want_global)
                     .map(|_| (b.uid, b.conv_id))
             });
         let sticky_uid: Option<String> = sticky0.as_ref().map(|(u, _)| u.clone());
+        // T5.3：按模型冷却预注入 tried
+        let model_cooled: HashSet<String> =
+            state.wb_pool.model_cooled_uids(&model).into_iter().collect();
         let sticky_conv: String = sticky0
             .as_ref()
             .map(|(_, c)| c.clone())
@@ -969,7 +1266,7 @@ pub async fn wb_aggregate_chat(
             .and_then(|(u, _)| {
                 state
                     .wb_pool
-                    .pick_sticky_yield(u, allowed_set.as_ref())
+                    .pick_sticky_yield_region(u, allowed_set.as_ref(), want_global)
                     .map(|(p, ev)| {
                         if let Some(ev) = ev {
                             state.logger.log_sched_event(&ev);
@@ -977,7 +1274,11 @@ pub async fn wb_aggregate_chat(
                         p
                     })
             })
-            .or_else(|| dedicated.as_deref().and_then(|uid| state.wb_pool.pick_by_uid(uid)));
+            .or_else(|| {
+                dedicated
+                    .as_deref()
+                    .and_then(|uid| state.wb_pool.pick_by_uid_region(uid, want_global))
+            });
 
         let mut tried: HashSet<String> = HashSet::new();
         let mut refreshed: HashSet<String> = HashSet::new();
@@ -987,7 +1288,10 @@ pub async fn wb_aggregate_chat(
         loop {
             let picked = match first_pick.take() {
                 Some(p) => p,
-                None => match state.wb_pool.pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref()) {
+                None => match state
+                    .wb_pool
+                    .pick_excluding_constrained_ev_region(&tried, allowed_set.as_ref(), dedicated.as_deref(), want_global)
+                {
                     Some((p, ev)) => {
                         if let Some(ev) = ev {
                             state.logger.log_sched_event(&ev);
@@ -998,16 +1302,19 @@ pub async fn wb_aggregate_chat(
                         state.record_usage(true, &model, "none", &key_id, false, stream,
                             start_ts.elapsed().as_millis() as u64, 0, 0);
                         // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
-                        let (healthy_total, _) = state.wb_pool.selectable_stats_in(None);
+                        let (healthy_total, _) = state
+                        .wb_pool
+                        .selectable_stats_in_region(None, want_global);
                         let (exhaust_msg, exhaust_tag) =
                             super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
                         // issue #99 ①：影子风控收尾落原始指纹样本（非流式路径无
                         // 收尾 [DEBUG] 行，就地补齐；样本 = 清洗前原始请求体）
                         if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
                             state.logger.log_debug_line(format!(
-                                "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=buddy 指纹样本: {}",
+                                "[DEBUG] {exhaust_tag} tried={} empty_hits={} model_cooled={} pool=buddy 指纹样本: {}",
                                 tried.len(),
                                 empty_hits,
+                                model_cooled.len(),
                                 wb_payload::fingerprint_sample(&body_vec),
                             ));
                         }
@@ -1015,6 +1322,21 @@ pub async fn wb_aggregate_chat(
                     }
                 },
             };
+            // T5.3 按模型冷却判定（同流式）：仅池内有其他备选时才换号，否则放行
+            if state.wb_pool.is_model_cooling(&picked.uid, &model)
+                && state.wb_pool.has_other_selectable_for_model(
+                    &picked.uid,
+                    allowed_set.as_ref(),
+                    want_global,
+                )
+            {
+                state.logger.log_sched_event(&format!(
+                    "model_cooldown_skip uid={} model={} (池内有其他账号顶上)",
+                    picked.uid, model
+                ));
+                tried.insert(picked.uid.clone());
+                continue;
+            }
             tried.insert(picked.uid.clone());
             // F-77 账号级在途计数：取号即绑定。
             // 审查 P1-4 TOCTOU 收紧：普通候选 CAS 复核「在途 < 并发上限」，已满则
@@ -1074,6 +1396,7 @@ pub async fn wb_aggregate_chat(
                             &tried,
                             allowed_set.as_ref(),
                             dedicated.as_deref(),
+                            want_global,
                         ) {
                             Ok(w) => w,
                             Err(()) => {
@@ -1129,8 +1452,17 @@ pub async fn wb_aggregate_chat(
                             (None, Some((code, msg))) => {
                                 let kind = classify_wb_error(code, &msg);
                                 if kind != ErrKind::None {
-                                    state.wb_pool.note_error(win_uid, kind);
-                                    note_model_failure_ex(&state, &model, Some(&msg));
+                                    // 模型级 429 不整号冷却（同流式主路径）
+                                    if !(kind == ErrKind::SoftRate && soft_rate_model_only(&msg)) {
+                                        state.wb_pool.note_error(win_uid, kind);
+                                    }
+                                    note_account_model_failure(&state, &model, Some(&msg), Some(win_uid));
+                                    // 免费模型额度耗尽记录（免费额度可见性）：流式路径
+                                    if kind == ErrKind::HardCredit {
+                                        note_free_model_exhausted(
+                                            &state.data_dir, win_uid, &model, Some(&msg),
+                                        );
+                                    }
                                     // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                     if kind.unbinds_sticky() {
                                         state.wb_sticky.unbind_uid(&win_uid);
@@ -1191,7 +1523,20 @@ pub async fn wb_aggregate_chat(
                                 );
                             }
                         }
-                        match retry_plan(status, &resp_body, same_attempt, retry_after) {
+                        // 上游已明确给出「日额度/频率耗尽 + 精确重置时刻」（WB 6004 一族）：
+                        // 这不是瞬时抖动，重试必然继续 429。此前 retry_plan 对 429 一律
+                        // 先同号重试 3 次（共 ~6s），把已超限的账号又硬打三遍，而池内
+                        // 其他健康账号一次都没被选中——用户感知为「明明还有余额的号却
+                        // 一直打在爆量的号上」。判据用「能解析出未来重置时刻」而非状态码，
+                        // 因为 429 既有瞬时限频也有日额度耗尽，前者仍应同号短退避。
+                        let quota_exhausted_429 =
+                            status == 429 && parse_quota_reset_at(&resp_body).is_some();
+                        let action = if quota_exhausted_429 {
+                            RetryAction::SwitchKey
+                        } else {
+                            retry_plan(status, &resp_body, same_attempt, retry_after)
+                        };
+                        match action {
                             RetryAction::RetrySame { delay_ms } => {
                                 same_attempt += 1;
                                 std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(60_000)));
@@ -1217,13 +1562,30 @@ pub async fn wb_aggregate_chat(
                                         }
                                     }
                                 }
-                                let kind = classify_error(status, &resp_body);
+                            let kind = classify_error(status, &resp_body);
+                            // ErrKind::None（如 4001 模型配置缺失）属请求/模型级问题，
+                            // 与账号健康无关——不计入账号失败，防全池被同号模型错误连坐熔断
+                            // 模型级 429（「可切换其他模型」文案）不整号冷却（同流内路径）
+                            if kind != ErrKind::None
+                                && !(kind == ErrKind::SoftRate
+                                    && upstream_msg(&resp_body)
+                                        .as_deref()
+                                        .is_some_and(|m| soft_rate_model_only(m)))
+                            {
                                 state.wb_pool.note_error(&picked.uid, kind);
-                                // issue #67：硬冷却/禁用类错误解绑该账号粘性
-                                if kind.unbinds_sticky() {
-                                    state.wb_sticky.unbind_uid(&picked.uid);
+                            }
+                            // issue #67：硬冷却/禁用类错误解绑该账号粘性
+                            if kind.unbinds_sticky() {
+                                state.wb_sticky.unbind_uid(&picked.uid);
+                            }
+                            note_account_model_failure(&state, &model, upstream_msg(&resp_body).as_deref(), Some(&picked.uid));
+                            // 免费模型额度耗尽记录（免费额度可见性）：非流式 HTTP 分支
+                                if kind == ErrKind::HardCredit {
+                                    note_free_model_exhausted(
+                                        &state.data_dir, &picked.uid, &model,
+                                        upstream_msg(&resp_body).as_deref(),
+                                    );
                                 }
-                                note_model_failure_ex(&state, &model, upstream_msg(&resp_body).as_deref());
                                 *safe_lock(&state.last_error) =
                                     Some(format!("wb uid={} status={}", picked.uid, status));
                                 // 每请求终态单行（审查问题6）：SwitchKey → 换号是中间态，
@@ -1237,6 +1599,12 @@ pub async fn wb_aggregate_chat(
                                 break;
                             }
                             RetryAction::Fatal => {
+                                // 同流式 Fatal：报文带精确重置时刻时仍冻结该账号
+                                note_account_model_failure(
+                                    &state, &model,
+                                    upstream_msg(&resp_body).as_deref(),
+                                    Some(&picked.uid),
+                                );
                                 // 终态记账对齐 SwitchKey 分支（审查 F3）：Fatal 是请求
                                 // 终局，此前仅 log_request 导致用量统计页缺口
                                 state.record_usage(true, &model, &picked.uid, &key_id, false, stream,
@@ -1353,15 +1721,17 @@ pub async fn wb_tool_exec_chat(
         log_longctx_hint(&state, &chat_body, &model);
 
         // F-35 子 Key 约束（与非流式同款；issue #30 混合白名单按前缀作用域分池）
-        let (allowed_set, dedicated) = super::api_keys::constraints_for(&state.data_dir, &key_id)
+        let (allowed_set, dedicated, key_want) = super::api_keys::constraints_for(&state.data_dir, &key_id)
             .and_then(|k| k.pool_constraints("buddy"))
-            .map_or((None, None), |c| (c.allowed, c.dedicated));
+            .map_or((None, None, None), |c| (c.allowed, c.dedicated, c.want_global));
 
         let catalog = super::wb_catalog::load(&state.data_dir);
         let effort = super::wb_catalog::find(&catalog, &model)
             .and_then(|m| m.resolve_effort(chat_body.get("reasoning_effort").and_then(|v| v.as_str())));
 
-        let mut tried: HashSet<String> = HashSet::new();
+        // T5.3：按模型冷却预注入 tried（toolexec 路径无粘性首选）
+        let mut tried: HashSet<String> =
+            state.wb_pool.model_cooled_uids(&model).into_iter().collect();
         let mut refreshed: HashSet<String> = HashSet::new();
         let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
         let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
@@ -1376,11 +1746,13 @@ pub async fn wb_tool_exec_chat(
         // 成功终局仍以 completion 写回值为准（只含最终成功账号，维持不变）
         let mut req_acc_usage = (0u64, 0u64);
         let resp_id = format!("resp_{}", now_ts());
+        // 区域判定（国内/海外号池隔离，同流式/聚合路径）；Key 区域约束显式覆盖
+        let want_global = key_want.or_else(|| super::wb_catalog::region_of(&state.data_dir, &model));
 
         'accounts: loop {
             let picked = match state
                 .wb_pool
-                .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref())
+                .pick_excluding_constrained_ev_region(&tried, allowed_set.as_ref(), dedicated.as_deref(), want_global)
             {
                 Some((p, ev)) => {
                     if let Some(ev) = ev {
@@ -1390,6 +1762,21 @@ pub async fn wb_tool_exec_chat(
                 }
                 None => break,
             };
+            // T5.3 按模型冷却判定（同流式）：仅池内有其他备选时才换号，否则放行
+            if state.wb_pool.is_model_cooling(&picked.uid, &model)
+                && state.wb_pool.has_other_selectable_for_model(
+                    &picked.uid,
+                    allowed_set.as_ref(),
+                    want_global,
+                )
+            {
+                state.logger.log_sched_event(&format!(
+                    "model_cooldown_skip uid={} model={} (池内有其他账号顶上)",
+                    picked.uid, model
+                ));
+                tried.insert(picked.uid.clone());
+                continue;
+            }
             tried.insert(picked.uid.clone());
             let conv_id = gen_conv_id();
             // F-77 账号级在途计数：取号即绑定。
@@ -1461,8 +1848,17 @@ pub async fn wb_tool_exec_chat(
                         if let Some((code, msg)) = error_info {
                             let kind = classify_wb_error(code, &msg);
                             if kind != ErrKind::None {
-                                state.wb_pool.note_error(&picked.uid, kind);
-                                note_model_failure_ex(&state, &model, Some(&msg));
+                                // 模型级 429 不整号冷却（同流式主路径）
+                                if !(kind == ErrKind::SoftRate && soft_rate_model_only(&msg)) {
+                                    state.wb_pool.note_error(&picked.uid, kind);
+                                }
+                                note_account_model_failure(&state, &model, Some(&msg), Some(&picked.uid));
+                                // 免费模型额度耗尽记录（免费额度可见性）：非流式流内错误
+                                if kind == ErrKind::HardCredit {
+                                    note_free_model_exhausted(
+                                        &state.data_dir, &picked.uid, &model, Some(&msg),
+                                    );
+                                }
                                 // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                 if kind.unbinds_sticky() {
                                     state.wb_sticky.unbind_uid(&picked.uid);
@@ -1590,7 +1986,15 @@ pub async fn wb_tool_exec_chat(
                                 );
                             }
                         }
-                        match retry_plan(status, &resp_body, same_attempt, retry_after) {
+                        // 同前两处：带精确重置时刻的 429 直接换号，不再同号空转
+                        let retry_action = if status == 429
+                            && parse_quota_reset_at(&resp_body).is_some()
+                        {
+                            RetryAction::SwitchKey
+                        } else {
+                            retry_plan(status, &resp_body, same_attempt, retry_after)
+                        };
+                        match retry_action {
                             RetryAction::RetrySame { delay_ms } => {
                                 same_attempt += 1;
                                 std::thread::sleep(std::time::Duration::from_millis(
@@ -1625,15 +2029,31 @@ pub async fn wb_tool_exec_chat(
                                     }
                                 }
                                 let kind = classify_error(status, &resp_body);
-                                state.wb_pool.note_error(&picked.uid, kind);
+                                // ErrKind::None（如 4001 模型配置缺失）属请求/模型级问题，
+                                // 与账号健康无关——不计入账号失败，防全池被同号模型错误连坐熔断
+                                // 模型级 429（「可切换其他模型」文案）不整号冷却（同流式主路径）
+                                if kind != ErrKind::None
+                                    && !(kind == ErrKind::SoftRate
+                                        && upstream_msg(&resp_body)
+                                            .as_deref()
+                                            .is_some_and(|m| soft_rate_model_only(m)))
+                                {
+                                    state.wb_pool.note_error(&picked.uid, kind);
+                                }
                                 // issue #67：硬冷却/禁用类错误解绑该账号粘性
                                 if kind.unbinds_sticky() {
                                     state.wb_sticky.unbind_uid(&picked.uid);
                                 }
-                                note_model_failure_ex(&state, &model, upstream_msg(&resp_body).as_deref());
+                                note_account_model_failure(&state, &model, upstream_msg(&resp_body).as_deref(), Some(&picked.uid));
                                 break Err(format!("upstream {} error: {}", status, safe_slice(&resp_body, 200)));
                             }
                             RetryAction::Fatal => {
+                                // 同前两处：带精确重置时刻时冻结账号，避免下个请求再撞
+                                note_account_model_failure(
+                                    &state, &model,
+                                    upstream_msg(&resp_body).as_deref(),
+                                    Some(&picked.uid),
+                                );
                                 break Err(format!("upstream {} error: {}", status, safe_slice(&resp_body, 300)));
                             }
                         }
@@ -1692,7 +2112,9 @@ pub async fn wb_tool_exec_chat(
                 );
                 // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                 Err(last_err.unwrap_or_else(|| {
-                    let (healthy_total, _) = state.wb_pool.selectable_stats_in(None);
+                    let (healthy_total, _) = state
+                        .wb_pool
+                        .selectable_stats_in_region(None, want_global);
                     let (exhaust_msg, exhaust_tag) =
                         super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
                     // issue #99 ①：影子风控收尾落原始指纹样本（chat_body 轮末已追加
@@ -1931,10 +2353,111 @@ mod tests {
         assert!(matches!(classify_wb_error(0, "weird"), ErrKind::Server));
         // message 关键词优先级不受 code 分段影响
         assert!(matches!(classify_wb_error(200, "积分不足"), ErrKind::HardCredit));
+        // P0-2 口径统一：频率限流语义（含英文 quota exceeded / 中文频率限制）
+        // 归 SoftRate 而非整号 HardCredit——与 HTTP 路径 is_credit_exhausted_error
+        // 有意排除 "quota exceeded" 的注释口径一致
+        assert!(matches!(classify_wb_error(6004, "quota exceeded, will reset later"), ErrKind::SoftRate));
+        assert!(matches!(
+            classify_wb_error(6004, "您的使用量已超出频率限制，您也可以切换其他模型继续使用"),
+            ErrKind::SoftRate
+        ));
+        // 11133/400001 input_invalid：上游拒绝请求参数（模型侧问题），
+        // 与账号健康无关 → None，不得计连续错误熔断整池
+        assert!(matches!(
+            classify_wb_error(11133, "the request parameters were rejected by the model provider"),
+            ErrKind::None
+        ));
+        // 限流词收窄（2026-10-20）：裸 "rate" 子串曾把 prepare/separate/
+        // generated/moderation 里的 "rate" 判成限频，白加 rate_trips 把退避
+        // 翻倍到 30 分钟；这些普通词必须落回 Client/Server 而非 SoftRate
+        assert!(matches!(
+            classify_wb_error(400, "failed to prepare the request"),
+            ErrKind::Client
+        ));
+        assert!(matches!(
+            classify_wb_error(400, "invalid moderation result"),
+            ErrKind::Client
+        ));
+        assert!(matches!(
+            classify_wb_error(400, "rate limit exceeded for this model"),
+            ErrKind::SoftRate
+        ));
+        // HTTP 路径同口径（400/11133 走 classify_error）
+        assert!(matches!(
+            super::classify_error(
+                400,
+                r#"{"code":11133,"msg":"the request parameters were rejected by the model provider","extError":{"code":"400001","type":"input_invalid"}}"#
+            ),
+            ErrKind::None
+        ));
     }
 
     /// 6004 限额文案 → 精确恢复时刻（agent2api errors.rs 同源语义；
     /// UTC+8 字面量必须命中，按 UTC+8 解释为 Unix 秒）
+    /// 回归（2026-10-18 用户线上文案）：6004「使用量已超出频率限制，将在 X UTC+8
+    /// 重置」必须被识别为「重试无意义」——否则 retry_plan 会先同号重试 3 次，
+    /// 把已超限的账号又硬打三遍，池内健康账号一次都没被选中。
+    #[test]
+    fn exhausted_429_message_is_retry_futile() {
+        let reset = (chrono::Utc::now() + chrono::Duration::hours(7))
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+        let body = format!(
+            r#"{{"code":6004,"msg":"您的使用量已超出频率限制，将在 {} UTC+8 重置，您也可以切换其他模型继续使用。","requestId":"x"}}"#,
+            reset.format("%Y-%m-%d %H:%M:%S")
+        );
+        // 判据：解析出未来重置时刻 → 走 SwitchKey 而非 RetrySame
+        assert!(
+            parse_quota_reset_at(&body).is_some(),
+            "应识别为额度耗尽形态，直接换号"
+        );
+        // 瞬时限频（无重置时刻）仍应保留同号短退避
+        assert!(parse_quota_reset_at(r#"{"code":6004,"msg":"slow down"}"#).is_none());
+    }
+
+    /// 模型级 429 判定（单账号区域池整池 503 修复，2026-10-19）：
+    /// 上游明示「可切换其他模型」= 仅该模型限频，账号健康，不得整号冷却；
+    /// 账号级日额度（不带可切换文案）必须维持整号冷却。三态覆盖：
+    /// ① 含中文可切换短语 → true（模型级）；② 英文可切换短语 → true；
+    /// ③ 纯账号额度文案 / 无限流文案 → false（不得放行整号冷却门）。
+    #[test]
+    fn soft_rate_model_only_detects_switchable_phrases() {
+        // ① 中文线上形态
+        assert!(soft_rate_model_only(
+            "您的使用量已超出频率限制，您也可以切换其他模型继续使用。"
+        ));
+        // ② 英文同义形态（中英双保险）
+        assert!(soft_rate_model_only(
+            "rate limit reached, you can switch to the other model to continue"
+        ));
+        // ③ 账号级日额度（无「可切换」语义）：必须整号冷却，否则真·日额度
+        //    账号其他模型反复被选中再 429（note_account_model_failure 同口径）
+        assert!(!soft_rate_model_only("您的使用量已超出今日限制，请明日再试"));
+        assert!(!soft_rate_model_only("quota exceeded, will reset later"));
+        // ④ 纯限频无文案线索 → 保守按账号级（不误放整池）
+        assert!(!soft_rate_model_only("slow down"));
+    }
+
+    /// 回归（2026-10-18 实测）：中文多字节文案 + 精确重置时刻。
+    /// 用户线上文案「您的使用量已超出频率限制，将在 ... UTC+8 重置」解析失败会让
+    /// 账号只吃到 60s 短冷却，冷却刚过就再次被选中、再次 429。
+    #[test]
+    fn parse_quota_reset_at_chinese_frequency_limit() {
+        let reset = (chrono::Utc::now() + chrono::Duration::hours(7))
+            .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+        let msg = format!(
+            "您的使用量已超出频率限制，将在 {} UTC+8 重置，您也可以切换其他模型继续使用。",
+            reset.format("%Y-%m-%d %H:%M:%S")
+        );
+        let ts = parse_quota_reset_at(&msg).expect("中文频率限额文案应解析出重置时刻");
+        assert_eq!(ts, reset.timestamp());
+        // 英文形态（上一轮已修）也必须仍然通过
+        let en = format!(
+            "usage exceeds frequency limit, your usage will reset at {} UTC+8",
+            reset.format("%Y-%m-%d %H:%M:%S")
+        );
+        assert_eq!(parse_quota_reset_at(&en), Some(reset.timestamp()));
+    }
+
     #[test]
     fn parse_quota_reset_at_from_limit_message() {
         // 未来时刻动态构造（UTC+8 时区格式化），格式与上游文案一致
@@ -1966,6 +2489,14 @@ mod tests {
             reset.format("%Y-%m-%d %H:%M:%S")
         );
         assert_eq!(parse_quota_reset_at(&dual), Some(reset.timestamp()));
+        // 2026-10-18 实测回归：WB 6004 **英文**频率限额文案（时刻与 UTC+8 之间隔
+        // 一个空格，且后缀还有逗号续句）。旧实现只从 anchor-DT_LEN 单向回扫，
+        // 合法起点在其右侧 → 漏解析 → 账号只吃到 60s 短冷却、冷却后继续连 429
+        let en = format!(
+            "usage exceeds frequency limit, but don't worry, your usage will reset at {} UTC+8, alternatively, you can switch to the other models to continue using it.",
+            reset.format("%Y-%m-%d %H:%M:%S")
+        );
+        assert_eq!(parse_quota_reset_at(&en), Some(reset.timestamp()));
     }
 
     /// upstream_msg 三种字段形态（message / error.message / msg）提取

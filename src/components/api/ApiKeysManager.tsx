@@ -6,30 +6,39 @@
  * 在子弹框打开期间屏蔽 ESC 双关（主弹窗 onClose 先于子弹框触发）。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Check, Copy, KeyRound, Plus, Power, RefreshCw, Route, Trash2 } from 'lucide-react';
+import { Activity, Check, Copy, KeyRound, Loader2, Plug, Plus, Power, RefreshCw, Route, Trash2 } from 'lucide-react';
 import { Badge, Modal } from '../ui';
-import { api } from '../../lib/tauri';
+import { api, type ApiKeyTestResult, type KeyScopedModels } from '../../lib/tauri';
 import { copyText } from '../../lib/clipboard';
 import { useAppStore } from '../../store';
 import { maskApiKey, fmtTokens } from '../../lib/format';
 import type { ApiKeyEntry, GroupView, PoolStatus, TagView, UsageDayView } from '../../types';
 
 /** issue #30 混合白名单：候选账号平台标记 */
-type CandidatePool = 'trae' | 'buddy' | 'qoder';
+type CandidatePool = 'trae' | 'buddy' | 'qoder' | 'zcode';
 /** 调度配置候选：上游账号 + 所属池标记 */
 interface PoolCandidate extends PoolStatus {
   pool: CandidatePool;
 }
 
 /** 池标记 → 徽标/文案映射（候选列表与专一/限定上游文案共用） */
-const POOL_TAG: Record<CandidatePool, { label: string; tone: 'blue' | 'green' | 'violet' }> = {
+const POOL_TAG: Record<CandidatePool, { label: string; tone: 'blue' | 'green' | 'violet' | 'amber' }> = {
   trae: { label: 'Trae', tone: 'blue' },
   buddy: { label: 'Buddy', tone: 'green' },
   qoder: { label: 'Qoder', tone: 'violet' },
+  zcode: { label: 'ZCode', tone: 'amber' },
 };
 /** 绑定池 → 展示文案（空串由调用方处理为跨池文案） */
 const bindPoolLabel = (p: string) =>
-  p === 'trae' ? 'Trae 池' : p === 'buddy' ? 'Buddy 池' : p === 'qoder' ? 'Qoder 池' : 'Trae/Buddy/Qoder 池';
+  p === 'trae'
+    ? 'Trae 池'
+    : p === 'buddy'
+      ? 'Buddy 池'
+      : p === 'qoder'
+        ? 'Qoder 池'
+        : p === 'zcode'
+          ? 'ZCode 池'
+          : 'Trae/Buddy/Qoder 池';
 
 export default function ApiKeysManager({
   onSubModalChange,
@@ -46,6 +55,12 @@ export default function ApiKeysManager({
   const [newKeyValue, setNewKeyValue] = useState('');
   // F-35 子 Key 配置弹框 + 删除确认（禁 window.confirm，红线）
   const [editKey, setEditKey] = useState<ApiKeyEntry | null>(null);
+  /** ① 连通性自测：进行中的 key id + 最近结果（toast + 行内展示） */
+  const [testingId, setTestingId] = useState('');
+  /** ③ 接入配置生成：当前导出 Key + 模型清单 */
+  const [exportKey, setExportKey] = useState<ApiKeyEntry | null>(null);
+  const [exportModels, setExportModels] = useState<KeyScopedModels | null>(null);
+  const [writingZcode, setWritingZcode] = useState(false);
   const [editAllowed, setEditAllowed] = useState<Set<string>>(new Set());
   const [editMode, setEditMode] = useState('expire_first');
   const [editDedicated, setEditDedicated] = useState('');
@@ -60,12 +75,14 @@ export default function ApiKeysManager({
   const [listOrgPreview, setListOrgPreview] = useState<Record<string, Record<string, number>>>({});
   // issue #25 资源池绑定："" = 跟随全局调度 | "trae" | "buddy" | "qoder"
   const [editBindPool, setEditBindPool] = useState('');
+  const [editRegion, setEditRegion] = useState('');
   // issue #30：打开弹框时的原始白名单/专一值（未归一）。保存时若用户未改动勾选
   // （归一化后等价），写回原值——旧裸 uid 数据保持旧语义，避免「仅打开保存一次」
   // 就把 trae 侧从「不限」静默升级为「排除」（混合白名单零条目池 = 排除）
   const editOrigRef = useRef<{ allowed: string[]; dedicated: string }>({ allowed: [], dedicated: '' });
   // 新增 Key 时的资源池选择（issue #25）
   const [newBindPool, setNewBindPool] = useState('');
+  const [newRegion, setNewRegion] = useState('');
   const [deleteForKey, setDeleteForKey] = useState<ApiKeyEntry | null>(null);
   // F8：关闭鉴权二次确认（全局安全开关，误触即放行所有无 Key 请求；重新开启不确认）
   const [authConfirmOpen, setAuthConfirmOpen] = useState(false);
@@ -75,6 +92,8 @@ export default function ApiKeysManager({
   const [poolStatus, setPoolStatus] = useState<PoolStatus[]>([]);
   const [buddyPoolStatus, setBuddyPoolStatus] = useState<PoolStatus[]>([]);
   const [qoderPoolStatus, setQoderPoolStatus] = useState<PoolStatus[]>([]);
+  // zcodePoolStatus = ZCode 池（z.ai GLM 池，fail-open 全量含凭证账号）
+  const [zcodePoolStatus, setZcodePoolStatus] = useState<PoolStatus[]>([]);
   // 今日按 Key 的 token 用量（「今日已用」列展示；四桶分账记账，跨桶合并后按 Key 聚合）
   const [usage, setUsage] = useState<UsageDayView[][]>([]);
   // Qoder 上游开关（对齐方案 §5.3 警告徽标数据源，已交付归档）：
@@ -163,6 +182,7 @@ export default function ApiKeysManager({
       schedule_mode: 'expire_first',
       dedicated_account: '',
       bind_pool: newBindPool,
+      region: newRegion,
       allowed_groups: [],
       allowed_tags: [],
       daily_stats: [],
@@ -193,17 +213,61 @@ export default function ApiKeysManager({
     await saveKeys(apiKeys.filter((x) => x.id !== k.id), `Key「${k.name}」已删除`);
   };
 
+  /** ① 连通性自测：真实走一次网关调度（含区域约束），toast 汇报归属 */
+  const runKeyTest = async (k: ApiKeyEntry) => {
+    setTestingId(k.id);
+    try {
+      const r: ApiKeyTestResult = await api.apiServer.keyTest(k.id);
+      if (r.ok) {
+        const who = r.acct ? `，账号「${r.acct}」` : '';
+        toast('success', `连通正常：模型 ${r.model}${who}，${r.elapsed_ms}ms`);
+      } else {
+        toast('error', `连通失败（HTTP ${r.status ?? '-'}）：${(r.error || '').slice(0, 120)}`);
+      }
+    } catch (err) {
+      toast('error', `自测失败：${String(err).slice(0, 120)}`);
+    } finally {
+      setTestingId('');
+    }
+  };
+
+  /** ③ 接入配置生成：拉 Key 生效范围模型清单并打开弹框 */
+  const openExport = async (k: ApiKeyEntry) => {
+    try {
+      const models = await api.apiServer.keyModels(k.id);
+      setExportModels(models);
+      setExportKey(k);
+    } catch (err) {
+      toast('error', `模型清单加载失败：${String(err).slice(0, 120)}`);
+    }
+  };
+
+  /** ③b 直写本机 ZCode agent 供应商配置 */
+  const writeZcode = async () => {
+    if (!exportKey) return;
+    setWritingZcode(true);
+    try {
+      const r = await api.apiServer.zcodeProviderWrite(exportKey.id);
+      toast('success', `已写入 ZCode agent：${r.provider_id}（${r.models} 个模型），重启 ZCode agent 生效`);
+    } catch (err) {
+      toast('error', `写入失败：${String(err).slice(0, 140)}`);
+    } finally {
+      setWritingZcode(false);
+    }
+  };
+
   // 子 Key 配置弹框（F-35 + issue #25 资源池绑定）：限定上游 + 专一/临期优先 + 按日统计展示
   const openKeyEdit = (k: ApiKeyEntry) => {
     setEditKey(k);
     // issue #30：bind="" 旧数据裸 uid 显示时归一为 buddy: 前缀（与候选编码对齐，
     // UI 勾选状态与实际限定一致）；原值存入 editOrigRef，保存时未改动则写回原值
-    const norm = (v: string) => (!k.bind_pool && v && !/^(trae|buddy|qoder):/i.test(v) ? `buddy:${v}` : v);
+    const norm = (v: string) => (!k.bind_pool && v && !/^(trae|buddy|qoder|zcode):/i.test(v) ? `buddy:${v}` : v);
     editOrigRef.current = { allowed: k.allowed_accounts, dedicated: k.dedicated_account || '' };
     setEditAllowed(new Set(k.allowed_accounts.map(norm)));
     setEditMode(k.schedule_mode || 'expire_first');
     setEditDedicated(norm(k.dedicated_account || ''));
     setEditBindPool(k.bind_pool || '');
+    setEditRegion(k.region || '');
     setEditGroups(new Set(k.allowed_groups ?? []));
     setEditTags(new Set(k.allowed_tags ?? []));
     // 共享分组/标签候选（全局一份；含各池成员计数）
@@ -236,6 +300,12 @@ export default function ApiKeysManager({
       .catch(() => {
         /* 保留上次候选 */
       });
+    api.apiServer
+      .zcodePoolStatus()
+      .then(setZcodePoolStatus)
+      .catch(() => {
+        /* 保留上次候选 */
+      });
   };
 
   const confirmKeyEdit = () => {
@@ -259,6 +329,7 @@ export default function ApiKeysManager({
             dedicated_account:
               editMode === 'dedicated' ? (dedicatedChanged ? editDedicated : editOrigRef.current.dedicated) : '',
             bind_pool: editBindPool,
+            region: editRegion,
             allowed_groups: [...editGroups],
             allowed_tags: [...editTags],
           }
@@ -396,7 +467,7 @@ export default function ApiKeysManager({
 
   // 子弹框开关状态上报（供主弹窗屏蔽 ESC 双关）
   useEffect(() => {
-    onSubModalChange?.(editKey != null || deleteForKey != null || authConfirmOpen);
+    onSubModalChange?.(editKey != null || deleteForKey != null || authConfirmOpen || exportKey != null);
   }, [editKey, deleteForKey, authConfirmOpen, onSubModalChange]);
 
   // 今日按 Key 的 token 用量（Keys 表「今日已用」并列展示；日期口径与后端一致 = 本地时区 YYYY-MM-DD）
@@ -426,8 +497,14 @@ export default function ApiKeysManager({
     if (editBindPool === 'trae') return tag('trae', poolStatus);
     if (editBindPool === 'buddy') return tag('buddy', buddyPoolStatus);
     if (editBindPool === 'qoder') return tag('qoder', qoderPoolStatus);
-    return [...tag('trae', poolStatus), ...tag('buddy', buddyPoolStatus), ...tag('qoder', qoderPoolStatus)];
-  }, [editBindPool, poolStatus, buddyPoolStatus, qoderPoolStatus]);
+    if (editBindPool === 'zcode') return tag('zcode', zcodePoolStatus);
+    return [
+      ...tag('trae', poolStatus),
+      ...tag('buddy', buddyPoolStatus),
+      ...tag('qoder', qoderPoolStatus),
+      ...tag('zcode', zcodePoolStatus),
+    ];
+  }, [editBindPool, poolStatus, buddyPoolStatus, qoderPoolStatus, zcodePoolStatus]);
 
   // issue #30 编码：跟随全局调度时白名单/专一值携带池前缀（trae:/buddy:），
   // 后端按前缀分池作用域；绑定池时存裸 uid（与旧格式一致）
@@ -503,6 +580,7 @@ export default function ApiKeysManager({
               { key: 'trae', label: 'Trae', title: '优先走 Trae，异常可回退' },
               { key: 'buddy', label: 'Buddy', title: '优先走 Buddy，异常可回退' },
               { key: 'qoder', label: 'Qoder', title: '优先走 Qoder，异常可回退' },
+              { key: 'zcode', label: 'ZCode', title: '优先走 ZCode（GLM-5.3），异常可回退' },
             ].map((p) => (
               <button
                 key={p.key}
@@ -515,6 +593,29 @@ export default function ApiKeysManager({
                 title={p.title}
               >
                 {p.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div>
+          <div className="mb-1 text-xs text-slate-400">区域（Buddy/Qoder 取号范围）</div>
+          <div className="flex gap-1">
+            {[
+              { key: '', label: '不限', title: '按模型区域自动分流' },
+              { key: 'cn', label: '国内', title: '只出国内账号（国内号池专用 Key）' },
+              { key: 'global', label: '海外', title: '只出海外账号（海外号池专用 Key）' },
+            ].map((r) => (
+              <button
+                key={r.key}
+                className={`flex-1 rounded-lg border px-2 py-1.5 text-xs font-medium transition-colors ${
+                  newRegion === r.key
+                    ? 'border-violet-400 bg-violet-50 text-violet-600 dark:border-violet-500 dark:bg-violet-500/10 dark:text-violet-300'
+                    : 'border-slate-200 text-slate-500 hover:border-slate-300 dark:border-zinc-700 dark:text-zinc-400'
+                }`}
+                onClick={() => setNewRegion(r.key)}
+                title={r.title}
+              >
+                {r.label}
               </button>
             ))}
           </div>
@@ -632,6 +733,9 @@ export default function ApiKeysManager({
                       {k.bind_pool === 'trae' && <Badge tone="blue" className="ml-1">Trae 池</Badge>}
                       {k.bind_pool === 'buddy' && <Badge tone="green" className="ml-1">Buddy 池</Badge>}
                       {k.bind_pool === 'qoder' && <Badge tone="violet" className="ml-1">Qoder 池</Badge>}
+                      {k.bind_pool === 'zcode' && <Badge tone="amber" className="ml-1">ZCode 池</Badge>}
+                      {k.region === 'global' && <Badge tone="violet" className="ml-1">仅海外</Badge>}
+                      {k.region === 'cn' && <Badge tone="blue" className="ml-1">仅国内</Badge>}
                       {/* §5.3 保存后校验提示：绑定 Qoder 池但上游未启用 → 警告徽标 */}
                       {k.bind_pool === 'qoder' && qoderEnabled === false && (
                         <span
@@ -697,6 +801,25 @@ export default function ApiKeysManager({
                         </button>
                         <button
                           className="btn-ghost !p-1.5"
+                          title="连通性自测：真实走一次网关调度，显示命中的账号与模型"
+                          disabled={testingId === k.id}
+                          onClick={() => void runKeyTest(k)}
+                        >
+                          {testingId === k.id ? (
+                            <Loader2 size={14} className="animate-spin" />
+                          ) : (
+                            <Activity size={14} />
+                          )}
+                        </button>
+                        <button
+                          className="btn-ghost !p-1.5"
+                          title="接入配置生成：ZCode / Claude Code / 通用 OpenAI 客户端配置"
+                          onClick={() => void openExport(k)}
+                        >
+                          <Plug size={14} />
+                        </button>
+                        <button
+                          className="btn-ghost !p-1.5"
                           title="调度配置（限定上游 / 专一 / 临期优先）"
                           onClick={() => openKeyEdit(k)}
                         >
@@ -721,6 +844,68 @@ export default function ApiKeysManager({
       )}
 
       {/* 子 Key 调度配置弹框（F-35：限定上游 + 专一/临期优先 + 按日统计） */}
+      {/* ③ 接入配置生成弹框：按 Key 生效范围生成各客户端配置 */}
+      <Modal
+        open={exportKey != null}
+        onClose={() => setExportKey(null)}
+        title={`接入配置 · ${exportKey?.name ?? ''}`}
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setExportKey(null)}>关闭</button>
+            <button className="btn-primary" disabled={writingZcode} onClick={() => void writeZcode()}>
+              {writingZcode ? <Loader2 size={14} className="animate-spin" /> : <Plug size={14} />}
+              写入本机 ZCode agent
+            </button>
+          </>
+        }
+      >
+        <div className="space-y-3 text-sm">
+          <div className="text-xs text-slate-500 dark:text-zinc-400">
+            网关地址 <code className="font-mono">http://127.0.0.1:7864/v1</code> ·
+            API Key <code className="font-mono">{exportKey?.key.slice(0, 10)}…</code> ·
+            生效模型 {exportModels ? Object.values(exportModels).flat().length : 0} 个
+            （按 Key 的池绑定与区域约束自动圈定）
+          </div>
+          {exportModels && ([
+            ['ZCode agent 供应商（推荐直接用「写入」按钮）',
+             JSON.stringify({
+               providerId: 'aiwork-' + (exportKey?.id ?? ''),
+               providerName: exportKey?.name ?? '',
+               config: {
+                 group: 'standard-personal',
+                 access: { type: 'api-key', apiKey: exportKey?.key ?? '' },
+                 api: { type: 'anthropic-messages', baseUrl: 'http://127.0.0.1:7864/v1' },
+                 personalModelIds: [...exportModels.trae, ...exportModels.buddy, ...exportModels.qoder],
+                 modelOrder: [...exportModels.trae, ...exportModels.buddy, ...exportModels.qoder],
+               },
+             }, null, 2)],
+            ['Claude Code（settings.json env 片段）',
+             JSON.stringify({
+               ANTHROPIC_BASE_URL: 'http://127.0.0.1:7864',
+               ANTHROPIC_AUTH_TOKEN: exportKey?.key ?? '',
+             }, null, 2)],
+            ['通用 OpenAI 兼容客户端',
+             ['Base URL: http://127.0.0.1:7864/v1', 'API Key: ' + (exportKey?.key ?? ''),
+              '模型: ' + [...exportModels.trae, ...exportModels.buddy, ...exportModels.qoder].join(', ')].join(String.fromCharCode(10))],
+          ] as [string, string][]).map(([label, text]) => (
+            <div key={label}>
+              <div className="mb-1 flex items-center justify-between">
+                <span className="text-xs font-medium text-slate-500 dark:text-zinc-400">{label}</span>
+                <button
+                  className="btn-outline !px-2 !py-1 text-xs"
+                  onClick={() => {
+                    void navigator.clipboard.writeText(text);
+                    toast('success', '已复制');
+                  }}
+                >
+                  复制
+                </button>
+              </div>
+              <pre className="max-h-40 overflow-auto rounded-lg bg-slate-50 p-2 font-mono text-[11px] leading-5 dark:bg-zinc-800/60">{text}</pre>
+            </div>
+          ))}
+        </div>
+      </Modal>
       <Modal
         open={editKey != null}
         onClose={() => setEditKey(null)}
@@ -743,6 +928,7 @@ export default function ApiKeysManager({
                 { key: 'trae', label: 'Trae 池', desc: '优先走 Trae，异常可回退' },
                 { key: 'buddy', label: 'Buddy 池', desc: '优先走 Buddy，异常可回退' },
                 { key: 'qoder', label: 'Qoder 池', desc: '优先走 Qoder，异常可回退' },
+                { key: 'zcode', label: 'ZCode 池', desc: '优先走 ZCode（GLM-5.3），异常可回退' },
               ].map((p) => (
                 <button
                   key={p.key}
@@ -761,6 +947,27 @@ export default function ApiKeysManager({
                 或上方「调度策略中心」开启「启用 Qoder 上游」。
               </p>
             )}
+          </div>
+          <div>
+            <div className="mb-1.5 text-xs font-medium text-slate-500">
+              区域<span className="ml-1 font-normal text-slate-400">（Buddy/Qoder 取号范围）</span>
+            </div>
+            <div className="flex gap-2">
+              {[
+                { key: '', label: '不限', desc: '按模型区域自动分流' },
+                { key: 'cn', label: '仅国内', desc: '只出国内账号（国内号池专用 Key）' },
+                { key: 'global', label: '仅海外', desc: '只出海外账号（海外号池专用 Key）' },
+              ].map((r) => (
+                <button
+                  key={r.key}
+                  className={`flex-1 rounded-lg border p-2.5 text-left text-xs ${editRegion === r.key ? 'border-violet-400 bg-violet-50 dark:bg-violet-500/10' : 'border-slate-200 dark:border-zinc-700'}`}
+                  onClick={() => setEditRegion(r.key)}
+                >
+                  <div className="font-medium">{r.label}</div>
+                  <div className="mt-0.5 text-slate-400">{r.desc}</div>
+                </button>
+              ))}
+            </div>
           </div>
           <div>
             <div className="mb-1.5 text-xs font-medium text-slate-500">调度模式</div>
@@ -806,9 +1013,15 @@ export default function ApiKeysManager({
             <div className="mb-1.5 text-xs font-medium text-slate-500">
               限定上游
               <span className="ml-1 font-normal text-slate-400">
-                （{editBindPool ? `${bindPoolLabel(editBindPool)}账号` : 'Trae + Buddy + Qoder 池账号'}
+                （{editBindPool ? `${bindPoolLabel(editBindPool)}账号` : 'Trae + Buddy + Qoder + ZCode 池账号'}
                 ；不勾选 = 使用全部上游账号）
               </span>
+              {editRegion !== '' && (
+                <span className="ml-1 font-normal text-violet-500">
+                  · 区域已限定{editRegion === 'global' ? '仅海外' : '仅国内'}
+                  ：实际可调度账号只有该区账号（区域不符的候选已置灰，勾选无效）
+                </span>
+              )}
             </div>
             <div className="max-h-40 space-y-1 overflow-y-auto rounded-lg border border-slate-200 p-2 dark:border-zinc-700">
               {editCandidates.length === 0 ? (
@@ -816,10 +1029,21 @@ export default function ApiKeysManager({
               ) : (
                 editCandidates.map((c) => {
                   const val = encodeUid(c.pool, c.uid);
+                  // 区域约束可视化（2026-10-17）：Key 区域限定下，Buddy/Qoder 池中
+                  // 区域不符的账号置灰禁选（调度侧本就排除，此处对齐认知）
+                  const regionExcluded =
+                    editRegion !== '' &&
+                    (c.pool === 'buddy' || c.pool === 'qoder') &&
+                    (editRegion === 'global') !== (c.global_region === true);
                   return (
-                    <label key={val} className="flex items-center gap-2 text-xs">
+                    <label
+                      key={val}
+                      className={`flex items-center gap-2 text-xs ${regionExcluded ? 'opacity-40' : ''}`}
+                      title={regionExcluded ? `区域约束已排除（当前 Key 限定${editRegion === 'global' ? '仅海外' : '仅国内'}，该账号为${c.global_region ? '海外' : '国内'}账号）` : undefined}
+                    >
                       <input
                         type="checkbox"
+                        disabled={regionExcluded}
                         checked={editAllowed.has(val)}
                         onChange={() => {
                           const next = new Set(editAllowed);
@@ -831,6 +1055,11 @@ export default function ApiKeysManager({
                       <Badge tone={POOL_TAG[c.pool].tone} className="!px-1.5 !text-[10px]">
                         {POOL_TAG[c.pool].label}
                       </Badge>
+                      {(c.pool === 'buddy' || c.pool === 'qoder') && (
+                        <Badge tone={c.global_region ? 'violet' : 'blue'} className="!px-1.5 !text-[10px]">
+                          {c.global_region ? '海外' : '国内'}
+                        </Badge>
+                      )}
                       <span className="truncate">{c.name || c.uid}</span>
                       {c.credits != null && <span className="ml-auto tabular-nums text-slate-400">{c.credits.toFixed(1)}</span>}
                     </label>

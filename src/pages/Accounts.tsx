@@ -282,14 +282,16 @@ export default function Accounts() {
       toast('warn', '没有账号可导出');
       return;
     }
-    // 凭证导出强确认（审查 P0-2；禁 window.confirm，红线）：导出文件恒含明文 JWT / refreshToken
+    // 导出方式二选一（2026-10-19 安全修正）：默认脱敏导出——不写 JWT/refreshToken，
+    // 明文凭据不出本机；含凭证导出需显式选择，走强确认弹框。
     setExportConfirming(true);
   };
 
-  const doExportAccounts = async () => {
+  const doExportAccounts = async (withCreds = false) => {
     setExportConfirming(false);
     try {
-      const payload = await api.accounts.exportRaw();
+      // withCreds=false → 脱敏导出（后端 redact 缺省 true）：不写 JWT/refreshToken
+      const payload = await api.accounts.exportRaw(!withCreds);
       const content = JSON.stringify(payload, null, 2);
       const fileStamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
       const filePath = await save({
@@ -812,29 +814,55 @@ export default function Accounts() {
         onClose={() => setDeleteSlot(null)}
         onConfirm={() => void confirmDeleteSlot()}
       />
-      {/* 导出凭证确认弹框（审查 P0-2；禁 window.confirm，红线） */}
+      {/* 导出方式选择（2026-10-19 安全修正：默认脱敏，含凭证需显式选择） */}
       <Modal
         open={exportConfirming}
         onClose={() => setExportConfirming(false)}
-        title="确认导出明文凭证"
+        title="导出账号"
         footer={
           <>
             <button className="btn-outline" onClick={() => setExportConfirming(false)}>取消</button>
             <button
-              className="btn-primary !bg-rose-600 hover:!bg-rose-500"
-              onClick={() => void doExportAccounts()}
+              className="btn-primary"
+              onClick={() => void doExportAccounts(false)}
             >
-              我已知晓风险，继续导出
+              导出（脱敏）
+            </button>
+            <button
+              className="btn-primary !bg-rose-600 hover:!bg-rose-500"
+              onClick={() => void doExportAccounts(true)}
+            >
+              导出（含凭证）
             </button>
           </>
         }
       >
         <div className="space-y-3 text-sm">
-          <div>即将导出 {accounts.length} 个账号，文件包含明文 JWT / refreshToken 凭证（等同密码）。</div>
-          <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300">
-            <ShieldAlert size={14} className="mt-0.5 shrink-0" />
-            <span>仅应在可信环境用于账号迁移，导出后请妥善保管，切勿通过不可信渠道传输。</span>
-          </div>
+          <div>即将导出 {accounts.length} 个账号，请选择导出方式：</div>
+          <button
+            type="button"
+            onClick={() => void doExportAccounts(false)}
+            className="w-full rounded-lg border border-slate-200 p-3 text-left transition hover:border-brand-400 hover:bg-brand-50/50 dark:border-zinc-700 dark:hover:border-brand-500 dark:hover:bg-brand-500/10"
+          >
+            <div className="font-medium">脱敏导出（推荐）</div>
+            <div className="mt-0.5 text-xs text-slate-500 dark:text-zinc-400">
+              保留账号名、余额、到期、分组等全部元数据；<b>不写入</b> JWT 与 refreshToken。
+              适合查看、统计、跨机器迁移账号结构。
+            </div>
+          </button>
+          <button
+            type="button"
+            onClick={() => void doExportAccounts(true)}
+            className="w-full rounded-lg border border-rose-200 bg-rose-50/50 p-3 text-left transition hover:border-rose-400 dark:border-rose-500/30 dark:bg-rose-500/10"
+          >
+            <div className="flex items-center gap-1.5 font-medium text-rose-600 dark:text-rose-400">
+              <ShieldAlert size={14} /> 含凭证导出
+            </div>
+            <div className="mt-0.5 text-xs text-rose-700 dark:text-rose-300">
+              文件包含<b>明文 JWT / refreshToken</b>（等同密码，任何人读到即可接管账号）。
+              仅应在可信环境用于账号迁移，导出后请妥善保管，切勿通过不可信渠道传输。
+            </div>
+          </button>
         </div>
       </Modal>
       <OAuthLoginModal

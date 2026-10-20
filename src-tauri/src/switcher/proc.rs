@@ -338,6 +338,25 @@ pub fn start_app_pid(sess: &mut Session, sink: &dyn ProgressSink) -> Result<u32,
         super::thrown(sink, &format!("启动 {} 失败: {e}", sess.prof.app_name))
     })?;
     let pid = child.id();
+    // authfile 布局（WorkBuddy/CodeBuddy）启动后活性确认：主进程 3 秒内退出 = 客户端
+    // 启动即崩（实测 2026-10-17：WorkBuddy 安装目录被静默更新砍残，主进程 MODULE_NOT_FOUND
+    // 崩溃/重装对话框即退，窗口永不出现——旧流程仍报「切换成功」，用户感知为「切了但
+    // 客户端打不开」）。此处等 3 秒确认主进程存活，崩了立即报错，不再假成功。
+    // Electron 正常冷启动主进程存活远超 3 秒，不会误伤。
+    if sess.prof.layout == super::profile::Layout::Authfile {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let sys = snapshot();
+        if !pid_alive_matching(&sys, pid, &sess.prof) {
+            return Err(super::thrown(
+                sink,
+                &format!(
+                    "{} 启动后 3 秒内进程退出（疑似客户端安装损坏或启动崩溃），本次切换未生效；\
+                     请修复或重装 {} 客户端后重试（详情见 logs/switcher.log）",
+                    sess.prof.app_name, sess.prof.app_name
+                ),
+            ));
+        }
+    }
     Ok(pid)
 }
 

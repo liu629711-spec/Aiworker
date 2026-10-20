@@ -160,7 +160,15 @@ async fn locate_exe(db: &SqlitePool) -> Option<std::path::PathBuf> {
 
 fn candidate_exe_paths() -> Vec<std::path::PathBuf> {
     let mut v = Vec::new();
-    // 本机实际安装位置(实测)与常见安装盘
+    // 本机实际安装位置(实测)与常见安装盘。
+    // 海外版优先(用户实测路径 D:\WorkBuddyAI\WorkBuddyAI.exe——10-15 自更新把
+    // D:\Work\WorkBuddyAI 覆盖成国内版后，海外安装包独立落此目录，自带海外
+    // asar 与 WorkBuddyAI.exe 入口)；国内版路径在后兜底。
+    for base in ["D", "C", "E"] {
+        v.push(std::path::PathBuf::from(format!(
+            "{base}:\\WorkBuddyAI\\WorkBuddyAI.exe"
+        )));
+    }
     for base in ["D", "C", "E"] {
         v.push(std::path::PathBuf::from(format!(
             "{base}:\\Work\\WorkBuddyAI\\WorkBuddy.exe"
@@ -182,7 +190,9 @@ fn locate_exe_from_process() -> Option<std::path::PathBuf> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        let script = "(Get-Process WorkBuddy -ErrorAction SilentlyContinue | \
+        // 海外入口进程名 WorkBuddyAI 与国内入口 WorkBuddy 都查(两者可在
+        // 不同安装目录共存；海外版为独立安装包、进程名不同)
+        let script = "(Get-Process WorkBuddy,WorkBuddyAI -ErrorAction SilentlyContinue | \
               Where-Object { $_.Path } | Select-Object -First 1).Path";
         if let Ok(out) = std::process::Command::new("powershell")
             .args(["-NoProfile", "-Command", script])
@@ -356,14 +366,14 @@ fn is_workbuddy_running() -> bool {
 }
 
 /// 切换到指定账号:退出 WorkBuddy → 备份并替换会话文件 → 重新启动
-pub async fn switch_account(db: &SqlitePool, id: i64) -> AppResult<()> {
-    let row: Option<(String, Vec<u8>)> =
-        sqlx::query_as("SELECT uid, session_blob FROM wb_accounts WHERE id = ?1")
+pub async fn switch_account(db: &SqlitePool, id: i64, app_data_dir: &std::path::Path) -> AppResult<()> {
+    let row: Option<(String, String, Vec<u8>)> =
+        sqlx::query_as("SELECT uid, region, session_blob FROM wb_accounts WHERE id = ?1")
             .bind(id)
             .fetch_optional(db)
             .await
             .map_err(|e| AppError::Other(format!("查询账号失败: {e}")))?;
-    let (_, blob) = row.ok_or_else(|| AppError::Other("账号不存在或已被删除".into()))?;
+    let (_, region, blob) = row.ok_or_else(|| AppError::Other("账号不存在或已被删除".into()))?;
 
     let exe = locate_exe(db).await.ok_or_else(|| {
         AppError::Other("未找到 WorkBuddy 客户端:可在设置里指定 WorkBuddy.exe 的完整路径".into())
@@ -390,36 +400,32 @@ pub async fn switch_account(db: &SqlitePool, id: i64) -> AppResult<()> {
         let _ = std::fs::remove_file(&logged_out);
     }
 
-    // 3. 重新启动(与 ZCode 相同的"毒变量"防护)
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.env_remove("ELECTRON_RUN_AS_NODE")
-        .env_remove("NODE_OPTIONS");
-    let poisoned: Vec<String> = std::env::vars()
-        .map(|(k, _)| k)
-        .filter(|k| k.starts_with("ELECTRON_"))
-        .collect();
-    for k in poisoned {
-        cmd.env_remove(&k);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0000_0008); // DETACHED_PROCESS
-    }
-    cmd.spawn()
-        .map_err(|e| AppError::Other(format!("启动 WorkBuddy 失败({}): {e}", exe.display())))?;
-    Ok(())
+    // 3. 重新启动:海外会话必须注入海外 ACC 配置(否则客户端以默认国内产品域
+    // 配置启动,海外会话(domain=workbuddy.ai/codebuddy.ai)登录态判环境不符
+    // 连不上服务器——用户实测「切换海外的登录不上去」根因之一);
+    // 国内会话不注入(客户端默认配置即国内)
+    let acc_config = if region == "overseas" {
+        Some(ensure_oversea_acc_config(app_data_dir)?)
+    } else {
+        None
+    };
+    launch_client(&exe, acc_config.as_deref())
 }
 
 fn kill_workbuddy() {
-    let mut kill = std::process::Command::new("taskkill");
-    kill.args(["/IM", "WorkBuddy.exe", "/T", "/F"]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        kill.creation_flags(no_window_flags());
+    // 国内入口 WorkBuddy.exe 与海外入口 WorkBuddyAI.exe 都杀
+    // (两版独立安装共存，切换/海外登录前必须都退出，单实例锁会把新启动
+    // 请求转给残留实例)
+    for im in ["WorkBuddy.exe", "WorkBuddyAI.exe"] {
+        let mut kill = std::process::Command::new("taskkill");
+        kill.args(["/IM", im, "/T", "/F"]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            kill.creation_flags(no_window_flags());
+        }
+        let _ = kill.output();
     }
-    let _ = kill.output();
     // 官方退出时要收尾会话文件/watcher,给足时间
     std::thread::sleep(std::time::Duration::from_secs(3));
 }
@@ -442,45 +448,14 @@ pub async fn set_exe_path(db: &SqlitePool, path: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// 海外登录向导:确认当前账号已捕获 → 退出 WorkBuddy → 写官方登出标记
-/// → 注入海外 ACC 产品配置(登录页指向 workbuddy.ai)→ 重新启动。
-/// 登录成功后回到工具「捕获」即可,国内账号随时可用 wb_switch 切回。
-pub async fn launch_oversea_login(db: &SqlitePool, app_data_dir: &std::path::Path) -> AppResult<()> {
-    let exe = locate_exe(db).await.ok_or_else(|| {
-        AppError::Other("未找到 WorkBuddy 客户端:可先在设置里指定 WorkBuddy.exe 的完整路径".into())
-    })?;
-
-    // 安全阀:当前登录的账号必须已捕获,否则登出后会话就丢了
-    if let Some(cur) = current_session_meta() {
-        let captured: Option<(i64,)> =
-            sqlx::query_as("SELECT id FROM wb_accounts WHERE uid = ?1 AND region = ?2")
-                .bind(&cur.uid)
-                .bind(cur.region)
-                .fetch_optional(db)
-                .await
-                .map_err(|e| AppError::Other(format!("查询账号库失败: {e}")))?;
-        if captured.is_none() {
-            return Err(AppError::Other(
-                "当前登录的账号尚未捕获,请先点「捕获当前登录」再进行海外登录(否则该账号会话会丢失)".into(),
-            ));
-        }
-    }
-
-    // 退出客户端(登出标记必须在退出后写,避免 watcher 竞争)
-    kill_workbuddy();
-
-    // 写官方登出标记(hasLogoutMarker 只做存在性检查)
-    let path = auth_file_path()?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| AppError::Other(format!("创建会话目录失败: {e}")))?;
-    }
-    let logged_out = path.with_file_name("workbuddy-desktop.info.logged-out");
-    std::fs::write(&logged_out, "")
-        .map_err(|e| AppError::Other(format!("写入登出标记失败: {e}")))?;
-
-    // 生成海外 ACC 产品配置(登录认证 endpoint → workbuddy.ai)
+/// 海外 ACC 产品配置文件路径（app_data_dir/wb-acc-oversea.json）。
+/// 已存在则直接复用（用户机器上可能为完整官方产品配置，不得用最小版覆盖）；
+/// 缺失才写最小可用版（endpoint → workbuddy.ai）。
+fn ensure_oversea_acc_config(app_data_dir: &std::path::Path) -> AppResult<std::path::PathBuf> {
     let acc_path = app_data_dir.join("wb-acc-oversea.json");
+    if acc_path.is_file() {
+        return Ok(acc_path);
+    }
     let acc_json = r#"{
   "endpoint": "https://www.workbuddy.ai",
   "stagingEndpoint": "https://staging.workbuddy.ai",
@@ -497,12 +472,18 @@ pub async fn launch_oversea_login(db: &SqlitePool, app_data_dir: &std::path::Pat
 }"#;
     std::fs::write(&acc_path, acc_json)
         .map_err(|e| AppError::Other(format!("写入海外配置失败: {e}")))?;
+    Ok(acc_path)
+}
 
-    // 启动(注入 ACC_PRODUCT_CONFIG_PATH;毒变量防护与切换一致)
-    let mut cmd = std::process::Command::new(&exe);
+/// 以毒变量防护启动客户端；`acc_config` 非 None 时注入海外产品配置
+/// （ACC_PRODUCT_CONFIG_PATH，登录/接口端点指向 workbuddy.ai）。
+fn launch_client(exe: &std::path::Path, acc_config: Option<&std::path::Path>) -> AppResult<()> {
+    let mut cmd = std::process::Command::new(exe);
     cmd.env_remove("ELECTRON_RUN_AS_NODE")
-        .env_remove("NODE_OPTIONS")
-        .env("ACC_PRODUCT_CONFIG_PATH", &acc_path);
+        .env_remove("NODE_OPTIONS");
+    if let Some(acc) = acc_config {
+        cmd.env("ACC_PRODUCT_CONFIG_PATH", acc);
+    }
     let poisoned: Vec<String> = std::env::vars()
         .map(|(k, _)| k)
         .filter(|k| k.starts_with("ELECTRON_"))
@@ -518,6 +499,63 @@ pub async fn launch_oversea_login(db: &SqlitePool, app_data_dir: &std::path::Pat
     cmd.spawn()
         .map_err(|e| AppError::Other(format!("启动 WorkBuddy 失败({}): {e}", exe.display())))?;
     Ok(())
+}
+
+/// 海外登录向导:确认当前账号已捕获 → 退出 WorkBuddy → 写官方登出标记
+/// → 注入海外 ACC 产品配置(登录页指向 workbuddy.ai)→ 重新启动。
+/// 登录成功后回到工具「捕获」即可,国内账号随时可用 wb_switch 切回。
+pub async fn launch_oversea_login(db: &SqlitePool, app_data_dir: &std::path::Path) -> AppResult<()> {
+    let exe = locate_exe(db).await.ok_or_else(|| {
+        AppError::Other("未找到 WorkBuddy 客户端:可先在设置里指定 WorkBuddy.exe 的完整路径".into())
+    })?;
+
+    // 安全阀:当前登录的账号必须已捕获,否则登出后会话就丢了。
+    // **只按 uid 匹配**:auth 文件 domain 随客户端产品域漂移(国内账号在海外版
+    // 客户端登录 → domain=codebuddy.ai → 判 overseas),旧捕获条目 region=domestic
+    // 会让 uid 命中而 region 不命中,误报「尚未捕获」(用户实测卡死点);
+    // 命中后把 region 同步为当前判定(会话文件同一份,环境跟随 auth 文件)。
+    if let Some(cur) = current_session_meta() {
+        let existing: Option<(i64, String)> =
+            sqlx::query_as("SELECT id, region FROM wb_accounts WHERE uid = ?1")
+                .bind(&cur.uid)
+                .fetch_optional(db)
+                .await
+                .map_err(|e| AppError::Other(format!("查询账号库失败: {e}")))?;
+        match existing {
+            Some((id, region)) => {
+                if region != cur.region {
+                    sqlx::query("UPDATE wb_accounts SET region = ?1 WHERE id = ?2")
+                        .bind(cur.region)
+                        .bind(id)
+                        .execute(db)
+                        .await
+                        .map_err(|e| AppError::Other(format!("同步会话环境失败: {e}")))?;
+                }
+            }
+            None => {
+                return Err(AppError::Other(
+                    "当前登录的账号尚未捕获,请先点「捕获当前登录」再进行海外登录(否则该账号会话会丢失)".into(),
+                ));
+            }
+        }
+    }
+
+    // 退出客户端(登出标记必须在退出后写,避免 watcher 竞争)
+    kill_workbuddy();
+
+    // 写官方登出标记(hasLogoutMarker 只做存在性检查)
+    let path = auth_file_path()?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| AppError::Other(format!("创建会话目录失败: {e}")))?;
+    }
+    let logged_out = path.with_file_name("workbuddy-desktop.info.logged-out");
+    std::fs::write(&logged_out, "")
+        .map_err(|e| AppError::Other(format!("写入登出标记失败: {e}")))?;
+
+    // 注入海外 ACC 产品配置并重启（完整版已存在则复用，见 ensure_oversea_acc_config）
+    let acc_path = ensure_oversea_acc_config(app_data_dir)?;
+    launch_client(&exe, Some(&acc_path))
 }
 
 /// 重命名账号备注

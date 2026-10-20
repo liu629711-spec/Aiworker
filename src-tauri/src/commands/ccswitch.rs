@@ -348,6 +348,7 @@ fn ensure_ccswitch_key(data_dir: &std::path::Path) -> Result<String, String> {
         daily_stats: Vec::new(),
         allowed_groups: Vec::new(),
         allowed_tags: Vec::new(),
+    region: String::new(),
     };
     let key = entry.key.clone();
     file.keys.push(entry);

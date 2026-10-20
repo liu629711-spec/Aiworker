@@ -21,3 +21,4 @@ pub mod usage_history;
 pub mod wb_config;
 pub mod workbuddy;
 pub mod workbuddy_stats;
+pub mod zcode_pool;

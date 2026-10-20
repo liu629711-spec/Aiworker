@@ -21,6 +21,10 @@ use crate::state::AppState;
 pub struct QoderAccount {
     #[serde(default)]
     pub id: String,
+    /// 账号所属区："cn"（默认，存量账号）| "global"——登录入口区域盖章，
+    /// 免费档分区回写、网关选号分区过滤、刷新/积分分区基址的依据
+    #[serde(default = "default_account_region")]
+    pub region: String,
     /// 全家桶 uid（/api/v1/userinfo 回填；PAT 导入时 userinfo 失败可空）
     #[serde(default)]
     pub uid: String,
@@ -61,6 +65,18 @@ pub struct QoderAccount {
     /// 存量账号经 ensure_pool_profiles 惰性回填）
     #[serde(default)]
     pub device_profile: Option<crate::tasks::qoder_device::QoderDeviceProfile>,
+    /// 免费档模型清单 + 状态（免费额度可见性）：目录 rate=0 的模型快照，
+    /// [{id,name,rate,exhausted_at}]——exhausted_at 为最近一次命中额度错误码
+    /// （110/112/113/114/115/116/117/118/119/122）的时刻，None = 未观测到耗尽
+    #[serde(default)]
+    pub free_models: Option<serde_json::Value>,
+    /// 免费额度信息刷新时刻（ISO8601；credits_fetch 回写）
+    #[serde(default)]
+    pub free_models_fetched_at: Option<String>,
+}
+
+fn default_account_region() -> String {
+    "cn".to_string()
 }
 
 /// Qoder 设置（kv `qoder_settings`；对照 WorkBuddySettings 裁剪）
@@ -399,6 +415,15 @@ pub(crate) fn ide_data_dir() -> Option<PathBuf> {
     std::env::var("APPDATA")
         .ok()
         .map(|d| PathBuf::from(d).join("QoderCN"))
+}
+
+/// 海外客户端（Qoder，独立产品）数据目录：`%APPDATA%\Qoder`——与 QoderCN 并列，
+/// 登录态文件布局同构（Local State + User/globalStorage/state.vscdb，2026-10-17
+/// 本机实测）。扫描本地账号时与国内目录各扫一份并盖对应区域章。
+pub(crate) fn ide_data_dir_global() -> Option<PathBuf> {
+    std::env::var("APPDATA")
+        .ok()
+        .map(|d| PathBuf::from(d).join("Qoder"))
 }
 
 /// QoderWork exe 候选：settings.qoderwork_path 人工指定优先，否则默认安装布局。

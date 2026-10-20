@@ -22,7 +22,9 @@ import {
   History,
   HelpCircle,
   FolderCog,
+  Sparkles,
   Tags,
+  ChevronDown,
 } from 'lucide-react';
 import { useMemo } from 'react';
 import { createPortal } from 'react-dom';
@@ -84,6 +86,71 @@ function fmtExpire(ts: number | null): string {
   return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
 }
 
+/** 免费额度数值展示：整数不带小数点，小数保留 2 位（null → '—'） */
+function fmtFreeNum(v: number | null): string {
+  if (v == null) return '—';
+  return Number.isInteger(v) ? String(v) : v.toFixed(2);
+}
+
+/** 免费模型徽标 + 悬停明细（免费额度可见性，对齐 Qoder 账号页同名列）。
+ *
+ * 免费模型 = 目录 rate=0 的限时免费档（不消耗积分，实测 Hy3 / Step-5-Preview）。
+ * 数据源：账号 free_models（随积分刷新/额度错误回写）。
+ * exhausted_at（额度错误码驱动记录）非空 → 标注「已用完（时刻）」，
+ * 是「哪个号在这个免费模型上还有额度」的唯一可靠信号（官方无查询接口）。
+ */
+function FreeModelsCell({ a }: { a: WorkBuddyAccountView }) {
+  const models = a.free_models ?? null;
+  if (models == null) {
+    return (
+      <span className="text-xs text-slate-300 dark:text-zinc-600" title="尚未采集（首次积分刷新后回写）">
+        —
+      </span>
+    );
+  }
+  if (models.length === 0) {
+    return (
+      <span className="text-xs text-slate-300 dark:text-zinc-600" title="当前目录无 0 倍率（免费档）模型">
+        无
+      </span>
+    );
+  }
+  const exhausted = models.filter((m) => m.exhausted_at);
+  const title = [
+    ...models.map((m) => {
+      if (!m.exhausted_at) return `${m.name}：可用`;
+      const reset = m.reset_at ? `，${m.reset_at} 恢复` : '';
+      return `${m.name}：已用完 ${m.exhausted_at}${reset}`;
+    }),
+    a.free_models_fetched_at ? `刷新于 ${a.free_models_fetched_at}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+  // 恢复时刻展示用最短形态（取 MM-DD HH:MM，标题里有完整值）
+  const resetHint = exhausted
+    .map((m) => (m.reset_at ? `${m.name} ${m.reset_at.slice(5, 16)} 恢复` : ''))
+    .filter(Boolean)
+    .join('、');
+  // 直接展示免费模型名（国内/海外目录不同：国内 Hy3/Step-5-Preview，海外以
+  // 上游下发的免费档为准）——计数徽标对多模型语义不清，模型名即事实
+  return (
+    <div className="flex flex-col items-start gap-0.5" title={title}>
+      <div className="flex flex-wrap gap-1">
+        {models.map((m) => (
+          <Badge key={m.id} tone={m.exhausted_at ? 'amber' : 'green'}>
+            <Sparkles size={10} className="mr-1" />
+            {m.name}
+            {m.exhausted_at && <span className="ml-0.5 opacity-70">·已用完</span>}
+          </Badge>
+        ))}
+      </div>
+      {resetHint && (
+        <span className="text-[10px] text-slate-400">{resetHint}</span>
+      )}
+    </div>
+  );
+}
+
 function tokenTone(ts: number | null): string {
   if (ts == null) return 'text-slate-400';
   const days = (ts * 1000 - Date.now()) / 86400000;
@@ -129,6 +196,8 @@ export default function BuddyAccounts() {
   const [oauthStage, setOauthStage] = useState('');
   const [oauthMessage, setOauthMessage] = useState('');
   const [oauthAuthUrl, setOauthAuthUrl] = useState<string | null>(null);
+  // 登录区域下拉（国内 / 海外版）：海外账号需走 www.workbuddy.ai 登录站
+  const [oauthRegionMenu, setOauthRegionMenu] = useState(false);
   // 环境重置（F-14）：16 项勾选预览 → 二次确认 → 执行结果
   const [resetOpen, setResetOpen] = useState(false);
   const [resetItems, setResetItems] = useState<WbResetItem[]>([]);
@@ -383,15 +452,18 @@ export default function BuddyAccounts() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [switchingTo, savingLogin]);
 
-  // 发起 OAuth 扫码（后端打开浏览器 + 轮询 + 自动入池）
-  const startOauth = async () => {
+  // 发起 OAuth 扫码（后端打开浏览器 + 轮询 + 自动入池）；
+  // region：'cn' = 国内登录站（copilot.tencent.com）/ 'global' = 海外版（www.workbuddy.ai）——
+  // 修复「海外账号无法登录」：旧流程硬编码国内端点，海外号只能收到国内登录站
+  const startOauth = async (region: 'cn' | 'global' = 'cn') => {
+    setOauthRegionMenu(false);
     setOauthBusy(true);
     setOauthStage('init');
-    setOauthMessage('正在发起扫码登录…');
+    setOauthMessage(region === 'global' ? '正在发起海外版扫码登录（www.workbuddy.ai）…' : '正在发起扫码登录…');
     setOauthAuthUrl(null);
     setOauthOpen(true);
     try {
-      await api.workbuddy.oauthLogin();
+      await api.workbuddy.oauthLogin(region);
     } catch (err) {
       setOauthStage('error');
       setOauthMessage(String(err));
@@ -785,14 +857,38 @@ export default function BuddyAccounts() {
             <button onClick={() => void refresh()} className="btn-outline" disabled={loading}>
               <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> 刷新
             </button>
-            <button
-              className="btn-outline"
-              onClick={() => void startOauth()}
-              disabled={oauthBusy}
-              title={oauthBusy ? '扫码流程进行中…' : undefined}
-            >
-              <Globe size={15} /> OAuth登录
-            </button>
+            <div className="relative">
+              <button
+                className="btn-outline"
+                onClick={() => setOauthRegionMenu((v) => !v)}
+                disabled={oauthBusy}
+                title={oauthBusy ? '扫码流程进行中…' : '选择登录区域：国内版 / 海外版'}
+              >
+                <Globe size={15} /> OAuth登录 <ChevronDown size={13} className="opacity-60" />
+              </button>
+              {oauthRegionMenu && (
+                <>
+                  {/* 透明遮罩：点击菜单外任意处关闭 */}
+                  <div className="fixed inset-0 z-10" onClick={() => setOauthRegionMenu(false)} />
+                  <div className="absolute left-0 top-full z-20 mt-1 w-56 overflow-hidden rounded-lg border border-slate-200 bg-white py-1 shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                    <button
+                      className="block w-full px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-100 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                      onClick={() => void startOauth('cn')}
+                    >
+                      <span className="font-medium">国内版登录</span>
+                      <span className="block text-xs text-slate-400">codebuddy.cn / copilot.tencent.com</span>
+                    </button>
+                    <button
+                      className="block w-full px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-100 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                      onClick={() => void startOauth('global')}
+                    >
+                      <span className="font-medium">海外版登录</span>
+                      <span className="block text-xs text-slate-400">workbuddy.ai（Global 区账号）</span>
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
             <button className="btn-outline" onClick={() => void importFromAuth()} disabled={importing}>
               {importing ? <Spinner /> : <ScanSearch size={15} />} 扫描本机账号
             </button>
@@ -909,6 +1005,12 @@ export default function BuddyAccounts() {
                 <th className="px-4 py-2 text-left">会员套餐</th>
                 <th className="px-4 py-2 text-left">积分包</th>
                 <th className="px-4 py-2 text-right">可用积分</th>
+                <th
+                  className="px-4 py-2 text-left"
+                  title="免费模型（不消耗积分的限时免费档，如 Hy3 / Step-5-Preview）：显示各模型额度状态；某模型额度被拒时标注已用完"
+                >
+                  免费模型
+                </th>
                 <th className="px-4 py-2 text-left">token 到期</th>
                 <th className="px-4 py-2 text-left">签到状态</th>
                 <th className="px-4 py-2 text-left">状态</th>
@@ -933,11 +1035,29 @@ export default function BuddyAccounts() {
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-1.5">
                         <span className="font-medium">{a.nickname || a.id}</span>
+                        {a.region === 'overseas' && (
+                          <Badge tone="violet" title="海外区账号（workbuddy.ai 端点，模型/计费与国内区独立）">
+                            海外
+                          </Badge>
+                        )}
                         {a.is_current && <Badge tone="green">当前</Badge>}
                         {a.needs_relogin && (
                           <span title={a.relogin_reason} className="text-rose-500">
                             <ShieldAlert size={12} />
                           </span>
+                        )}
+                        {/* 凭证健康度预警（2026-10-18）：临期/过期提前提示，不必等签到
+                            失败才发现；dead 由上面的 needs_relogin 图标表达。
+                            tooltip 优先用后端 credential_hint（口径唯一），缺失时回退本地文案 */}
+                        {!a.needs_relogin && a.credential_health === 'expiring' && (
+                          <Badge tone="amber" title={a.credential_hint || `access token 剩余约 ${Math.round(a.credential_ttl_hours ?? 0)} 小时，下轮续期将自动刷新`}>
+                            凭证临期
+                          </Badge>
+                        )}
+                        {!a.needs_relogin && a.credential_health === 'expired' && (
+                          <Badge tone="red" title={a.credential_hint || 'access token 已过期；若 refresh token 仍有效会在下次调用时自动刷新'}>
+                            凭证过期
+                          </Badge>
                         )}
                       </div>
                       <div className="font-mono text-xs text-slate-400">{maskUid(a.uid)}</div>
@@ -1000,6 +1120,9 @@ export default function BuddyAccounts() {
                     </td>
                     <td className="px-4 py-3 text-right tabular-nums">
                       {a.credits_balance != null ? a.credits_balance.toFixed(2) : '-'}
+                    </td>
+                    <td className="px-4 py-3">
+                      <FreeModelsCell a={a} />
                     </td>
                     <td className="px-4 py-3 text-xs">
                       <div className={tokenTone(a.access_token_expires_at)}>{fmtExpire(a.access_token_expires_at)}</div>

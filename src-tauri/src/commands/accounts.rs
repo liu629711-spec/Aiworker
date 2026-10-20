@@ -74,6 +74,7 @@ pub fn derive_device(uid: &str) -> DeviceEntry {
         device_id,
         market_user_id: Some(market_user_id),
         session_id: Some(session_id),
+        locked: false,
     }
 }
 
@@ -156,8 +157,17 @@ pub fn accounts_list(state: State<AppState>) -> Vec<AccountView> {
 }
 
 /// 导出所有账号原始数据，字段名对齐参考 JSON（camelCase），供前端一键导出使用。
+///
+/// `redact`（缺省 true，2026-10-19 安全修正）：true = 脱敏导出，`cloudIdeJwt` 与
+/// `refreshToken` 不写入文件（JWT 是账号的完整接管凭据，有效期以天计；明文落盘
+/// 等于把账号交给任何能读到该文件的人）。含凭证导出需显式 `redact=false`，
+/// 前端对该路径已有强确认弹框。
 #[tauri::command]
-pub fn accounts_export_raw(state: State<AppState>) -> Result<serde_json::Value, String> {
+pub fn accounts_export_raw(
+    state: State<AppState>,
+    redact: Option<bool>,
+) -> Result<serde_json::Value, String> {
+    let redact = redact.unwrap_or(true);
     let accounts = crate::vault::load_accounts(&state);
     let groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     let device_map: DeviceMap = crate::store::docs::device_map_load(&crate::store::db(&state.data_dir));
@@ -186,11 +196,12 @@ pub fn accounts_export_raw(state: State<AppState>) -> Result<serde_json::Value, 
 
             serde_json::json!({
                 "name": v.name,
-                "cloudIdeJwt": jwt_full,
+                // 脱敏导出：不写入完整 JWT / refreshToken（明文凭据不出本机）
+                "cloudIdeJwt": if redact { String::new() } else { jwt_full },
                 "deviceId": device_id,
                 "jwtExp": v.jwt_exp_timestamp,
                 "balance": v.credits,
-                "refreshToken": refresh_token,
+                "refreshToken": if redact { String::new() } else { refresh_token },
                 "jwtSource": jwt_source,
                 "userId": v.user_id,
                 "dcId": raw.and_then(|a| a.dc_id.clone()),
@@ -673,21 +684,18 @@ pub fn account_delete(
     // 键，仅清 device_map）。
     {
         let store = crate::store::db(&state.data_dir);
-        // C3（审查）：整表 load→save 持 DEVICE_MAP_LOCK（叶子锁）——与签到
-        // get_device_for / OAuth writeback_oauth_device 写方互斥防丢更新
-        let _g = crate::store::docs::DEVICE_MAP_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut map = crate::store::docs::device_map_load(&store);
-        if map.remove(&user_id).is_some() {
-            // 保存失败仅落日志不阻断删除（数据卫生问题，对齐下方标签清理口径；
-            // 孤儿条目影响兜底设备基准，留痕便于人工修复 device_map.json）
-            if let Err(e) = crate::store::docs::device_map_save(&store, &map) {
-                fs_utils::app_log(
-                    &state.data_dir,
-                    &format!("账号 {user_id} 设备指纹清理失败: {e}"),
-                );
-            }
+        // C3（审查）：与签到 get_device_for / OAuth writeback_oauth_device 写方
+        // 互斥防丢更新。
+        // 自死锁修复（2026-10-20）：原实现外层持 DEVICE_MAP_LOCK 后再调
+        // device_map_save（内部再锁）。改用持锁读改写封装。
+        let removed = crate::store::docs::with_device_map(&store, |map| Ok(map.remove(&user_id)));
+        // 保存失败仅落日志不阻断删除（数据卫生问题，对齐下方标签清理口径；
+        // 孤儿条目影响兜底设备基准，留痕便于人工修复 device_map.json）
+        if let Err(e) = removed {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("账号 {user_id} 设备指纹清理失败: {e}"),
+            );
         }
     }
 
@@ -1463,25 +1471,30 @@ pub fn refresh_remaining_credits_impl(
     if !thawed_uids.is_empty() {
         // C4（审查）：解冻回写两阶段第二段——锁内重读最新表、仅移除本次解冻的
         // uid（查询流程不持锁；他方窗口期写入的其他条目原样保留）
-        let _g = crate::store::docs::ACCOUNT_COOLDOWNS_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut cd = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
-        for (uid, snap) in &thawed_uids {
-            // 竞态防护：扫描窗口内调度签到/手动操作重写的新冷却（until/计数等已变化）
-            // 不得误清——仅移除与快照完全一致的条目；条目已消失（他方已清）则跳过
-            let unchanged_since_snap = cd.cooldowns.get(uid).map_or(true, |e| {
-                e.error_type == snap.error_type
-                    && e.until == snap.until
-                    && e.reason == snap.reason
-                    && e.error_count == snap.error_count
-            });
-            if unchanged_since_snap {
-                cd.cooldowns.remove(uid);
-            }
-        }
-        cd.updated_at = Some(fs_utils::now_iso());
-        crate::store::docs::account_cooldowns_save(&crate::store::db(&state.data_dir), &cd)?;
+        //
+        // 自死锁修复（2026-10-20）：原实现外层先拿 ACCOUNT_COOLDOWNS_LOCK，
+        // 再调 account_cooldowns_save——save 内部又拿同一把非重入锁，同线程
+        // 二次 lock 永久阻塞。改用持锁读改写封装，临界区只在一处获取。
+        crate::store::docs::with_account_cooldowns(
+            &crate::store::db(&state.data_dir),
+            |cd| {
+                for (uid, snap) in &thawed_uids {
+                    // 竞态防护：扫描窗口内调度签到/手动操作重写的新冷却（until/计数等已变化）
+                    // 不得误清——仅移除与快照完全一致的条目；条目已消失（他方已清）则跳过
+                    let unchanged_since_snap = cd.cooldowns.get(uid).map_or(true, |e| {
+                        e.error_type == snap.error_type
+                            && e.until == snap.until
+                            && e.reason == snap.reason
+                            && e.error_count == snap.error_count
+                    });
+                    if unchanged_since_snap {
+                        cd.cooldowns.remove(uid);
+                    }
+                }
+                cd.updated_at = Some(fs_utils::now_iso());
+                Ok(())
+            },
+        )?;
     }
     Ok(ok_count)
 }
@@ -1645,16 +1658,40 @@ pub fn credits_daily_list(state: State<AppState>) -> Vec<CreditsDailySnapshot> {
 
 /// 手动清除指定账号的冷却状态
 #[tauri::command]
-pub fn cooldown_clear(state: State<AppState>, user_id: String) -> Result<(), String> {
-    // C8（审查）：写库前持 ACCOUNT_COOLDOWNS_LOCK（叶子锁），与签到写方
-    //（save_cooldown）互斥，防整表读改写互相覆盖
-    let _g = crate::store::docs::ACCOUNT_COOLDOWNS_LOCK
+pub fn cooldown_clear(
+    state: State<AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+    user_id: String,
+) -> Result<(), String> {
+    // C8（审查）：写库走持锁读改写封装（store 层单处获取），与签到写方
+    //（save_cooldown）互斥，防整表读改写互相覆盖。
+    // 自死锁修复（2026-10-20）：原实现外层持锁后再调 `_save`（内部再锁）会
+    // 同线程二次 lock 永久阻塞。
+    {
+        crate::store::docs::with_account_cooldowns(
+            &crate::store::db(&state.data_dir),
+            |cd| {
+                if cd.cooldowns.remove(&user_id).is_some() {
+                    cd.updated_at = Some(fs_utils::now_iso());
+                }
+                Ok(())
+            },
+        )?;
+    }
+    // P1：网关运行中同步清除三池内存冷却并立即落库快照——否则 pool_cooldowns
+    // 表里的旧冷却会在下次启动回灌时把用户刚解除的账号重新冻上
+    let shared = runtime
         .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
-    if cd.cooldowns.remove(&user_id).is_some() {
-        cd.updated_at = Some(fs_utils::now_iso());
-        crate::store::docs::account_cooldowns_save(&crate::store::db(&state.data_dir), &cd)?;
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|rt| rt.shared.clone());
+    if let Some(shared) = shared {
+        shared.pool.clear_one(&user_id);
+        shared.wb_pool.clear_one(&user_id);
+        shared.qoder_pool.clear_one(&user_id);
+        shared.pool.flush_cooldown_snapshot();
+        shared.wb_pool.flush_cooldown_snapshot();
+        shared.qoder_pool.flush_cooldown_snapshot();
     }
     Ok(())
 }
@@ -1666,29 +1703,43 @@ pub fn cooldown_clear_all(
     state: State<AppState>,
     runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
 ) -> Result<usize, String> {
-    // C8（审查）：文件部分持 ACCOUNT_COOLDOWNS_LOCK（叶子锁）写库；内存池清理
-    //（clear_cooldowns 内部持池锁）在锁外执行——叶子锁不得嵌套其他锁
+    // C8（审查）：文件部分走持锁读改写封装；内存池清理（clear_cooldowns 内部
+    // 持池锁）在锁外执行——叶子锁不得嵌套其他锁。
+    // 自死锁修复（2026-10-20）：原实现外层持锁后再调 `_save`（内部再锁）。
     let file_count = {
-        let _g = crate::store::docs::ACCOUNT_COOLDOWNS_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
-        let n = cd.cooldowns.len();
-        if n > 0 {
-            cd.cooldowns.clear();
-            cd.updated_at = Some(fs_utils::now_iso());
-            crate::store::docs::account_cooldowns_save(&crate::store::db(&state.data_dir), &cd)?;
-        }
-        n
+        crate::store::docs::with_account_cooldowns(
+            &crate::store::db(&state.data_dir),
+            |cd| {
+                let n = cd.cooldowns.len();
+                if n > 0 {
+                    cd.cooldowns.clear();
+                    cd.updated_at = Some(fs_utils::now_iso());
+                }
+                Ok(n)
+            },
+        )?
     };
 
-    // 同时清除运行中 API 池的内存冷却状态
+    // 同时清除运行中 API 池的内存冷却状态。
+    // 修复（2026-10-19 审查）：此前只清 Trae 池——用户点「一键清除所有冷却」
+    // （多号被冷却致 503 的应急按钮）时，WB/Qoder 池冷却原样保留，503 不解。
+    // 三池全部清，返回合计。
     let mem_count = {
         let guard = runtime
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         match guard.as_ref() {
-            Some(rt) => rt.shared.pool.clear_cooldowns(),
+            Some(rt) => {
+                let n = rt.shared.pool.clear_cooldowns()
+                    + rt.shared.wb_pool.clear_cooldowns()
+                    + rt.shared.qoder_pool.clear_cooldowns();
+                // P1：清除后立即落空快照——否则 2s flusher 窗口内退出/崩溃，
+                // pool_cooldowns 旧行会在下次启动把刚清掉的冷却回灌复活
+                rt.shared.pool.flush_cooldown_snapshot();
+                rt.shared.wb_pool.flush_cooldown_snapshot();
+                rt.shared.qoder_pool.flush_cooldown_snapshot();
+                n
+            }
             None => 0,
         }
     };
@@ -2022,19 +2073,20 @@ pub fn refresh_jwt_impl(state: &AppState, user_id: &str, force: bool) -> Result<
     // 自动解冻（含 SessionDead）：新 JWT 刚从 ExchangeToken 换发、必然有效，
     // 此前签到 401 打上的 SessionDead 永久冷却若不清除，调度会永远跳过该账号
     //（自动解冻逻辑明确排除 SessionDead，见 refresh_remaining_credits）
-    // C4/C8（审查）：冷却整表读改写持 ACCOUNT_COOLDOWNS_LOCK（叶子锁），与
-    // 签到写方/手动清理命令互斥；app_log 在锁外执行
+    // C4/C8（审查）：冷却整表读改写走持锁封装，与签到写方/手动清理命令互斥；
+    // app_log 在锁外执行。
+    // 自死锁修复（2026-10-20）：原实现外层持锁后再调 `_save`（内部再锁）。
     let thaw_entry = {
-        let _g = crate::store::docs::ACCOUNT_COOLDOWNS_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut cd: AccountCooldownsFile = crate::store::docs::account_cooldowns_load(&crate::store::db(&state.data_dir));
-        let removed = cd.cooldowns.remove(user_id);
-        if removed.is_some() {
-            cd.updated_at = Some(fs_utils::now_iso());
-            crate::store::docs::account_cooldowns_save(&crate::store::db(&state.data_dir), &cd)?;
-        }
-        removed
+        crate::store::docs::with_account_cooldowns(
+            &crate::store::db(&state.data_dir),
+            |cd| {
+                let removed = cd.cooldowns.remove(user_id);
+                if removed.is_some() {
+                    cd.updated_at = Some(fs_utils::now_iso());
+                }
+                Ok(removed)
+            },
+        )?
     };
     if let Some(entry) = thaw_entry {
         fs_utils::app_log(

@@ -81,6 +81,10 @@ import type {
   UsageSessionsResult,
   TraeExpiredEntsResult,
   QoderAccountView,
+  OverseasAccessInfo,
+  ApiKeyTestResult,
+  KeyScopedModels,
+  FreeUsageSnapshot,
   QoderCheckinRecord,
   QoderCliStatus,
   QoderLiveLogins,
@@ -96,6 +100,8 @@ import type {
   QoderResetResult,
   QoderSettings,
 } from '../types';
+
+export type { ApiKeyEntry, OverseasAccessInfo, ApiKeyTestResult, KeyScopedModels, FreeUsageSnapshot, QoderAccountView, WorkBuddyAccountView };
 
 // ---- F1/F11：invoke 统一超时 + 错误源头翻译 ----
 // Tauri IPC 的 Promise 无法中止（invoke 无 AbortSignal 支持），用 Promise.race 竞速超时：
@@ -206,7 +212,13 @@ export const api = {
       invoke<number>('cooldown_clear_all'),
     refreshJwt: (userId: string, force = false) =>
       invoke<string>('refresh_jwt', { userId, force }),
-    exportRaw: () => invoke<Record<string, unknown>>('accounts_export_raw'),
+    /**
+     * Trae 账号导出。redact 缺省 true = 脱敏导出（不写 JWT/refreshToken，
+     * 2026-10-19 安全修正：明文凭据不出本机）；redact=false = 含凭证导出，
+     * 需前端强确认（导出文件等同密码）。
+     */
+    exportRaw: (redact?: boolean) =>
+      invoke<Record<string, unknown>>('accounts_export_raw', { redact: redact ?? null }),
     importAccounts: (content: string, only?: number[]) =>
       invoke<ImportReport>('accounts_import', { content, only }),
     // F-46：导入前预览（解析账号/分组、标记已存在，不写盘）
@@ -505,7 +517,9 @@ export const api = {
     accountsImport: (payload: Record<string, unknown>) =>
       invoke<WbPoolImportResult>('workbuddy_accounts_import', { payload }),
     // OAuth 扫码 + 环境重置（F-50/F-14，批次3）
-    oauthLogin: () => invoke<void>('workbuddy_oauth_login'),
+    /** region：'cn' = 国内登录站（copilot.tencent.com，缺省）；'global' = 海外版（www.workbuddy.ai） */
+    oauthLogin: (region?: 'cn' | 'global') =>
+      invoke<void>('workbuddy_oauth_login', { region: region ?? null }),
     envResetItems: () => invoke<WbResetItem[]>('workbuddy_env_reset_items'),
     envReset: (items: string[], keycloakLogout: boolean) =>
       invoke<WbResetResult[]>('workbuddy_env_reset', { items, keycloakLogout }),
@@ -572,7 +586,8 @@ export const api = {
     /** OAuth 设备流登录（浏览器授权页 + deviceToken/poll 轮询；事件 qoder-oauth-progress/done）。
      *  compat=true = 兼容模式（授权 URL 不带 client_id）：官方 client_id 常量被
      *  Qoder 轮换导致授权页「参数无效」时的降级链路；前端在授权超时后自动切换重试 */
-    oauthLogin: (compat?: boolean) => invoke<void>('qoder_oauth_login', { compat: compat ?? null }),
+    oauthLogin: (compat?: boolean, region?: 'cn' | 'global') =>
+      invoke<void>('qoder_oauth_login', { compat: compat ?? null, region: region ?? null }),
     /** 取消进行中的 OAuth 轮询（弹框「取消授权」）：后端置标志后轮询线程自行发失败终态 */
     oauthCancel: () => invoke<void>('qoder_oauth_cancel'),
     /** IDE 存储账号发现/导入（M3；secret://aicoding.auth.userInfo DPAPI+AES-GCM 解密） */
@@ -734,6 +749,14 @@ export const api = {
         wbTagIds?: string[] | null;
         /** Qoder 池标签筛选；null/未传 = 保留原值 */
         qoderTagIds?: string[] | null;
+        /** ZCode 上游开关（z.ai GLM 池）；null/未传 = 保留原值 */
+        zcodeEnabled?: boolean;
+        /** ZCode 池入池白名单（zcode accounts.id）；null/未传 = 保留原值 */
+        zcodeUids?: string[] | null;
+        /** ZCode 池账号并发上限（0 = 不限）；null/未传 = 保留原值 */
+        zcodeAccountConcurrencyLimit?: number;
+        /** ZCode 池粘性 TTL 秒；null/未传 = 保留原值 */
+        zcodePoolStickyTtlSecs?: number;
       },
       wbStrategy?: string,
     ) =>
@@ -769,6 +792,10 @@ export const api = {
         traeTagIds: wbFlags?.traeTagIds ?? null,
         wbTagIds: wbFlags?.wbTagIds ?? null,
         qoderTagIds: wbFlags?.qoderTagIds ?? null,
+        zcodeEnabled: wbFlags?.zcodeEnabled ?? null,
+        zcodeUids: wbFlags?.zcodeUids ?? null,
+        zcodeAccountConcurrencyLimit: wbFlags?.zcodeAccountConcurrencyLimit ?? null,
+        zcodePoolStickyTtlSecs: wbFlags?.zcodePoolStickyTtlSecs ?? null,
         wbStrategy: wbStrategy ?? null,
       }),
     poolStatus: () => invoke<PoolStatus[]>('pool_status'),
@@ -779,8 +806,22 @@ export const api = {
     wbPoolStatus: () => invoke<PoolStatus[]>('wb_pool_status'),
     /** Qoder 池实时状态（Qoder「资源调度」页：含 per-account inflight 在途计数） */
     qoderPoolStatus: () => invoke<PoolStatus[]>('qoder_pool_status'),
+    /** ZCode 池实时状态（z.ai GLM 池：含 per-account inflight 在途计数） */
+    zcodePoolStatus: () => invoke<PoolStatus[]>('zcode_pool_status'),
     /** 手动同步 Qoder 模型目录（复用每日调度任务入口；返回采纳模型数） */
     qoderCatalogSync: () => invoke<number>('qoder_catalog_sync'),
+    /** 海外号池接入信息（ZCode 页「海外号池」面板）：网关基址 + Buddy/Qoder 海外模型清单 */
+    overseasAccess: () =>
+      invoke<OverseasAccessInfo>('overseas_access_info'),
+    /** ① Key 连通性自测（真实走一次网关调度链路） */
+    keyTest: (keyId: string) => invoke<ApiKeyTestResult>('api_key_test', { keyId }),
+    /** ③ Key 生效范围模型清单（接入配置生成数据源） */
+    keyModels: (keyId: string) => invoke<KeyScopedModels>('api_key_models', { keyId }),
+    /** ③b 直写本机 ZCode agent 供应商配置 */
+    zcodeProviderWrite: (keyId: string) =>
+      invoke<{ ok: boolean; provider_id: string; models: number; backup: string }>('zcode_provider_write', { keyId }),
+    /** ② 免费模型用量计数快照（额度中心） */
+    freeUsageSnapshot: () => invoke<FreeUsageSnapshot>('free_usage_snapshot'),
     logsList: () => invoke<string[]>('api_logs_list'),
     logsDetail: (date: string) => invoke<string | null>('api_logs_detail', { date }),
     logsSearch: (opts: {

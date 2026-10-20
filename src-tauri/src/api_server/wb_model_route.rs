@@ -137,6 +137,14 @@ pub fn resolve(cfg: &WbRouteFile, catalog: &[super::wb_catalog::WbModel], reques
         return RouteResult::direct(req);
     }
 
+    // ⓪ 字面命中目录优先（2026-10-17 海外接入）：目录实名请求不被后续系列
+    // 通配劫持——gpt-6-astra / gemini-3.5-flash 等海外 GPT/Gemini 系实名入库后，
+    // 旧系列规则（"gpt-*"→deepseek-v4-pro、"gemini-*"→glm-5.3）会把实名请求
+    // 改写到别的模型。系列语义只服务「目录外名称」的兜底映射
+    if let Some(target) = catalog_hit(catalog, &req) {
+        return RouteResult::direct(target);
+    }
+
     // ① 别名静态映射
     let alias_hit = cfg
         .aliases
