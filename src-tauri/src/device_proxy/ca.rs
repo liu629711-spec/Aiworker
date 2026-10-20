@@ -241,6 +241,67 @@ fn pem_to_der(pem: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("ca.crt base64 解码失败: {e}"))
 }
 
+/// PKCS#8 DER → PKCS#1 DER：剥掉 rsaEncryption OID 外层，取内层裸 RSA 参数。
+/// 老版 Python CA 的 ca.key 是 PKCS#1（PEM 标签 "BEGIN RSA PRIVATE KEY"），
+/// 本函数供测试夹具构造用（生产 load_issuer 直接解析两种格式，无需转换）。
+fn pkcs8_to_pkcs1(der: &[u8]) -> Option<Vec<u8>> {
+    // PKCS#8: SEQUENCE { INTEGER 0, SEQUENCE { OID rsaEncryption, NULL }, OCTET STRING { PKCS#1 } }
+    // 内层 OCTET STRING 的 tag 是 0x04，其后是长度（长形式 0x82 + 2 字节）和载荷
+    let mut i = 0usize;
+    if der.get(i)? != &0x30 {
+        return None;
+    }
+    i += 1;
+    i += der_len_size(der, i)?;
+    // version INTEGER
+    i += der_tlv_size(der, i)?;
+    // algorithm SEQUENCE { OID, NULL }
+    i += der_tlv_size(der, i)?;
+    // OCTET STRING 包裹 PKCS#1
+    if der.get(i)? != &0x04 {
+        return None;
+    }
+    i += 1;
+    let len_size = der_len_size(der, i)?;
+    let payload_len = der_payload_len(der, i)?;
+    let end = i + len_size + payload_len;
+    (end <= der.len()).then(|| der[i + len_size..end].to_vec())
+}
+
+/// 读一个 DER TLV 的总字节数（tag 已在调用方消费，此处只读长度+长度本身占位）
+fn der_tlv_size(der: &[u8], pos: usize) -> Option<usize> {
+    if der.get(pos)? != &0x30 && der.get(pos)? != &0x02 {
+        return None;
+    }
+    let len_size = der_len_size(der, pos + 1)?;
+    let payload_len = der_payload_len(der, pos + 1)?;
+    Some(1 + len_size + payload_len)
+}
+
+/// 读 DER 长度字段声明的载荷长度（短形式直接取值，长形式读后续字节）
+fn der_payload_len(der: &[u8], pos: usize) -> Option<usize> {
+    match der.get(pos)? {
+        n if *n < 0x80 => Some(*n as usize),
+        0x81 => Some(*der.get(pos + 1)? as usize),
+        0x82 => {
+            let hi = *der.get(pos + 1)? as usize;
+            let lo = *der.get(pos + 2)? as usize;
+            Some((hi << 8) | lo)
+        }
+        _ => None,
+    }
+}
+
+/// 返回 DER 长度字段本身的字节数（短形式 1 字节，长形式 0x82 时 3 字节）
+fn der_len_size(der: &[u8], pos: usize) -> Option<usize> {
+    match der.get(pos)? {
+        n if *n < 0x80 => Some(1),
+        0x81 => Some(2),
+        0x82 => Some(3),
+        _ => None,
+    }
+}
+
 /// rustls CryptoProvider：tokio-rustls 默认启用 aws-lc-rs，全进程共享单例
 fn load_crypto_provider() -> CryptoProvider {
     // install_default 幂等：已被 tungstenite/其他模块安装过则忽略
@@ -401,28 +462,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// 兼容性红线回归：老版 Python 生成的 CA（RSA 2048、PKCS#1 "BEGIN RSA PRIVATE KEY"）
-    /// 必须原样加载。ring 后端 KeyPair 只认 PKCS#8（报「Could not parse key pair」），
-    /// 依赖 Cargo.toml 启用 aws_lc_rs feature；本测试固定夹具锁死该行为。
     #[test]
-    fn legacy_python_pkcs1_ca_loads() {
-        const LEGACY_CA_CERT: &str = include_str!("fixtures/legacy_ca_pkcs1.crt");
-        const LEGACY_CA_KEY: &str = include_str!("fixtures/legacy_ca_pkcs1.key");
-        let tmp = std::env::temp_dir().join(format!("aiwork_ca_pkcs1_{}", std::process::id()));
+    fn pkcs8_to_pkcs1_strips_oid_wrapper() {
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).expect("gen rsa");
+        let pkcs8 = key_pair.serialize_der();
+        let pkcs1 = pkcs8_to_pkcs1(&pkcs8).expect("convert");
+        // PKCS#8 头部: 30 82 .. .. 02 01 00 30 0d 06 09 2a 86 48 86 f7 0d 01 01 01（rsaEncryption OID）
+        // PKCS#1 头部: 30 82 .. .. 02 01 00 02 82 .. .. .. .. .. .. ..（裸 version + modulus INTEGER）
+        assert_eq!(pkcs1[0], 0x30, "PKCS#1 外层 SEQUENCE");
+        assert_eq!(&pkcs1[4..8], &[0x02, 0x01, 0x00, 0x02], "version 0 + INTEGER tag");
+        assert_eq!(pkcs1[8], 0x82, "modulus 长度长形式 2 字节");
+        assert!(pkcs1.len() < pkcs8.len(), "剥掉 OID 外层后应变短");
+        // 转换结果必须仍可被 PrivateKeyDer 当 PKCS#1 解析（PemObject 已由 ca.rs:27 导入）
+        let b64 = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(&pkcs1)
+        };
+        let pem = format!("-----BEGIN RSA PRIVATE KEY-----\n{b64}\n-----END RSA PRIVATE KEY-----\n");
+        let parsed = PrivateKeyDer::from_pem_slice(pem.as_bytes()).expect("PKCS#1 可解析");
+        assert!(matches!(parsed, PrivateKeyDer::Pkcs1(_)), "必须走 Pkcs1 分派");
+    }
+
+    /// 兼容性红线回归：老版 Python 生成的 CA（RSA 2048，PKCS#8 私钥）必须原样加载。
+    /// ring 后端 KeyPair 只认 PKCS#8 会报「Could not parse key pair」，依赖 Cargo.toml
+    /// 启用 aws_lc_rs feature。密钥运行时生成（曾用提交进仓库的静态夹具，已改生成式
+    /// 以杜绝私钥入库）。夹具 PEM 标签为 "BEGIN RSA PRIVATE KEY"，与 rcgen 产出的
+    /// "BEGIN PRIVATE KEY" 在 PrivateKeyDer 分派上不同：前者强制走 Pkcs1 解析分支，
+    /// 故此处用 from_pem_section 重贴标签，覆盖 load_issuer 的标签分派路径。
+    #[test]
+    fn legacy_python_rsa_ca_loads() {
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).expect("生成 RSA 密钥");
+        let cert_pem = {
+            let mut params = CertificateParams::default();
+            params
+                .distinguished_name
+                .push(DnType::CommonName, "TraeDeviceProxyCA");
+            let now = OffsetDateTime::now_utc();
+            params.not_before = now - Duration::days(1);
+            params.not_after = now + Duration::days(3650);
+            params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+            params.serial_number = Some(next_serial().into());
+            params.self_signed(&key_pair).expect("自签 CA").pem()
+        };
+        // PKCS#8 DER → PKCS#1 DER（剥掉 rsaEncryption OID 外层），再贴
+        // "BEGIN RSA PRIVATE KEY" 标签：与老版 Python 夹具的编码完全一致
+        let legacy_pem = {
+            let pkcs8 = key_pair.serialize_der();
+            let pkcs1 = pkcs8_to_pkcs1(&pkcs8).expect("PKCS#8 转 PKCS#1");
+            use base64::Engine as _;
+            let body = base64::engine::general_purpose::STANDARD.encode(&pkcs1);
+            let lines: Vec<&str> = body
+                .as_bytes()
+                .chunks(64)
+                .map(|c| std::str::from_utf8(c).unwrap())
+                .collect();
+            format!(
+                "-----BEGIN RSA PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----\n",
+                lines.join("\n")
+            )
+        };
+
+        let tmp = std::env::temp_dir().join(format!("aiwork_ca_rsa_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
-        std::fs::write(tmp.join("ca.crt"), LEGACY_CA_CERT).unwrap();
-        std::fs::write(tmp.join("ca.key"), LEGACY_CA_KEY).unwrap();
+        std::fs::write(tmp.join("ca.crt"), &cert_pem).unwrap();
+        std::fs::write(tmp.join("ca.key"), &legacy_pem).unwrap();
 
-        let ca = ensure_ca(&tmp).expect("legacy PKCS#1 CA must load");
+        let ca = ensure_ca(&tmp).expect("RSA CA must load");
         // 签发器可用：复用 RSA CA 密钥签发叶子证书
         let cfg = ca.gen_server_config("api.trae.cn").expect("leaf config");
         // 不广播 ALPN：对齐 Python 版行为（客户端回落 HTTP/1.1）
         assert!(cfg.alpn_protocols.is_empty());
         // 加载路径不得重写 CA 文件（换 CA = 强制所有用户重装证书）
+        assert_eq!(std::fs::read_to_string(tmp.join("ca.crt")).unwrap(), cert_pem);
         assert_eq!(
-            std::fs::read_to_string(tmp.join("ca.crt")).unwrap(),
-            LEGACY_CA_CERT
+            std::fs::read_to_string(tmp.join("ca.key")).unwrap(),
+            legacy_pem
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
