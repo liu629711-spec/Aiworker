@@ -10,3 +10,7 @@ nul
 release/
 .workbuddy/
 .zcode/
+# 私钥类：CA 夹具曾因静态提交进公开仓库历史，已改运行时生成（见 device_proxy/ca.rs）
+# 兜底规则，防止任何 pem/key 私钥被再次 add
+*.key
+*.pem
