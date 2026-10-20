@@ -2562,6 +2562,10 @@ mod pool_merge_tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
         );
         assert_eq!(m.wb_enabled_uids, vec!["wb-new".to_string()]);
         assert_eq!(m.enabled_uids, vec!["u1".to_string()]);
@@ -2650,6 +2654,10 @@ mod pool_merge_tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
+            None,
         );
         assert_eq!(m.strategy, "p2c");
         assert_eq!(m.wb_strategy, "");
@@ -2684,6 +2692,10 @@ mod pool_merge_tests {
             None, None, Some(vec!["g2".into()]), None, None, None, None,
             None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
         );
         assert_eq!(m.enabled_uids.len(), 2);
         assert_eq!(m.group_ids, vec!["g2".to_string()]);

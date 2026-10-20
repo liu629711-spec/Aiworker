@@ -131,7 +131,9 @@ fn to_anthropic_body(peek: &Value, model: &str) -> Vec<u8> {
 }
 
 /// GLM-5.3 思考档位 → thinking budget_tokens（分档口径 = ZCode 客户端
-/// reasoning.variants [low, max, high]；budget 按输出上限比例取整）
+/// reasoning.variants [low, max, high]）：budget = 输出上限 × 档位比例，
+/// 下限 1024（防小 max_tokens 归零），上限 max_tokens - 1024（保底正文空间，
+/// 上游对 budget ≥ max_tokens 直接拒绝）
 fn thinking_budget(effort: &str, max_tokens: i64) -> Option<i64> {
     let ratio = match effort.trim().to_lowercase().as_str() {
         "low" => 0.2,
@@ -139,7 +141,8 @@ fn thinking_budget(effort: &str, max_tokens: i64) -> Option<i64> {
         "high" => 0.8,
         _ => return None,
     };
-    Some(((max_tokens as f64) * ratio) as i64 / 1024 * 1024)
+    let raw = (max_tokens as f64 * ratio).floor() as i64;
+    Some(raw.clamp(1024, (max_tokens - 1024).max(1024)))
 }
 
 /// 发起上游请求（anthropic messages，强制 SSE）

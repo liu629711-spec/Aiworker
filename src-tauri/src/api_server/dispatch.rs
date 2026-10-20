@@ -817,9 +817,9 @@ fn smart_pool_order(
             TargetPool::Trae => (trae_stats, trae_rate),
             TargetPool::Buddy => (wb_stats, buddy_rate),
             TargetPool::Qoder => (qoder_stats, qoder_rate),
-            // ZCode：无余额概念（z.ai 按套餐配额），排序键退 (无到期, 免费, 0 号)，
-            // 实际并列时回退固定优先级序（ZCode 排最尾）
-            TargetPool::ZCode => ((None, 0.0), Some(0.0)),
+            // ZCode：无倍率概念（z.ai 按套餐配额），排序键退 (无到期, 未知倍率,
+            // 0 号)——未知倍率与 Custom 同口径排最后，绝不做「免费最优」抢跑
+            TargetPool::ZCode => ((None, 0.0), None),
             TargetPool::Custom => ((None, 0.0), None),
         };
         (
@@ -1209,6 +1209,19 @@ mod tests {
             );
         }
 
+        /// 种子一个 ZCode 池健康账号（zcode 独有/前缀锁定用例用）
+        fn seed_zcode_healthy(&self) {
+            self.state.zcode_pool.sync_from_zcode(
+                &[super::super::pool::ZCodeSyncAccount {
+                    uid: "16".into(),
+                    name: "zai".into(),
+                    access_token: "tk".into(),
+                    device_mid: "mid".into(),
+                }],
+                &["16".to_string()],
+            );
+        }
+
         fn app_log_contains(&self, needle: &str) -> bool {
             let log_dir = self.dir.join("logs");
             let Ok(entries) = std::fs::read_dir(&log_dir) else {
@@ -1261,6 +1274,7 @@ mod tests {
     #[test]
     fn zcode_prefix_locks_pool() {
         let fx = fixture(&["GLM-5.3"], None, None);
+        fx.seed_zcode_healthy();
         let r = fx.resolve("zcode/GLM-5.3").unwrap();
         assert_eq!(r.pool, TargetPool::ZCode);
         // 目录 id 字面量（执行路径据此构造上游 anthropic 请求）
@@ -1271,7 +1285,9 @@ mod tests {
     /// zcode_enabled=false 时仍可透传 Trae（ZCodeDisabled 只拦 zcode 独有模型）
     #[test]
     fn zcode_disabled_keeps_shared_models_routable() {
-        let fx = fixture(&["GLM-5.3"], None, None);
+        let fx = fixture(&["GLM-5.3"], Some(&["glm-5.3"]), None);
+        fx.seed_healthy(true);
+        fx.seed_healthy(false);
         fx.state
             .zcode_enabled
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1283,7 +1299,9 @@ mod tests {
     /// 前缀锁定才强制 ZCode——零行为差异（§9.1 口径对第四池同样成立）
     #[test]
     fn zcode_default_priority_stays_last() {
-        let fx = fixture(&["GLM-5.3"], None, None);
+        let fx = fixture(&["GLM-5.3"], Some(&["glm-5.3"]), None);
+        fx.seed_healthy(true);
+        fx.seed_healthy(false);
         let r = fx.resolve("GLM-5.3").unwrap();
         assert_ne!(r.pool, TargetPool::ZCode, "默认策略下 ZCode 不得抢先");
     }
@@ -1715,9 +1733,17 @@ mod tests {
         std::fs::create_dir_all(dir.join("data")).unwrap();
         // 缺失
         let p = load_policy(&dir);
+        // 默认优先级含 ZCode 尾部（2026-10-20 第四池接入）：Buddy → Trae →
+        // Qoder → ZCode，前三序保持改造前行为，ZCode 仅在前三者均不可用或
+        // 前缀/绑点名时接管（§9.1 零行为差异）
         assert_eq!(
             p.priority,
-            vec!["buddy".to_string(), "trae".to_string(), "qoder".to_string()]
+            vec![
+                "buddy".to_string(),
+                "trae".to_string(),
+                "qoder".to_string(),
+                "zcode".to_string()
+            ]
         );
         assert!(p.fallback);
         // 非法值（kv 直写）
