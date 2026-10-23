@@ -125,7 +125,13 @@ fn note_free_model_exhausted(data_dir: &std::path::Path, uid: &str, model: &str,
                 .map(|id| id.eq_ignore_ascii_case(model))
                 .unwrap_or(false);
             if hit {
-                m["exhausted_at"] = json!(now);
+                // 用 insert() 而非 IndexMut：与 free_usage/qoder_route 的 P0 修复
+                // 同口径。此处 m 是 Value（IndexMut 会安全插入、不 panic），但同一
+                // 批代码混用两种写法，极易在下一次重构中被换成 Map 索引而 panic；
+                // 统一成 insert 是零成本的一致性保障。
+                if let Some(obj) = m.as_object_mut() {
+                    obj.insert("exhausted_at".to_string(), json!(now));
+                }
                 if let Some(ts) = reset_at {
                     // Unix 秒 → "YYYY-MM-DD HH:MM:SS"（UTC+8，与 exhausted_at 同形态）
                     use chrono::TimeZone;
@@ -133,7 +139,9 @@ fn note_free_model_exhausted(data_dir: &std::path::Path, uid: &str, model: &str,
                         .and_then(|cn| cn.timestamp_opt(ts, 0).single())
                         .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string());
                     if let Some(txt) = txt {
-                        m["reset_at"] = json!(txt);
+                        if let Some(obj) = m.as_object_mut() {
+                            obj.insert("reset_at".to_string(), json!(txt));
+                        }
                     }
                 }
                 updated = true;
@@ -368,6 +376,30 @@ fn upstream_msg(resp_body: &str) -> Option<String> {
 /// 请求成功后清除该模型的冷却与失败计数
 pub fn clear_model_failure(state: &ApiSharedState, model: &str) {
     safe_lock(&state.model_cooldowns).remove(model);
+}
+
+/// 进程级模型冷却快照（Buddy 域，供前端「模型冷却」展示；与 Qoder 侧
+/// `qoder_route::model_cooldown_snapshot` 同构）。回答「这个模型此刻整体在
+/// 限流/额度受限」——此前只服务 dispatch 预检，前端看不到，用户收到 429
+/// 也不知是哪个模型、多久恢复。过期条目在此过滤。
+pub fn model_cooldown_snapshot(state: &ApiSharedState) -> Vec<crate::models::ModelCooldown> {
+    let now = crate::api_server::pool::now_ts();
+    safe_lock(&state.model_cooldowns)
+        .iter()
+        .filter_map(|(model, (until, fails))| {
+            let left = until.saturating_sub(now);
+            if left <= 0 {
+                return None; // 过期残留按无冷却
+            }
+            Some(crate::models::ModelCooldown {
+                model: model.clone(),
+                // Buddy 无区域键（其冷却表按模型名裸键记账）
+                global: false,
+                remaining_secs: left as u64,
+                fails: *fails,
+            })
+        })
+        .collect()
 }
 
 // ==================== 审核模板映射热更新（T2.1） ====================
@@ -617,6 +649,7 @@ pub fn wb_stream_chat(
     key_id: String,
     guard: InflightGuard,
     encoded: std::collections::HashSet<String>,
+    region_hint: Option<bool>,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
@@ -661,7 +694,7 @@ pub fn wb_stream_chat(
             });
         }
 
-        run_wb_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard, &encoded);
+        run_wb_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard, &encoded, region_hint);
     });
 
     let stream = ReceiverStream::new(rx);
@@ -690,6 +723,7 @@ fn run_wb_stream(
     start_ts: Instant,
     mut guard: InflightGuard,
     encoded: &std::collections::HashSet<String>,
+    region_hint: Option<bool>,
 ) {
     // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
     let key_name = super::api_keys::key_name_for(&state.data_dir, key_id);
@@ -713,7 +747,13 @@ fn run_wb_stream(
     // 未知模型（不在目录）不过滤，保持旧透传语义。
     // Key 区域约束（2026-10-17 海外接入）显式覆盖模型推导：国内号池用国内 Key、
     // 海外号池用海外 Key 的硬隔离手段
-    let want_global = key_want.or_else(|| super::wb_catalog::region_of(&state.data_dir, model));
+    // 区域后缀（2026-10-23）：@cn/@global 显式点名区域，优先级最高
+    // （覆盖 Key region 与目录区域推导；两区同 id 模型靠它区分）
+    let want_global = if let Some(h) = region_hint {
+        Some(h)
+    } else {
+        key_want.or_else(|| super::wb_catalog::region_of(&state.data_dir, model))
+    };
     // 粘性首轮：命中绑定且账号 healthy → 锁定账号与上游会话（双段分配）；
     // 子 Key 限定上游不含粘性账号时忽略粘性
     let sticky0: Option<(String, String)> = state
@@ -773,6 +813,11 @@ fn run_wb_stream(
     let mut refreshed: HashSet<String> = HashSet::new(); // 401 刷新每账号一次
     let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
     let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
+    // 模型冷却跳过计数（按模型分开报）：本轮因「该账号在此模型被限流」而跳过的
+    // 账号数。>0 且轮换耗尽 → 客户端错误必须是模型冷却语义（带模型名/恢复时刻/
+    // 可换模型），而非笼统 no healthy account——否则用户朝着「账号全挂了」排查，
+    // 真实动作只是换个模型或等恢复
+    let mut model_cool_skips: usize = 0;
 
     loop {
         // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽（对齐 routes.rs stream_chat）。
@@ -800,14 +845,23 @@ fn run_wb_stream(
                 None => {
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     state.record_usage(true, model, "none", key_id, false, true, duration_ms, 0, 0);
-                    // 审查 P2：轮换耗尽收尾对齐 routes.rs（issue #57 可观测）——
-                    // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
-                    // wb_template_map.json），否则维持原文案；code 保持 no_healthy_account
-                    let (healthy_total, _) = state
-                        .wb_pool
-                        .selectable_stats_in_region(None, want_global);
-                    let (exhaust_msg, exhaust_tag) =
-                        super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                    // 模型冷却（按模型分开报）：本轮有账号因该模型被限流而跳过且
+                    // 轮换耗尽 → 客户端错误必须是模型冷却语义（带模型名/恢复时刻/
+                    // 可换模型）。错误码用独立值便于客户端分流
+                    let (exhaust_msg, exhaust_tag) = if model_cool_skips > 0 {
+                        (
+                            super::qoder_route::model_cooldown_exhaust_msg(model),
+                            "MODEL_COOLDOWN_EXHAUSTED",
+                        )
+                    } else {
+                        // 审查 P2：轮换耗尽收尾对齐 routes.rs（issue #57 可观测）——
+                        // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
+                        // wb_template_map.json），否则维持无健康账号文案；code 保持 no_healthy_account
+                        let (healthy_total, _) = state
+                            .wb_pool
+                            .selectable_stats_in_region(None, want_global);
+                        super::routes::exhaust_message(empty_hits, tried.len(), healthy_total)
+                    };
                     state.logger.log_request(
                         "buddy", "POST", "/v2/chat/completions", model, true, 503, "none",
                         duration_ms, &key_name, "",
@@ -832,8 +886,15 @@ fn run_wb_stream(
                         diag_summary.join(", "),
                         sample_note,
                     ));
+                    // 错误码分流：模型冷却用独立 code（客户端可按码换模型重试），
+                    // 其余维持 no_healthy_account（客户端兼容）
+                    let err_code = if exhaust_tag == "MODEL_COOLDOWN_EXHAUSTED" {
+                        "model_cooldown_exhausted"
+                    } else {
+                        "no_healthy_account"
+                    };
                     let err_body = json!({
-                        "error": {"message": exhaust_msg, "type": "api_error", "code": "no_healthy_account"}
+                        "error": {"message": exhaust_msg, "type": "api_error", "code": err_code}
                     });
                     let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
                         "data: {err_body}\n\n"
@@ -857,6 +918,7 @@ fn run_wb_stream(
                 "model_cooldown_skip uid={} model={} (池内有其他账号顶上)",
                 picked.uid, model
             ));
+            model_cool_skips += 1;
             tried.insert(picked.uid.clone());
             continue;
         }
@@ -1218,6 +1280,7 @@ pub async fn wb_aggregate_chat(
     key_id: String,
     guard: InflightGuard,
     encoded: std::collections::HashSet<String>,
+    region_hint: Option<bool>,
 ) -> Response {
     let model_out = model.clone();
     // P2 修复：聚合含分级重试（RetrySame 退避 std::thread::sleep 最长 60s×N），
@@ -1240,7 +1303,12 @@ pub async fn wb_aggregate_chat(
             .map_or((None, None, None), |c| (c.allowed, c.dedicated, c.want_global));
 
         // 区域判定（国内/海外号池隔离，同流式路径）；Key 区域约束显式覆盖
-        let want_global = key_want.or_else(|| super::wb_catalog::region_of(&state.data_dir, &model));
+        // 区域后缀（2026-10-23）：@cn/@global 显式点名，优先级最高
+        let want_global = if let Some(h) = region_hint {
+            Some(h)
+        } else {
+            key_want.or_else(|| super::wb_catalog::region_of(&state.data_dir, &model))
+        };
         let sticky0: Option<(String, String)> = state
             .wb_sticky
             .resolve(&sticky_key, now_ts())
@@ -1284,6 +1352,8 @@ pub async fn wb_aggregate_chat(
         let mut refreshed: HashSet<String> = HashSet::new();
         let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
         let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
+        // 模型冷却跳过计数（按模型分开报）：同流式路径语义
+        let mut model_cool_skips: usize = 0;
 
         loop {
             let picked = match first_pick.take() {
@@ -1301,12 +1371,19 @@ pub async fn wb_aggregate_chat(
                     None => {
                         state.record_usage(true, &model, "none", &key_id, false, stream,
                             start_ts.elapsed().as_millis() as u64, 0, 0);
-                        // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
-                        let (healthy_total, _) = state
-                        .wb_pool
-                        .selectable_stats_in_region(None, want_global);
-                        let (exhaust_msg, exhaust_tag) =
-                            super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                        // 模型冷却（按模型分开报）：同流式路径语义
+                        let (exhaust_msg, exhaust_tag) = if model_cool_skips > 0 {
+                            (
+                                super::qoder_route::model_cooldown_exhaust_msg(&model),
+                                "MODEL_COOLDOWN_EXHAUSTED",
+                            )
+                        } else {
+                            // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
+                            let (healthy_total, _) = state
+                            .wb_pool
+                            .selectable_stats_in_region(None, want_global);
+                            super::routes::exhaust_message(empty_hits, tried.len(), healthy_total)
+                        };
                         // issue #99 ①：影子风控收尾落原始指纹样本（非流式路径无
                         // 收尾 [DEBUG] 行，就地补齐；样本 = 清洗前原始请求体）
                         if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {
@@ -1334,6 +1411,7 @@ pub async fn wb_aggregate_chat(
                     "model_cooldown_skip uid={} model={} (池内有其他账号顶上)",
                     picked.uid, model
                 ));
+                model_cool_skips += 1;
                 tried.insert(picked.uid.clone());
                 continue;
             }
@@ -1702,6 +1780,7 @@ pub async fn wb_tool_exec_chat(
     key_id: String,
     guard: InflightGuard,
     encoded: std::collections::HashSet<String>,
+    region_hint: Option<bool>,
 ) -> Response {
     let model_inner = model.clone();
     // P2 修复：工具代执行多轮上游请求 + 重试退避（最长 60s×N），长阻塞占主池
@@ -1729,12 +1808,16 @@ pub async fn wb_tool_exec_chat(
         let effort = super::wb_catalog::find(&catalog, &model)
             .and_then(|m| m.resolve_effort(chat_body.get("reasoning_effort").and_then(|v| v.as_str())));
 
-        // T5.3：按模型冷却预注入 tried（toolexec 路径无粘性首选）
-        let mut tried: HashSet<String> =
-            state.wb_pool.model_cooled_uids(&model).into_iter().collect();
+        // T5.3：按模型冷却的账号不进 tried——冷却是**状态**、tried 是「本轮已试过
+        // 且失败」的**事件**集合，混用会把「该模型对此账号冷却」误当成「已试过」，
+        // 池内仅剩该账号时退化成假 503（同流式路径 2026-10-19 修正口径）。
+        // 改为取到号后判断 is_model_cooling，跳过时计数供收尾按模型分开报错。
+        let mut tried: HashSet<String> = HashSet::new();
         let mut refreshed: HashSet<String> = HashSet::new();
         let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
         let mut last_11128_sample: Option<String> = None; // 11128 诊断样本按请求去重
+        // 模型冷却跳过计数（按模型分开报）：同流式路径语义
+        let mut model_cool_skips: usize = 0;
         let mut records: Vec<super::wb_toolexec::SearchRecord> = Vec::new();
         let mut final_completion: Option<Value> = None;
         let mut success_uid: Option<String> = None; // 审查修复：保留真实账号归因
@@ -1774,6 +1857,7 @@ pub async fn wb_tool_exec_chat(
                     "model_cooldown_skip uid={} model={} (池内有其他账号顶上)",
                     picked.uid, model
                 ));
+                model_cool_skips += 1;
                 tried.insert(picked.uid.clone());
                 continue;
             }
@@ -2112,11 +2196,18 @@ pub async fn wb_tool_exec_chat(
                 );
                 // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
                 Err(last_err.unwrap_or_else(|| {
-                    let (healthy_total, _) = state
-                        .wb_pool
-                        .selectable_stats_in_region(None, want_global);
-                    let (exhaust_msg, exhaust_tag) =
-                        super::routes::exhaust_message(empty_hits, tried.len(), healthy_total);
+                    // 模型冷却（按模型分开报）：同流式路径语义
+                    let (exhaust_msg, exhaust_tag) = if model_cool_skips > 0 {
+                        (
+                            super::qoder_route::model_cooldown_exhaust_msg(&model),
+                            "MODEL_COOLDOWN_EXHAUSTED",
+                        )
+                    } else {
+                        let (healthy_total, _) = state
+                            .wb_pool
+                            .selectable_stats_in_region(None, want_global);
+                        super::routes::exhaust_message(empty_hits, tried.len(), healthy_total)
+                    };
                     // issue #99 ①：影子风控收尾落原始指纹样本（chat_body 轮末已追加
                     // tool 消息，样本取首条 system + 工具清单，语义不受影响）
                     if exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK" {

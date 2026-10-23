@@ -77,6 +77,8 @@ pub async fn start_api_server(
     ensure_bind_auth_policy(&host, &super::api_keys::load(&state.data_dir))?;
     // 海外号池专用 Key 预置（幂等；Qoder/Buddy 各一把 region=global，见 api_keys）
     super::api_keys::ensure_overseas_pool_keys(&state.data_dir);
+    // ZCode 号池专用 Key 预置（幂等；bind_pool=zcode 钉死，供 ZCode 客户端 provider 直写用）
+    super::api_keys::ensure_zcode_pool_key(&state.data_dir);
     // 存量 Key 一次性迁移为「仅国内」（用户裁决；幂等标记防重复）
     super::api_keys::normalize_legacy_key_regions(&state.data_dir);
     let bind_host = state

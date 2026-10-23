@@ -19,6 +19,7 @@ import {
   Loader2,
   Info,
 } from 'lucide-react';
+import PageHeader from '../../components/PageHeader';
 import { Badge, EmptyState } from '../../components/ui';
 import { cn } from '../../lib/cn';
 import { accountsApi, onBatchDone, onBatchProgress } from './api/accounts';
@@ -279,6 +280,11 @@ export default function SecretsPanel() {
 
   return (
     <div className="animate-fade-in space-y-4">
+      <PageHeader
+        title="ZCode · 账密与批量登录"
+        desc="账密仅存本机库 · CSV 批量导入 · 内嵌窗口自动登录队列"
+      />
+
       {/* 操作行 */}
       <div className="flex flex-wrap items-center gap-2">
         <button className="btn-outline" onClick={add}>

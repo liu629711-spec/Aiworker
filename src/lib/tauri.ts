@@ -36,6 +36,7 @@ import type {
   ImportPreview,
   LogLine,
   ModelOption,
+  ModelCooldown,
   OAuthLoginUrl,
   OAuthLoginResult,
   OAuthLoginDoneEvent,
@@ -85,6 +86,8 @@ import type {
   ApiKeyTestResult,
   KeyScopedModels,
   FreeUsageSnapshot,
+  DetectedAgent,
+  AgentApplyResult,
   QoderCheckinRecord,
   QoderCliStatus,
   QoderLiveLogins,
@@ -101,7 +104,7 @@ import type {
   QoderSettings,
 } from '../types';
 
-export type { ApiKeyEntry, OverseasAccessInfo, ApiKeyTestResult, KeyScopedModels, FreeUsageSnapshot, QoderAccountView, WorkBuddyAccountView };
+export type { ApiKeyEntry, OverseasAccessInfo, ApiKeyTestResult, KeyScopedModels, FreeUsageSnapshot, QoderAccountView, WorkBuddyAccountView, DetectedAgent, AgentApplyResult };
 
 // ---- F1/F11：invoke 统一超时 + 错误源头翻译 ----
 // Tauri IPC 的 Promise 无法中止（invoke 无 AbortSignal 支持），用 Promise.race 竞速超时：
@@ -806,6 +809,10 @@ export const api = {
     wbPoolStatus: () => invoke<PoolStatus[]>('wb_pool_status'),
     /** Qoder 池实时状态（Qoder「资源调度」页：含 per-account inflight 在途计数） */
     qoderPoolStatus: () => invoke<PoolStatus[]>('qoder_pool_status'),
+    /** Qoder 进程级模型冷却快照（排队/限流致冷；与账号级 per_model_cooldowns 互补） */
+    qoderModelCooldowns: () => invoke<ModelCooldown[]>('qoder_model_cooldowns'),
+    /** WB 进程级模型冷却快照（同 qoderModelCooldowns 语义） */
+    wbModelCooldowns: () => invoke<ModelCooldown[]>('wb_model_cooldowns'),
     /** ZCode 池实时状态（z.ai GLM 池：含 per-account inflight 在途计数） */
     zcodePoolStatus: () => invoke<PoolStatus[]>('zcode_pool_status'),
     /** 手动同步 Qoder 模型目录（复用每日调度任务入口；返回采纳模型数） */
@@ -820,6 +827,17 @@ export const api = {
     /** ③b 直写本机 ZCode agent 供应商配置 */
     zcodeProviderWrite: (keyId: string) =>
       invoke<{ ok: boolean; provider_id: string; models: number; backup: string }>('zcode_provider_write', { keyId }),
+    /** Agent 接入中心：检测本机 agent（WorkBuddy / ZCode CLI / Claude Code） */
+    agentsScan: () => invoke<{ agents: DetectedAgent[] }>('agent_integration_scan'),
+    /** Agent 接入中心：把勾选 Key 的生效模型写入指定 agent（fallback 仅 Claude 用） */
+    agentsApply: (agentId: string, keyIds: string[], fallbackKeyId?: string) =>
+      invoke<AgentApplyResult>('agent_integration_apply', {
+        agentId,
+        keyIds,
+        fallbackKeyId: fallbackKeyId ?? null,
+      }),
+    /** Agent 接入中心：清除该 agent 内本工具写入的配置 */
+    agentsClear: (agentId: string) => invoke<AgentApplyResult>('agent_integration_clear', { agentId }),
     /** ② 免费模型用量计数快照（额度中心） */
     freeUsageSnapshot: () => invoke<FreeUsageSnapshot>('free_usage_snapshot'),
     logsList: () => invoke<string[]>('api_logs_list'),

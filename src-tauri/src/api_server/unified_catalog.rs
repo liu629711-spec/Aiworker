@@ -980,7 +980,8 @@ mod tests {
             .map(|(id, rate)| {
                 let mut o = json!({"id": id, "label": id});
                 if let Some(r) = rate {
-                    o["rate"] = json!(r);
+                    // 2026-10-22 P0：insert() 而非 IndexMut（键缺失会 panic）
+                    if let Some(x) = o.as_object_mut() { x.insert("rate".to_string(), json!(r)); }
                 }
                 o
             })

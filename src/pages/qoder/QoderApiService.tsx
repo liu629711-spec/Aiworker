@@ -3,6 +3,7 @@ import { RefreshCw, Save, Coins, ToggleLeft, Activity, Layers } from 'lucide-rea
 import PageHeader from '../../components/PageHeader';
 import { Badge, Spinner, StatCard } from '../../components/ui';
 import { PoolHealthBadges } from '../../components/api/PoolHealthBadges';
+import { ModelCooldownBanner } from '../../components/api/ModelCooldownBanner';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
@@ -10,6 +11,7 @@ import type {
   ApiServiceStatus,
   ApiPoolFile,
   GroupView,
+  ModelCooldown,
   PoolStatus,
   TagView,
   UnifiedModel,
@@ -65,6 +67,8 @@ export default function QoderApiService() {
   const [usage, setUsage] = useState<UsageDayView[]>([]);
   // Qoder 池实时状态（可观测：per-account inflight 在途计数）
   const [qoderPool, setQoderPool] = useState<PoolStatus[]>([]);
+  // 进程级模型冷却快照（模型整体排队/限流，与账号级 per_model_cooldowns 互补）
+  const [qoderModelCooldowns, setQoderModelCooldowns] = useState<ModelCooldown[]>([]);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
@@ -140,16 +144,26 @@ export default function QoderApiService() {
     void loadTodayUsage();
   }, [loadTodayUsage]);
 
-  // 服务运行中轮询 Qoder 池实时状态（inflight 徽标；3s 同 Trae/Buddy 页惯例）
+  // 服务运行中轮询 Qoder 池实时状态（inflight 徽标 + 账号级按模型冷却；3s 同
+  // Trae/Buddy 页惯例）与**进程级模型冷却**（模型整体排队/限流）——两者互补：
+  // 前者回答「哪个账号的哪个模型没额度」，后者回答「该模型整体在排队」。
+  // 两个调用必须**各自独立兜底**：合并进 Promise.all 会让冷却快照失败连带
+  // 清空池状态（账号徽标整个消失——旧命令未注册时即此事故）。
   const refreshPoolStatus = useCallback(async () => {
     if (!status?.running) {
       setQoderPool([]);
+      setQoderModelCooldowns([]);
       return;
     }
     try {
       setQoderPool(await api.apiServer.qoderPoolStatus());
     } catch {
-      /* ignore */
+      /* 池状态轮询失败静默：保留上一轮数据，下轮重试 */
+    }
+    try {
+      setQoderModelCooldowns(await api.apiServer.qoderModelCooldowns());
+    } catch {
+      /* 冷却快照失败不影响池状态（独立兜底，防徽标连坐消失） */
     }
   }, [status?.running]);
 
@@ -483,6 +497,13 @@ export default function QoderApiService() {
               </div>
             )}
 
+            {/* 进程级模型冷却横幅（模型整体排队/限流）：与账号行的按模型冷却徽标
+                是两个维度——这个换账号也绕不过（海外换号=新号从头排） */}
+            {qoderModelCooldowns.length > 0 && (
+              <div className="mb-2">
+                <ModelCooldownBanner items={qoderModelCooldowns} />
+              </div>
+            )}
             {/* 账号清单（勾选白名单：健康状态 / 在途计数 / credits 余额；筛选外整行灰显） */}
             {accountsError ? (
               <p className="py-4 text-center text-xs text-rose-500 dark:text-rose-400">

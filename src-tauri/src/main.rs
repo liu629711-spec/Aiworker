@@ -261,12 +261,17 @@ fn main() {
             commands::api_server::pool_status,
             commands::api_server::wb_pool_status,
             commands::api_server::qoder_pool_status,
+            commands::api_server::qoder_model_cooldowns,
+            commands::api_server::wb_model_cooldowns,
             commands::api_server::zcode_pool_status,
             commands::api_server::qoder_catalog_sync,
             commands::api_server::overseas_access_info,
             commands::api_server::api_key_test,
             commands::api_server::api_key_models,
             commands::api_server::zcode_provider_write,
+            commands::agent_integration::agent_integration_scan,
+            commands::agent_integration::agent_integration_apply,
+            commands::agent_integration::agent_integration_clear,
             commands::api_server::free_usage_snapshot,
             commands::api_server::api_logs_list,
             commands::api_server::api_logs_detail,
@@ -441,6 +446,21 @@ fn main() {
             zcode::modules::accounts::commands::zcode_accounts_delete,
             zcode::modules::accounts::commands::zcode_accounts_set_invite_role,
             zcode::modules::accounts::commands::zcode_accounts_sync_invite,
+            zcode::modules::accounts::commands::zcode_accounts_sync_invite_qualification,
+            zcode::modules::accounts::commands::zcode_accounts_invite_link,
+            zcode::modules::accounts::commands::zcode_accounts_bind_invite,
+            zcode::modules::register::commands::zcode_register_start,
+            zcode::modules::register::commands::zcode_register_cancel,
+            zcode::modules::register::commands::zcode_register_status,
+            zcode::modules::register::commands::zcode_register_mask_pool,
+            zcode::modules::register::commands::zcode_register_complete_tasks,
+            zcode::modules::register::commands::zcode_relay_status,
+            zcode::modules::register::commands::zcode_relay_list_masks,
+            zcode::modules::register::commands::zcode_relay_delete_mask,
+            zcode::modules::register::commands::zcode_relay_create_masks,
+            zcode::modules::register::commands::zcode_register_batch,
+            zcode::modules::register::commands::zcode_register_save_imap,
+            zcode::modules::register::commands::zcode_register_imap_state,
             zcode::modules::accounts::commands::zcode_secrets_list,
             zcode::modules::accounts::commands::zcode_secrets_save,
             zcode::modules::accounts::commands::zcode_secrets_add,
@@ -467,13 +487,14 @@ fn main() {
         ])
         .setup(|app| {
             // zcode 域初始化(移植自 zai-claim):建独立库 zcode.sqlite、跑迁移、构建 API 客户端
-            let zstate = std::sync::Arc::new(
-                tauri::async_runtime::block_on(zcode::state::ZcodeState::init(app.handle()))?,
-            );
+            let zstate = tauri::async_runtime::block_on(zcode::state::ZcodeState::init(app.handle()))?;
+            // 注册裸 ZcodeState：全部 zcode 命令（State<'_, ZcodeState>）与
+            // app.state::<ZcodeState>() 均按裸类型查找。曾误注册 Arc<ZcodeState>，
+            // TypeId 不匹配 → 启动即 panic 闪退（panic.log 2026-10-21 10:06:52 有案底）。
             app.manage(zstate.clone());
             // 网关 ZCode 池桥：ZcodeState 入全局缓存——axum handler（无 tauri State
             // 访问）里按需读账号凭证（池装配 + identity 回调两条路径）
-            commands::zcode_pool::register_zcode_state(zstate.clone());
+            commands::zcode_pool::register_zcode_state(std::sync::Arc::new(zstate));
             // zcode 检测器自动轮询:余额每 5s / 活动每 10min(不依赖任何窗口存活)
             {
                 use zcode::state::ZcodeState;

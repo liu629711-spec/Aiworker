@@ -65,14 +65,32 @@ fn client_headers() -> [(&'static str, &'static str); 5] {
     ]
 }
 
-/// OpenAI 内部格式 → anthropic messages 信封。
-/// system 消息提取为顶层 system 字段（ anthropic 协议形态）；messages 的
-/// system 角色剔除；user/assistant 原样保留（content 字符串或块数组两种
-/// 形态 anthropic 均接受）。max_tokens 键名兼容 max_completion_tokens。
-/// stream 恒 true（上游只回 SSE，聚合与非流式统一处理）。
+/// OpenAI 内部格式 → anthropic messages 信封（2026-10-21 工具调用重写）。
+/// 上游只接受 anthropic 块形态：字符串 content 或 text/thinking/document/image/
+/// tool_use/tool_result 块数组。网关内部（含 anthropic_to_openai 投影后的）消息
+/// 是 OpenAI 形态，必须显式转换——原样透传会让工具调用会话直接 400
+/// （实测签名：messages.N.content.str: Input should be a valid string——
+/// assistant tool_calls 消息 content=null + role:"tool" 直传）：
+/// - system → 顶层 system（字符串或块数组取 text 段）；
+/// - assistant.tool_calls[] → tool_use 块（arguments JSON 解析为 input 对象，
+///   失败退空对象）；content 非空时前置 text 块；两者皆无跳过消息；
+/// - role:"tool" → user 消息内 tool_result 块（content 取文本段字符串）；
+/// - user 数组形态的 text/image_url 块 → text/image 块（data URL → base64
+///   source，http(s) → url source）；
+/// - 相邻同角色合并为一条消息（anthropic 严格 user/assistant 交替，工具轮
+///   多条 tool 消息须并成一个 user）；
+/// - tools/tool_choice/stop 同转 anthropic 字段名与形态。
+/// max_tokens 键名兼容 max_completion_tokens；stream 恒 true（上游只回 SSE）。
 fn to_anthropic_body(peek: &Value, model: &str) -> Vec<u8> {
     let mut system_parts: Vec<String> = Vec::new();
-    let mut msgs: Vec<Value> = Vec::new();
+    // 累积中的 anthropic 消息：{role, content: Vec<块>}，相邻同角色合并
+    let mut msgs: Vec<(String, Vec<Value>)> = Vec::new();
+    let mut push_block = |role: &str, block: Value| {
+        match msgs.last_mut() {
+            Some((r, arr)) if r == role => arr.push(block),
+            _ => msgs.push((role.to_string(), vec![block])),
+        }
+    };
     if let Some(arr) = peek.get("messages").and_then(Value::as_array) {
         for m in arr {
             let role = m.get("role").and_then(Value::as_str).unwrap_or("");
@@ -93,15 +111,110 @@ fn to_anthropic_body(peek: &Value, model: &str) -> Vec<u8> {
                         _ => {}
                     }
                 }
-                "user" | "assistant" => msgs.push(m.clone()),
+                "assistant" => {
+                    let text = m.get("content").and_then(Value::as_str).unwrap_or("");
+                    if !text.is_empty() {
+                        push_block("assistant", json!({"type": "text", "text": text}));
+                    }
+                    for tc in m
+                        .get("tool_calls")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                    {
+                        let f = tc.get("function").cloned().unwrap_or(json!({}));
+                        let input = f
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                            .unwrap_or_else(|| json!({}));
+                        push_block(
+                            "assistant",
+                            json!({
+                                "type": "tool_use",
+                                "id": tc.get("id").cloned().unwrap_or(json!("")),
+                                "name": f.get("name").cloned().unwrap_or(json!("")),
+                                "input": input,
+                            }),
+                        );
+                    }
+                }
+                "tool" => {
+                    // OpenAI tool 结果 → anthropic tool_result（并入 user 回合）
+                    let content_str = match m.get("content") {
+                        Some(Value::String(s)) => s.clone(),
+                        Some(Value::Array(parts)) => parts
+                            .iter()
+                            .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+                            .filter_map(|p| p.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join(""),
+                        _ => String::new(),
+                    };
+                    push_block(
+                        "user",
+                        json!({
+                            "type": "tool_result",
+                            "tool_use_id": m.get("tool_call_id").cloned().unwrap_or(json!("")),
+                            "content": content_str,
+                        }),
+                    );
+                }
+                "user" => {
+                    match m.get("content") {
+                        Some(Value::String(s)) => {
+                            push_block("user", json!({"type": "text", "text": s}))
+                        }
+                        Some(Value::Array(parts)) => {
+                            for pv in parts.iter() {
+                                match pv.get("type").and_then(Value::as_str).unwrap_or("") {
+                                    "text" => {
+                                        if let Some(t) = pv.get("text").and_then(Value::as_str) {
+                                            push_block("user", json!({"type": "text", "text": t}));
+                                        }
+                                    }
+                                    "image_url" => {
+                                        let url =
+                                            pv.pointer("/image_url/url").and_then(Value::as_str).unwrap_or("");
+                                        if url.is_empty() {
+                                            continue;
+                                        }
+                                        // data:<mime>;base64,<data> → base64 source；其余 → url source
+                                        let source = match url
+                                            .strip_prefix("data:")
+                                            .and_then(|rest| rest.split_once(";base64,"))
+                                        {
+                                            Some((mime, data)) => json!({
+                                                "type": "base64",
+                                                "media_type": mime,
+                                                "data": data,
+                                            }),
+                                            None => json!({"type": "url", "url": url}),
+                                        };
+                                        push_block(
+                                            "user",
+                                            json!({"type": "image", "source": source}),
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
         }
     }
+    let messages: Vec<Value> = msgs
+        .into_iter()
+        .map(|(role, blocks)| json!({"role": role, "content": blocks}))
+        .collect();
     let mut body = json!({
         "model": model,
         "stream": true,
-        "messages": msgs,
+        "messages": messages,
     });
     if !system_parts.is_empty() {
         body["system"] = json!(system_parts.join("\n\n"));
@@ -118,6 +231,57 @@ fn to_anthropic_body(peek: &Value, model: &str) -> Vec<u8> {
     for key in ["temperature", "top_p"] {
         if let Some(v) = peek.get(key) {
             body[key] = v.clone();
+        }
+    }
+    // stop（OpenAI string|array）→ stop_sequences 数组
+    if let Some(s) = peek.get("stop") {
+        let arr: Vec<String> = match s {
+            Value::String(x) => vec![x.clone()],
+            Value::Array(xs) => xs.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+            _ => vec![],
+        };
+        if !arr.is_empty() {
+            body["stop_sequences"] = json!(arr);
+        }
+    }
+    // tools：OpenAI function 封装 → anthropic {name, description, input_schema}
+    if let Some(ts) = peek.get("tools").and_then(Value::as_array) {
+        let conv: Vec<Value> = ts
+            .iter()
+            .filter_map(|t| {
+                let f = t.get("function").or(t.get("tool")).or(Some(t))?;
+                let name = f.get("name").and_then(Value::as_str)?;
+                Some(json!({
+                    "name": name,
+                    "description": f.get("description").cloned().unwrap_or(json!("")),
+                    "input_schema": f.get("parameters").or_else(|| f.get("input_schema"))
+                        .cloned().unwrap_or_else(|| json!({"type": "object"})),
+                }))
+            })
+            .collect();
+        if !conv.is_empty() {
+            body["tools"] = json!(conv);
+        }
+    }
+    // tool_choice：OpenAI 形态 → anthropic 形态（none = 省略）
+    if let Some(tc) = peek.get("tool_choice") {
+        match tc {
+            Value::String(s) => match s.as_str() {
+                "auto" => body["tool_choice"] = json!({"type": "auto"}),
+                "required" => body["tool_choice"] = json!({"type": "any"}),
+                _ => {}
+            },
+            Value::Object(o) => {
+                let name = o
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str);
+                match name {
+                    Some(n) => body["tool_choice"] = json!({"type": "tool", "name": n}),
+                    None => {}
+                }
+            }
+            _ => {}
         }
     }
     // GLM thinking：客户端经 reasoning_effort 传档位时映射 anthropic thinking 字段
@@ -183,6 +347,37 @@ fn upstream_code(body: &str) -> Option<String> {
 /// 1113（无资源包）判定：账号级套餐问题 → SoftRate 语义
 fn is_no_resource_pack(status: u16, body: &str) -> bool {
     status == 429 && upstream_code(body).as_deref() == Some(NO_RESOURCE_PACK_CODE)
+}
+
+/// 1113（无资源包）细分（2026-10-23 套餐池改造）。
+///
+/// 改造前一律 `SoftRate`（60s 起按次翻倍，封顶 30min）。对两种真实情况都是错的：
+///
+/// - **额度真的烧完了**：60s 后解冻再撞一次，一分钟一次空转到夜里重置；
+///   应冷却到额度换日（沿用池内既有 `HardCredit` = 下个 04:00 口径）。
+/// - **这个号根本没有该模型权益**（画像漂移：刚领到/刚过期/画像未刷新）：
+///   短冷却也修不好，需要长冷却等下一轮 `billing/current` 画像同步把它摘掉。
+///
+/// 判定依据是池内套餐门闸（画像来自 `billing/current`，见 `zcode::plan_profile`）：
+/// 画像未知 → 保持原 `SoftRate`（fail-open，不臆造长冷却）。
+fn no_resource_pack_kind(state: &ApiSharedState, uid: &str, model: &str) -> ErrKind {
+    let Some(plan) = state.zcode_pool.plan_of(uid) else {
+        return ErrKind::SoftRate;
+    };
+    if plan.grant_units > 0 && plan.remaining_units <= 0 {
+        return ErrKind::HardCredit;
+    }
+    let model_lc = model.trim().to_lowercase();
+    if plan.has_entitlement() && !plan.serves(&model_lc) {
+        return ErrKind::PlanLimit;
+    }
+    ErrKind::SoftRate
+}
+
+/// 本地小时（夜间档窗口判定）。统一走 plan_profile 的同一口径，
+/// 避免窗口常量在网关与监控域被复制成两份不一致的实现。
+fn zcode_local_hour() -> u32 {
+    crate::zcode::plan_profile::local_hour()
 }
 
 fn now_ts() -> i64 {
@@ -251,15 +446,19 @@ pub async fn zcode_aggregate_chat(
         let mut same_attempt: u32 = 0;
 
         'pick: loop {
-            // ── 取号：Key 约束 + 调度策略（无区域维度）──────────────
-            let (allowed_set, dedicated) = super::api_keys::constraints_for(&state.data_dir, &key_id)
-                .and_then(|k| k.pool_constraints("zcode"))
-                .map_or((None, None), |c| (c.allowed, c.dedicated));
-            let picked = match state.zcode_pool.pick_excluding_constrained_ev_region(
+            // ── 取号：Key 约束（含套餐白名单）+ 套餐感知调度（无区域维度）──────
+            let (allowed_set, dedicated, plan_kinds) =
+                super::api_keys::constraints_for(&state.data_dir, &key_id)
+                    .and_then(|k| k.pool_constraints("zcode"))
+                    .map_or((None, None, None), |c| (c.allowed, c.dedicated, c.plan_kinds));
+            let picked = match state.zcode_pool.pick_zcode(
                 &tried,
                 allowed_set.as_ref(),
                 dedicated.as_deref(),
-                None,
+                plan_kinds.as_ref(),
+                &model,
+                now_ts(),
+                zcode_local_hour(),
             ) {
                 Some((p, ev)) => {
                     if let Some(ev) = ev {
@@ -270,9 +469,11 @@ pub async fn zcode_aggregate_chat(
                 None => {
                     state.record_usage(false, &model, "none", &key_id, false, stream,
                         start_ts.elapsed().as_millis() as u64, 0, 0);
-                    let (healthy_total, _) = state.zcode_pool.selectable_stats_in(None);
+                    let (for_model, healthy_total) = state.zcode_pool.zcode_model_stats(
+                        &model, now_ts(), zcode_local_hour(),
+                    );
                     return Err(format!(
-                        "no healthy account available (pool=zcode healthy={healthy_total})"
+                        "no healthy account available (pool=zcode healthy={healthy_total} model={model} servable={for_model})"
                     ));
                 }
             };
@@ -369,9 +570,11 @@ pub async fn zcode_aggregate_chat(
                     }
                 }
                 Err((status, resp_body, retry_after)) => {
-                    // 1113 无资源包：账号级问题，直接换号（同号重试无意义）
+                    // 1113 无资源包：账号级问题，直接换号（同号重试无意义）。
+                    // 细分三态见 no_resource_pack_kind（额度耗尽/无该模型权益/未知）
                     let action = if is_no_resource_pack(status, &resp_body) {
-                        state.zcode_pool.note_error(&picked.uid, ErrKind::SoftRate);
+                        let kind = no_resource_pack_kind(&state, &picked.uid, &model);
+                        state.zcode_pool.note_error(&picked.uid, kind);
                         RetryAction::SwitchKey
                     } else {
                         retry_plan(status, &resp_body, same_attempt, retry_after)
@@ -485,14 +688,18 @@ fn run_stream(
     let chat_id = format!("chatcmpl-{}", now_ts());
 
     'pick: loop {
-        let (allowed_set, dedicated) = super::api_keys::constraints_for(&state.data_dir, key_id)
-            .and_then(|k| k.pool_constraints("zcode"))
-            .map_or((None, None), |c| (c.allowed, c.dedicated));
-        let picked: PickedAccount = match state.zcode_pool.pick_excluding_constrained_ev_region(
+        let (allowed_set, dedicated, plan_kinds) =
+            super::api_keys::constraints_for(&state.data_dir, key_id)
+                .and_then(|k| k.pool_constraints("zcode"))
+                .map_or((None, None, None), |c| (c.allowed, c.dedicated, c.plan_kinds));
+        let picked: PickedAccount = match state.zcode_pool.pick_zcode(
             &tried,
             allowed_set.as_ref(),
             dedicated.as_deref(),
-            None,
+            plan_kinds.as_ref(),
+            model,
+            now_ts(),
+            zcode_local_hour(),
         ) {
             Some((p, ev)) => {
                 if let Some(ev) = ev {
@@ -501,9 +708,10 @@ fn run_stream(
                 p
             }
             None => {
-                let (healthy_total, _) = state.zcode_pool.selectable_stats_in(None);
+                let (for_model, healthy_total) =
+                    state.zcode_pool.zcode_model_stats(model, now_ts(), zcode_local_hour());
                 let msg = format!(
-                    "no healthy account available (pool=zcode healthy={healthy_total})"
+                    "no healthy account available (pool=zcode healthy={healthy_total} model={model} servable={for_model})"
                 );
                 state.record_usage(false, model, "none", key_id, false, true,
                     start_ts.elapsed().as_millis() as u64, 0, 0);
@@ -607,7 +815,8 @@ fn run_stream(
             }
             Err((status, resp_body, retry_after)) => {
                 let action = if is_no_resource_pack(status, &resp_body) {
-                    state.zcode_pool.note_error(&picked.uid, ErrKind::SoftRate);
+                    let kind = no_resource_pack_kind(&state, &picked.uid, model);
+                    state.zcode_pool.note_error(&picked.uid, kind);
                     RetryAction::SwitchKey
                 } else {
                     retry_plan(status, &resp_body, same_attempt, retry_after)
@@ -745,6 +954,96 @@ mod tests {
         });
         let body: Value = serde_json::from_slice(&to_anthropic_body(&peek, "GLM-5.3")).unwrap();
         assert_eq!(body["max_tokens"], 4096);
+    }
+
+    #[test]
+    fn tool_call_roundtrip_converts_to_anthropic_blocks() {
+        // 回归 2026-10-21：ZCode 客户端（编码 agent）会话必含工具轮；
+        // OpenAI 形态 assistant.tool_calls（content=null）+ role:"tool" 原样透传
+        // 被 z.ai 400 拒绝（content.str 要求合法字符串）
+        let peek = json!({
+            "messages": [
+                {"role": "user", "content": "列一下目录"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "a.txt\nb.txt"},
+                {"role": "tool", "tool_call_id": "call_2", "content": "more"},
+                {"role": "assistant", "content": "有两个文件"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "bash", "description": "d", "parameters": {"type": "object"}}}],
+            "tool_choice": "auto"
+        });
+        let body: Value = serde_json::from_slice(&to_anthropic_body(&peek, "GLM-5.3")).unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        // 相邻同角色合并：user, assistant, user(两条 tool_result 并入), assistant
+        assert_eq!(msgs.len(), 4, "got {msgs:?}");
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"][0]["type"], "text");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["content"][0]["type"], "tool_use");
+        assert_eq!(msgs[1]["content"][0]["name"], "bash");
+        assert_eq!(msgs[1]["content"][0]["input"]["cmd"], "ls");
+        assert_eq!(msgs[2]["role"], "user");
+        let tr = msgs[2]["content"].as_array().unwrap();
+        assert_eq!(tr.len(), 2, "相邻 tool 消息须并入同一条 user");
+        assert_eq!(tr[0]["type"], "tool_result");
+        assert_eq!(tr[0]["tool_use_id"], "call_1");
+        assert_eq!(tr[0]["content"], "a.txt\nb.txt");
+        assert_eq!(msgs[3]["role"], "assistant");
+        assert_eq!(msgs[3]["content"][0]["text"], "有两个文件");
+        // tools/tool_choice 同转 anthropic 字段形态
+        assert_eq!(body["tools"][0]["name"], "bash");
+        assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+        assert!(body["tools"][0].get("function").is_none());
+        assert_eq!(body["tool_choice"]["type"], "auto");
+    }
+
+    #[test]
+    fn assistant_text_with_tool_calls_keeps_text_then_tool_use() {
+        let peek = json!({
+            "messages": [
+                {"role": "assistant", "content": "先看一眼", "tool_calls": [
+                    {"id": "c1", "function": {"name": "read", "arguments": "{}"}}
+                ]}
+            ]
+        });
+        let body: Value = serde_json::from_slice(&to_anthropic_body(&peek, "GLM-5.3")).unwrap();
+        let m = &body["messages"][0];
+        assert_eq!(m["content"][0]["type"], "text");
+        assert_eq!(m["content"][1]["type"], "tool_use");
+    }
+
+    #[test]
+    fn bad_tool_arguments_degrade_to_empty_input() {
+        let peek = json!({
+            "messages": [
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "function": {"name": "x", "arguments": "not-json{"}}
+                ]}
+            ]
+        });
+        let body: Value = serde_json::from_slice(&to_anthropic_body(&peek, "GLM-5.3")).unwrap();
+        assert_eq!(body["messages"][0]["content"][0]["input"], json!({}));
+    }
+
+    #[test]
+    fn image_data_url_and_plain_string_user_pass_through() {
+        let peek = json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "看图"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                    {"type": "image_url", "image_url": {"url": "https://x.test/a.png"}}
+                ]}
+            ]
+        });
+        let body: Value = serde_json::from_slice(&to_anthropic_body(&peek, "GLM-5.3")).unwrap();
+        let c = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(c[0]["type"], "text");
+        assert_eq!(c[1]["source"]["type"], "base64");
+        assert_eq!(c[1]["source"]["media_type"], "image/png");
+        assert_eq!(c[2]["source"]["type"], "url");
     }
 
     #[test]

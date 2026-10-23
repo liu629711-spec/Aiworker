@@ -11,6 +11,7 @@
 //! 同步策略：读路径全部直查 sqlx 池（zcode.sqlite 单机单人场景，账号量 < 百，
 //! 无缓存必要；账号变更经 zcode 域命令 → reload_pools_if_running 热重载兜底）。
 
+use crate::api_server::pool::PlanGate;
 use crate::api_server::zcode_catalog::ZCodeCreds;
 use crate::state::AppState;
 use crate::zcode::db::models::Account;
@@ -22,6 +23,69 @@ pub struct ZCodePoolAccount {
     pub label: String,
     pub access_token: String,
     pub device_mid: String,
+    /// 套餐门闸快照（accounts 表 plan_* 字段归一化）。
+    /// `None` = 从未同步过画像（fail-open：老库升级后第一轮画像拉取前仍可用）
+    pub plan: Option<PlanGate>,
+}
+
+/// 由库内 plan_* 字段拼池内门闸。`profile_synced_at` 为空 = 从未同步 → None。
+///
+/// 优先用 `plan_profile_json`（含 `kinds` 全量形态与 grants 明细）反序列化，
+/// 仓储列只作降级——这样 Key 级套餐路由能命中"同号多形态"（如 id=30 同时是
+/// Global Build + Start Plan），而不是只看到主形态。
+fn plan_gate_of(a: &Account) -> Option<PlanGate> {
+    let synced_at = a.profile_synced_at?;
+    let kinds = a
+        .plan_profile_json
+        .as_deref()
+        .and_then(|j| serde_json::from_str::<crate::zcode::plan_profile::PlanProfile>(j).ok())
+        .map(|p| {
+            p.kinds
+                .iter()
+                .map(|k| k.as_str().to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let kind = a.plan_kind.clone().unwrap_or_else(|| "other".to_string());
+    let kinds = if kinds.is_empty() {
+        kind.clone()
+    } else {
+        kinds.join(",")
+    };
+    Some(PlanGate {
+        kind,
+        kinds,
+        models: a
+            .plan_servable_models
+            .clone()
+            .unwrap_or_default()
+            .split(',')
+            .map(|m| m.trim().to_lowercase())
+            .filter(|m| !m.is_empty())
+            .collect::<Vec<_>>()
+            .join(","),
+        period: a.plan_period.clone().unwrap_or_default(),
+        night_only: a.plan_night_only.unwrap_or(0) != 0,
+        grant_units: a.plan_grant_units.unwrap_or(0),
+        remaining_units: a.plan_remaining_units.unwrap_or(0),
+        ends_at: a.plan_ends_at,
+        synced_at,
+    })
+}
+
+/// 同步上下文 → 异步查询的安全桥接：
+/// - 已在 tokio runtime 内（网关 identity 回调跑在网关 runtime worker、
+///   apply_pool_snapshot 跑在 tauri 主 runtime worker）→ 先 `block_in_place`
+///   把当前 worker 转为阻塞线程，再 `block_on`，否则直接嵌套 block_on 会
+///   panic "Cannot start a runtime from within a runtime"（panic.log 2026-10-21 有案底）；
+/// - current_thread runtime 或普通 OS 线程 → 直接 `block_on`（合法）。
+fn bridge_block_on<F: std::future::Future>(fut: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| tauri::async_runtime::block_on(fut))
+        }
+        _ => tauri::async_runtime::block_on(fut),
+    }
 }
 
 /// 全量列出可入池账号（token 非空才入池——空 token 账号入池也只会每请求
@@ -30,7 +94,7 @@ pub fn list_pool_accounts(state: &AppState) -> Vec<ZCodePoolAccount> {
     let Some(zstate) = try_zcode_state(state) else {
         return Vec::new();
     };
-    let accounts = tauri::async_runtime::block_on(async {
+    let accounts = bridge_block_on(async {
         sqlx::query_as::<_, Account>("SELECT * FROM accounts ORDER BY id")
             .fetch_all(&zstate.db)
             .await
@@ -42,8 +106,9 @@ pub fn list_pool_accounts(state: &AppState) -> Vec<ZCodePoolAccount> {
             .map(|a| ZCodePoolAccount {
                 uid: a.id.to_string(),
                 label: a.label.clone(),
-                access_token: a.zai_access_token.unwrap_or_default(),
+                access_token: a.zai_access_token.clone().unwrap_or_default(),
                 device_mid: a.device_mid.clone(),
+                plan: plan_gate_of(&a),
             })
             .collect(),
         Err(e) => {
@@ -65,7 +130,7 @@ pub fn resolve_credentials(state: &AppState, acct_id: &str) -> Result<ZCodeCreds
     let id: i64 = acct_id
         .parse()
         .map_err(|_| format!("zcode 账号 id 非法: {acct_id}"))?;
-    let row = tauri::async_runtime::block_on(async {
+    let row = bridge_block_on(async {
         sqlx::query_as::<_, Account>("SELECT * FROM accounts WHERE id = ?1")
             .bind(id)
             .fetch_optional(&zstate.db)

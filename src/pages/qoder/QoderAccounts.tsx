@@ -154,13 +154,16 @@ function FreeModelsCell({ a }: { a: QoderAccountView }) {
     .filter(Boolean)
     .join('、');
   // 展示口径对齐 Buddy 域：逐模型名称徽标（可用绿/已用完琥珀，悬停见详情），
-  // 不再只给 N/N 计数——两区免费档目录不同，模型名才是可执行信息
+  // 不再只给 N/N 计数——两区免费档目录不同，模型名才是可执行信息。
+  // 徽标内带「·已用完」字样（不只是颜色）：同屏两个免费模型时，靠琥珀色
+  // 区分状态在暗色主题/色弱场景下不可靠，文字才是无歧义信号
   return (
     <div className="flex flex-col items-start gap-0.5" title={title}>
       {models.map((m) => (
         <Badge key={`${m.region || 'cn'}:${m.id}`} tone={m.exhausted_at ? 'amber' : 'green'}>
           <Sparkles size={10} className="mr-1" />
           {m.name}
+          {m.exhausted_at && <span className="ml-0.5 opacity-70">·已用完</span>}
         </Badge>
       ))}
       {resetHint && (

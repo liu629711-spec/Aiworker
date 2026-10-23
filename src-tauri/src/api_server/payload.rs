@@ -336,9 +336,27 @@ fn normalize_tools(obj: &mut serde_json::Map<String, Value>) {
 
 // ==================== Anthropic 协议输入（F-39：+Anthropic 适配） ====================
 
+/// 组装带图片的消息：有图 → OpenAI 多模态 content 数组；纯文本 → 字符串形态。
+///
+/// 纯文本必须保持 string（不是 [{type:text}]）：部分上游（含 WB/Trae 的
+/// 历史实现）只吃字符串 content，数组形态会被拒或当空内容处理。只有确实
+/// 携带图片时才升格为数组，改动面最小。
+fn build_content_message(role: &str, text_parts: &[String], image_parts: &[Value]) -> Value {
+    if image_parts.is_empty() {
+        return json!({ "role": role, "content": text_parts.join("") });
+    }
+    let mut parts: Vec<Value> = Vec::new();
+    let text = text_parts.join("");
+    if !text.is_empty() {
+        parts.push(json!({ "type": "text", "text": text }));
+    }
+    parts.extend(image_parts.iter().cloned());
+    json!({ "role": role, "content": parts })
+}
+
 /// Anthropic Messages 请求体 → OpenAI 内部格式（随后复用 OpenAI → llm_utils_chat 链路）
-/// 支持：system（字符串/blocks）、text blocks、tool_use/tool_result、tools、tool_choice
-/// 不支持：image 等多模态 block（跳过）；max_tokens 由 prepare_llm_chat_body 统一设 4096
+/// 支持：system（字符串/blocks）、text blocks、image blocks（base64/url →
+/// OpenAI image_url，2026-10-22）、tool_use/tool_result、tools、tool_choice
 pub fn anthropic_to_openai(src: &[u8]) -> Vec<u8> {
     let v: Value = match serde_json::from_slice(src) {
         Ok(v) => v,
@@ -410,6 +428,7 @@ pub fn anthropic_to_openai(src: &[u8]) -> Vec<u8> {
             }
             Some(Value::Array(blocks)) => {
                 let mut text_parts: Vec<String> = Vec::new();
+                let mut image_parts: Vec<Value> = Vec::new();
                 let mut tool_calls: Vec<Value> = Vec::new();
                 let mut tool_results: Vec<Value> = Vec::new();
                 for b in blocks {
@@ -464,26 +483,73 @@ pub fn anthropic_to_openai(src: &[u8]) -> Vec<u8> {
                                 "content": content_final,
                             }));
                         }
-                        _ => {} // image 等不支持类型跳过
+                        // Anthropic image 块 → OpenAI image_url 块（2026-10-22 修复）。
+                        //
+                        // 此前这里是 `_ => {}`（注释「image 等不支持类型跳过」），
+                        // 后果：所有走 anthropic-messages 协议的 provider（aiwork-trae
+                        // 等）在网关投影层就把图片**静默丢弃**，模型收到纯文本却仍被
+                        // 要求「看截图」，表现为「读不了图 / 看不见图 / 瞎描述」。
+                        // Anthropic 形态 {type:image, source:{type:base64, media_type,
+                        // data}} 与 {type:image, source:{type:url, url}} 两种都要转。
+                        "image" => {
+                            let Some(src) = b.get("source") else { continue };
+                            let stype = src
+                                .get("type")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("base64");
+                            let url = match stype {
+                                // base64：拼成 data URL（OpenAI 兼容上游唯一通用形态）
+                                "base64" => {
+                                    let media = src
+                                        .get("media_type")
+                                        .and_then(|m| m.as_str())
+                                        .unwrap_or("image/png");
+                                    let data =
+                                        src.get("data").and_then(|d| d.as_str()).unwrap_or("");
+                                    // data URL 必须是 compact JSON（无换行）——
+                                    // base64 里可能有客户端塞的空格/换行
+                                    let compact: String = data
+                                        .chars()
+                                        .filter(|c| !c.is_whitespace())
+                                        .collect();
+                                    format!("data:{media};base64,{compact}")
+                                }
+                                // url 形态：直传
+                                "url" => src
+                                    .get("url")
+                                    .and_then(|u| u.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                _ => String::new(),
+                            };
+                            if !url.is_empty() {
+                                image_parts.push(json!({
+                                    "type": "image_url",
+                                    "image_url": { "url": url },
+                                }));
+                            }
+                        }
+                        _ => {} // 其余未知类型跳过（保持原容错行为）
                     }
                 }
                 if !tool_results.is_empty() {
-                    // tool_result 属于 user 回合：先输出 tool 消息，再输出剩余文本
+                    // tool_result 属于 user 回合：先输出 tool 消息，再输出剩余文本/图片
                     for tr in tool_results {
                         messages.push(tr);
                     }
-                    if !text_parts.is_empty() {
-                        messages.push(json!({ "role": role, "content": text_parts.join("") }));
+                    if !text_parts.is_empty() || !image_parts.is_empty() {
+                        messages.push(build_content_message(&role, &text_parts, &image_parts));
                     }
                 } else if !tool_calls.is_empty() {
                     let mut m = json!({
                         "role": "assistant",
                         "content": if text_parts.is_empty() { Value::Null } else { json!(text_parts.join("")) },
                     });
-                    m["tool_calls"] = json!(tool_calls);
+                    // 2026-10-22 P0：insert() 而非 IndexMut（键缺失会 panic）
+                    if let Some(o) = m.as_object_mut() { o.insert("tool_calls".to_string(), json!(tool_calls)); }
                     messages.push(m);
-                } else if !text_parts.is_empty() {
-                    messages.push(json!({ "role": role, "content": text_parts.join("") }));
+                } else if !text_parts.is_empty() || !image_parts.is_empty() {
+                    messages.push(build_content_message(&role, &text_parts, &image_parts));
                 }
             }
             _ => {}
@@ -549,6 +615,84 @@ pub fn anthropic_to_openai(src: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 2026-10-22 回归：Anthropic image 块必须转成 OpenAI image_url，不得丢弃。
+    ///
+    /// 历史 bug：content block 的 `_ => {}` 直接跳过 image，导致所有
+    /// anthropic-messages provider（aiwork-trae 等）在网关投影层就把图片吃掉，
+    /// 模型只收到文字却仍被要求「看图」，表现为「读不了图片 / 看不见截图」。
+    #[test]
+    fn anthropic_image_block_becomes_image_url() {
+        let src = json!({
+            "model": "glm-5.2",
+            "max_tokens": 1024,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "这张图里是什么？"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png",
+                        // 故意夹空白：base64 里出现换行/空格时 data URL 会失效
+                        "data": "iVBORw0KGgo\nAAAANSUhEUg=="
+                    }}
+                ]
+            }]
+        });
+        let out: Value = serde_json::from_slice(
+            &anthropic_to_openai(serde_json::to_vec(&src).unwrap().as_slice()),
+        )
+        .unwrap();
+        let msg = &out["messages"][0];
+        assert_eq!(msg["role"], "user");
+        let parts = msg["content"].as_array().expect("有图时必须升格为 content 数组");
+        // 文本块 + 图片块
+        assert_eq!(parts.len(), 2, "文字与图片都要保留: {parts:?}");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "这张图里是什么？");
+        assert_eq!(parts[1]["type"], "image_url");
+        let url = parts[1]["image_url"]["url"].as_str().expect("image_url.url 必填");
+        assert!(url.starts_with("data:image/png;base64,"), "应为 data URL: {url}");
+        assert!(!url.contains('\n') && !url.contains(' '), "data URL 不得含空白: {url}");
+        assert!(url.ends_with("iVBORw0KGgoAAAANSUhEUg=="), "base64 内容须完整保留");
+    }
+
+    /// 带图片但**无文字**时也要输出（不能因 text_parts 为空就丢整条消息）。
+    #[test]
+    fn anthropic_image_only_message_is_kept() {
+        let src = json!({
+            "model": "glm-5.2",
+            "max_tokens": 64,
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "image", "source": {
+                    "type": "url", "url": "https://example.test/a.png"
+                }}]
+            }]
+        });
+        let out: Value = serde_json::from_slice(
+            &anthropic_to_openai(serde_json::to_vec(&src).unwrap().as_slice()),
+        )
+        .unwrap();
+        let parts = out["messages"][0]["content"].as_array().expect("纯图消息不得被丢弃");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["image_url"]["url"], "https://example.test/a.png");
+    }
+
+    /// 纯文本仍保持字符串 content（不因加图片支持而把所有消息升格成数组，
+    /// 否则只吃字符串 content 的历史上游会拒收）。
+    #[test]
+    fn anthropic_text_only_stays_string_content() {
+        let src = json!({
+            "model": "glm-5.2",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        });
+        let out: Value = serde_json::from_slice(
+            &anthropic_to_openai(serde_json::to_vec(&src).unwrap().as_slice()),
+        )
+        .unwrap();
+        assert_eq!(out["messages"][0]["content"], "hi", "纯文本必须是字符串形态");
+    }
 
     #[test]
     fn anthropic_basic_text_conversion() {
@@ -679,7 +823,7 @@ mod tests {
                 "messages": [{"role": "user", "content": "hi"}]
             });
             if !extra.is_null() {
-                src["is_max_mode"] = extra;
+                if let Some(o) = src.as_object_mut() { o.insert("is_max_mode".to_string(), extra); }
             }
             let out: Value = serde_json::from_slice(&prepare_llm_chat_body(
                 serde_json::to_vec(&src).unwrap().as_slice(),

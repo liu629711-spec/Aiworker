@@ -32,17 +32,33 @@ function fmtDate(v: string | number | null | undefined): string {
   return `${d.getMonth() + 1}/${d.getDate()}`;
 }
 
-function FreeUsageCell({ usage }: { usage?: { count?: number; exhausted_at?: string; reset_at?: string } }) {
-  if (!usage || (usage.count == null && !usage.exhausted_at)) {
-    return <span className="text-xs text-slate-300 dark:text-zinc-600">—</span>;
-  }
-  const used = usage.count ?? 0;
-  if (usage.exhausted_at) {
+/** 单个免费模型的用量/额度单元格。
+ *
+ * 双数据源口径：`usage` 是网关记账（free_model_usage kv，只记成功调用），
+ * `snapshot` 是账号池快照（free_models[]，由上游错误码驱动标注 exhausted_at）。
+ * 两者谁先到不一定——「第一个请求就撞限额」的模型只有快照有标注、kv 里没条目
+ * （旧实现 kv 侧静默失败，2026-10-21 已改 upsert，但存量数据仍可能缺）。
+ * 故展示取并集：任一为耗尽即显示「已用完」，不互相等待。
+ */
+function FreeUsageCell({
+  usage,
+  snapshot,
+}: {
+  usage?: { count?: number; exhausted_at?: string; reset_at?: string };
+  snapshot?: { exhausted_at?: string | null; reset_at?: string | null };
+}) {
+  const exhaustedAt = usage?.exhausted_at ?? snapshot?.exhausted_at ?? null;
+  const resetAt = usage?.reset_at ?? snapshot?.reset_at ?? null;
+  const used = usage?.count;
+  if (exhaustedAt) {
     return (
       <span className="text-xs text-amber-600 dark:text-amber-400">
-        已用完（{usage.exhausted_at.slice(5, 16)}）{usage.reset_at ? ` · ${usage.reset_at.slice(5, 16)} 恢复` : ''}
+        已用完（{exhaustedAt.slice(5, 16)}）{resetAt ? ` · ${resetAt.slice(5, 16)} 恢复` : ''}
       </span>
     );
+  }
+  if (used == null) {
+    return <span className="text-xs text-slate-300 dark:text-zinc-600">—</span>;
   }
   return <span className="text-xs text-slate-500 dark:text-zinc-400">本周期已用 {used} 次</span>;
 }
@@ -81,7 +97,9 @@ export default function QuotaCenter() {
     void refresh();
   }, [refresh]);
 
-  // 体检问题清单（跨家族）
+  // 体检问题清单（跨家族）：免费档**按模型逐条**上报——一个账号的两个免费
+  // 模型一个用完一个可用是常态，合并成「全部耗尽」会同时掩盖两种事实：
+  // 已耗尽的看不出是哪个、部分耗尽的根本不出现
   const issues = useMemo<Issue[]>(() => {
     const out: Issue[] = [];
     for (const a of wbAccounts) {
@@ -91,9 +109,13 @@ export default function QuotaCenter() {
       if (a.credits_balance != null && a.credits_balance < 50) {
         out.push({ family: 'Buddy', account: a.nickname || a.id, detail: `积分余额偏低：${a.credits_balance}` });
       }
-      const fm = a.free_models ?? [];
-      if (fm.length > 0 && fm.every((m) => m.exhausted_at)) {
-        out.push({ family: 'Buddy', account: a.nickname || a.id, detail: `免费档全部耗尽（${fm.map((m) => m.name).join('、')}）` });
+      for (const m of a.free_models ?? []) {
+        if (!m.exhausted_at) continue;
+        out.push({
+          family: 'Buddy',
+          account: a.nickname || a.id,
+          detail: `免费模型 ${m.name} 已用完${m.reset_at ? ` · ${m.reset_at.slice(5, 16)} 恢复` : ''}`,
+        });
       }
     }
     for (const a of qoderAccounts) {
@@ -103,9 +125,13 @@ export default function QuotaCenter() {
       if (a.credits_balance != null && a.credits_balance < 50) {
         out.push({ family: 'Qoder', account: a.nickname || a.id, detail: `积分余额偏低：${a.credits_balance}` });
       }
-      const fm = a.free_models ?? [];
-      if (fm.length > 0 && fm.every((m) => m.exhausted_at)) {
-        out.push({ family: 'Qoder', account: a.nickname || a.id, detail: `免费档全部耗尽（${fm.map((m) => m.name).join('、')}）` });
+      for (const m of a.free_models ?? []) {
+        if (!m.exhausted_at) continue;
+        out.push({
+          family: 'Qoder',
+          account: a.nickname || a.id,
+          detail: `免费模型 ${m.name} 已用完${m.reset_at ? ` · ${m.reset_at.slice(5, 16)} 恢复` : ''}`,
+        });
       }
     }
     return out;
@@ -198,12 +224,7 @@ export default function QuotaCenter() {
                             {a.free_models!.map((m) => (
                               <div key={m.id} className="flex items-center gap-2">
                                 <span className="text-xs">{m.name}</span>
-                                <FreeUsageCell usage={freeOf('buddy', a.uid, m.id)} />
-                                {m.exhausted_at && !freeOf('buddy', a.uid, m.id)?.exhausted_at && (
-                                  <span className="text-xs text-amber-600 dark:text-amber-400">
-                                    已用完{m.reset_at ? ` · ${m.reset_at.slice(5, 16)} 恢复` : ''}
-                                  </span>
-                                )}
+                                <FreeUsageCell usage={freeOf('buddy', a.uid, m.id)} snapshot={m} />
                               </div>
                             ))}
                           </div>
@@ -252,10 +273,7 @@ export default function QuotaCenter() {
                             {a.free_models!.map((m) => (
                               <div key={m.id} className="flex items-center gap-2">
                                 <span className="text-xs">{m.name}</span>
-                                <FreeUsageCell usage={freeOf('qoder', a.uid, m.id)} />
-                                {m.exhausted_at && !freeOf('qoder', a.uid, m.id)?.exhausted_at && (
-                                  <span className="text-xs text-amber-600 dark:text-amber-400">已用完</span>
-                                )}
+                                <FreeUsageCell usage={freeOf('qoder', a.uid, m.id)} snapshot={m} />
                               </div>
                             ))}
                           </div>

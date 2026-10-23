@@ -8,12 +8,20 @@ use crate::zcode::modules::accounts::batch::BatchLoginHandle;
 use crate::zcode::modules::accounts::oauth::OAuthCancel;
 use crate::zcode::modules::claim::service::ClaimRuntime;
 use crate::zcode::modules::monitor::service::MonitorHandle;
+use crate::zcode::modules::register::flow::RegisterHandle;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use std::str::FromStr;
 use tauri::Manager;
 
 /// zcode 域全局唯一状态:多窗口共享的单一数据源。
+///
+/// Clone 语义：全部字段均为句柄/连接池/`Arc`（浅拷贝零成本），
+/// 供 `app.manage(zstate.clone())` 注册裸类型使用——Tauri 的
+/// `State<'_, ZcodeState>` 与 `app.state::<ZcodeState>()` 均按裸类型
+/// 查找；若 manage 的是 `Arc<ZcodeState>`，TypeId 不匹配会在启动期
+/// panic（2026-10-21 闪退根因，panic.log 有案底）。
+#[derive(Clone)]
 pub struct ZcodeState {
     /// SQLite 连接池(异步,内部由后台线程执行,不阻塞 UI)
     pub db: SqlitePool,
@@ -27,6 +35,8 @@ pub struct ZcodeState {
     pub oauth: Arc<OAuthCancel>,
     /// 批量账密登录队列(取消/运行标志)
     pub batch: Arc<BatchLoginHandle>,
+    /// 马甲邮箱全自动注册流水线(取消/运行标志)
+    pub register: Arc<RegisterHandle>,
 }
 
 impl ZcodeState {
@@ -66,6 +76,7 @@ impl ZcodeState {
             claims: Arc::new(ClaimRuntime::default()),
             oauth: Arc::new(OAuthCancel::default()),
             batch: Arc::new(BatchLoginHandle::default()),
+            register: Arc::new(RegisterHandle::default()),
         })
     }
 }

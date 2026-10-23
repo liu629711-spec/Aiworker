@@ -928,6 +928,62 @@ pub struct PoolStatus {
     /// refresh_token 是否已判定失效（F-78 批次 3：前端展示「Token 失效」徽标）
     #[serde(default)]
     pub refresh_invalid: bool,
+    /// 按模型冷却（per_model_cooldowns 的快照）：模型名 → 冷却截止 Unix 秒。
+    /// 账号本身健康（其他模型/积分照常可用），只是**这一个模型**被上游限到
+    /// 截止时刻——Qoder 免费额度 114/115/119 冷却到次日 00:00、Buddy 6004
+    /// 「可切换其他模型」按重置时刻。没有这个字段时前端只能显示「就绪」，
+    /// 用户无从知道该账号是哪个模型不能打、该换哪个模型（可观测盲点）。
+    /// 过期条目已在后端过滤（前端拿到的都是生效中的）。
+    #[serde(default)]
+    pub per_model_cooldowns: std::collections::HashMap<String, i64>,
+    // ── ZCode 套餐画像（2026-10-23 套餐池改造；仅 zcode 池有值，其余池为 None）──
+    /// 归一化套餐形态：new_account | task_card | global_build | start_plan | other
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_kind: Option<String>,
+    /// 该账号持有的全部形态（同号可能既 Global Build 又 Start Plan）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan_kinds: Vec<String>,
+    /// 可服务模型（空 = 无可用来权益，选号会直接跳过）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plan_models: Vec<String>,
+    /// 聚合时段口径：daily | daily_night
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_period: Option<String>,
+    /// 只有夜间档权益（白天不可选）
+    #[serde(default)]
+    pub plan_night_only: bool,
+    /// 剩余额度（token）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_remaining_units: Option<i64>,
+    /// 发放总额度（token）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_grant_units: Option<i64>,
+    /// 最早到期时间（unix 秒）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_ends_at: Option<i64>,
+    /// 画像同步时间（unix 秒）；None = 从未同步（选号 fail-open）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_synced_at: Option<i64>,
+}
+
+/// 进程级模型冷却条目（前端「模型冷却」横幅数据源）。
+///
+/// 与 `PoolStatus.per_model_cooldowns`（账号级：哪个账号的哪个模型没额度）
+/// 是两个维度：这个回答「该模型整体在排队/被限流」——Qoder 海外排队换号
+/// 照样排（换号=新号从头排），所以这是模型级现象而非账号级。来源是路由层的
+/// 进程级冷却表：排队退避（5–30s）、Server 渐进冷却（30s→8min）。
+#[derive(Serialize, Clone, Debug)]
+pub struct ModelCooldown {
+    /// 模型名（Qoder 侧的 `g:` 区域前缀已剥离）
+    pub model: String,
+    /// 是否海外区（Qoder 双区冷却键隔离；Buddy 恒 false）
+    #[serde(default)]
+    pub global: bool,
+    /// 剩余冷却秒数（后端已过滤过期条目）
+    pub remaining_secs: u64,
+    /// 连续失败片段数（0 = 排队退避落下的短窗；>0 = Server 渐进冷却计数）
+    #[serde(default)]
+    pub fails: u32,
 }
 
 /// API 服务整体状态（给前端用）

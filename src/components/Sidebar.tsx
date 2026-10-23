@@ -17,6 +17,11 @@ import {
   Terminal,
   SwitchCamera,
   Gauge,
+  Link2,
+  MailPlus,
+  Mail,
+  Layers,
+  Plug,
 } from 'lucide-react';
 import { useAppStore } from '../store';
 import { cn } from '../lib/cn';
@@ -75,9 +80,14 @@ export const APP_TABS: { key: AppKey; label: string; icon: typeof Users; disable
   { key: 'zcode', label: 'ZCode', icon: Terminal, title: 'ZCode 账号生态（余额/切换/领取）' },
 ];
 
-/** ZCode 生态导航（zai-claim 移植） */
+/** ZCode 生态导航（对齐 QODER_NAV：每个功能一个顶级导航项，页内不再切 tab） */
 const ZCODE_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
-  { key: 'zcode', label: '账号工作台', icon: Terminal },
+  { key: 'zcode-accounts', label: '账号管理', icon: Users },
+  { key: 'zcode-invite', label: '邀请档案', icon: Link2 },
+  { key: 'zcode-register', label: '自动注册', icon: MailPlus },
+  { key: 'zcode-masks', label: '马甲邮箱', icon: Mail },
+  { key: 'zcode-pool', label: '号池调度', icon: Layers },
+  { key: 'zcode-secrets', label: '账密 · 批量登录', icon: KeyRound },
 ];
 
 /** 全部合法应用 key（settings 脏值兜底用） */
@@ -210,6 +220,20 @@ export default function Sidebar({
           title="额度中心（跨家族积分 / 免费档用量 / 账号体检）"
         >
           <Gauge size={17} />
+        </button>
+        {/* Agent 接入中心（2026-10-23：全局页，把网关 Key/模型一键写入本机 agent） */}
+        <button
+          onClick={() => onNav('agent-integration')}
+          className={cn(
+            'flex h-8 w-8 items-center justify-center rounded-lg transition active:scale-90',
+            view === 'agent-integration'
+              ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
+              : 'text-slate-500 hover:bg-slate-100 hover:text-slate-700 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-200',
+          )}
+          aria-label="Agent 接入中心"
+          title="Agent 接入中心（一键写入本机 WorkBuddy / ZCode / Claude Code）"
+        >
+          <Plug size={17} />
         </button>
         {/* API 管理入口（统一网关 §5.1，原 Github 图标位置） */}
         <button

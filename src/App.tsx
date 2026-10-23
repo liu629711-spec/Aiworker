@@ -7,6 +7,7 @@ import { useAppStore } from './store';
 import { resolveTheme } from './lib/themes';
 import Dashboard from './pages/Dashboard';
 import QuotaCenter from './pages/QuotaCenter';
+import AgentIntegration from './pages/AgentIntegration';
 import Accounts from './pages/Accounts';
 import Checkin from './pages/Checkin';
 import Logs from './pages/Logs';
@@ -29,9 +30,31 @@ import QoderAccounts from './pages/qoder/QoderAccounts';
 import QoderCheckin from './pages/qoder/QoderCheckin';
 import QoderApiService from './pages/qoder/QoderApiService';
 import QoderSettings from './pages/qoder/QoderSettings';
-import ZCodePage from './pages/zcode/ZCodePage';
+import SecretsPanel from './pages/zcode/SecretsPanel';
+import RegisterPanel from './pages/zcode/RegisterPanel';
+import InviteArchivePanel from './pages/zcode/InviteArchivePanel';
+import MaskManagerPanel from './pages/zcode/MaskManagerPanel';
+import ZCodeAccountsPage from './pages/zcode/ZCodeAccountsPage';
+import ZCodePoolPanel from './pages/zcode/ZCodePoolPanel';
 import ApiManagerModal from './components/api/ApiManagerModal';
 import TraeWorkMigrationGuide from './components/TraeWorkMigrationGuide';
+import PageHeader from './components/PageHeader';
+
+/**
+ * ZCodePoolPanel 是他人未完成任务，本流程不改其源码；
+ * 独立成页需要页头，这里在路由层包一层（只加标题，不动面板内部）。
+ */
+function ZCodePoolPage() {
+  return (
+    <div className="animate-fade-in">
+      <PageHeader
+        title="ZCode · 号池调度"
+        desc="账号池白名单 · 并发与粘性策略 · ZCode CLI 供应商配置"
+      />
+      <ZCodePoolPanel />
+    </div>
+  );
+}
 
 function renderView(view: string) {
   switch (view) {
@@ -51,6 +74,8 @@ function renderView(view: string) {
       return <ApiService />;
     case 'quota-center':
       return <QuotaCenter />;
+    case 'agent-integration':
+      return <AgentIntegration />;
     case 'settings':
       return <Settings />;
     case 'doubao-overview':
@@ -85,8 +110,18 @@ function renderView(view: string) {
       return <QoderApiService key="qoder-api-service" />;
     case 'qoder-settings':
       return <QoderSettings />;
-    case 'zcode':
-      return <ZCodePage />;
+    case 'zcode-accounts':
+      return <ZCodeAccountsPage />;
+    case 'zcode-pool':
+      return <ZCodePoolPage />;
+    case 'zcode-secrets':
+      return <SecretsPanel />;
+    case 'zcode-register':
+      return <RegisterPanel />;
+    case 'zcode-invite':
+      return <InviteArchivePanel />;
+    case 'zcode-masks':
+      return <MaskManagerPanel />;
     default:
       return <Dashboard />;
   }

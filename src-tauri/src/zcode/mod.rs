@@ -6,5 +6,6 @@ pub mod credentials;
 pub mod db;
 pub mod error;
 pub mod modules;
+pub mod plan_profile;
 pub mod state;
 pub mod util;

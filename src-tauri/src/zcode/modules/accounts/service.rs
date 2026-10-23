@@ -75,6 +75,8 @@ pub async fn import_local_account(db: &SqlitePool) -> AppResult<models::Account>
             user_info: creds.user_info.clone(),
             zai_access_token: creds.zai_access_token.clone(),
             zai_refresh_token: creds.zai_refresh_token.clone(),
+            invite_role: None,
+            invited_by: None,
         },
     )
     .await?)
@@ -101,18 +103,22 @@ pub struct InviteSyncResult {
     pub unmatched: Vec<String>,
     /// 各账号请求失败原因(凭证失效等)
     pub errors: Vec<String>,
+    /// 与工具侧记账不一致的记录(官方说有/无邀请关系,但库里标的不一样)
+    pub conflicts: Vec<String>,
 }
 
 /// 自动同步邀请关系(数据源:官方奖励中心接口):
-/// 1. 每个账号调 referral/invitees 翻页拉取邀请记录 → 有记录者即邀请者(官方数据,强制标记)
+/// 1. 每个账号调 referral/summary → 顺手落邀请资格字段(invite_code/state/unlock_at/invited_count);
+///    inviter 节点非空即邀请者(官方数据,强制标记)
 /// 2. 记录的 user_id_masked(前2***后2)与库内账号 user_id 匹配(带横线原样比对;
 ///    一个 mask 命中多个账号视为歧义跳过) → 命中者标记 invited + invited_by
 /// 3. 顺手回填 JWT 解出的 user_id(仅当 DB 缺失)
-/// 官方无记录的账号不改动(保留手工标记作为补充)。
+/// 4. 交叉校验:官方确认无邀请记录但库里已标 invited 的账号,记为冲突(不自动改,交人工判断)
+/// 官方无记录的账号不改动邀请标记(保留手工标记作为补充)。
 pub async fn sync_invite_relations(db: &SqlitePool, http: &crate::zcode::api::ZaiClient) -> AppResult<InviteSyncResult> {
     let accounts = repo::list(db).await?;
     let now = chrono::Utc::now().timestamp();
-    let mut result = InviteSyncResult { inviters: 0, linked: 0, unmatched: vec![], errors: vec![] };
+    let mut result = InviteSyncResult { inviters: 0, linked: 0, unmatched: vec![], errors: vec![], conflicts: vec![] };
 
     // 账号池:label -> (id, user_id) 供 mask 匹配
     let mut pool: Vec<(String, i64, Option<String>)> = Vec::new();
@@ -135,9 +141,48 @@ pub async fn sync_invite_relations(db: &SqlitePool, http: &crate::zcode::api::Za
         pool.push((a.label.clone(), a.id, uid));
     }
 
-    // 每个账号拉邀请记录
+    // 每个账号拉邀请记录(summary 的 inviter 节点已内嵌 invitees,无需再翻页)
     for a in &accounts {
-        // invitees 翻页(上限 5 页 = 250 条,足够)
+        let summary = match http.get_referral_summary(&a.jwt, &a.device_mid).await {
+            Ok(v) => v,
+            Err(e) => {
+                result.errors.push(format!("{}: {e}", a.label));
+                continue;
+            }
+        };
+        if summary["code"].as_i64() != Some(0) {
+            result.errors.push(format!(
+                "{}: {}",
+                a.label,
+                summary["msg"].as_str().unwrap_or("接口返回异常")
+            ));
+            continue;
+        }
+
+        // 顺手落邀请资格(与 sync_invite_qualification 同口径:active 时清解锁时间)
+        let code = super::invite::parse_inviter_code(&summary);
+        let state = super::invite::parse_invite_state(&summary);
+        let mut unlock_at = super::invite::parse_unlock_at(&summary);
+        if state == Some(super::invite::InviteState::Active) {
+            unlock_at = None;
+        }
+        let invited_count = super::invite::parse_invited_count(&summary);
+        let quota = super::invite::parse_invite_quota(&summary);
+        let _ = repo::set_invite_qualification(
+            db,
+            a.id,
+            code.as_deref(),
+            state.map(|s| s.as_str()),
+            unlock_at,
+            invited_count,
+            Some(quota.weekly),
+            Some(quota.cap),
+            Some(i64::from(quota.capped)),
+        )
+        .await;
+
+        // invitees 的 mask 必须走专用接口:summary 内嵌节点只有 name_masked(昵称打码),
+        // 没有 user_id_masked(用于匹配库内账号)。翻页上限 5 页 = 250 条,足够。
         let mut masks: Vec<String> = Vec::new();
         let mut cursor: Option<String> = None;
         for _ in 0..5 {
@@ -166,7 +211,14 @@ pub async fn sync_invite_relations(db: &SqlitePool, http: &crate::zcode::api::Za
             }
         }
         if masks.is_empty() {
-            continue; // 无邀请记录:不动(保留手工标记)
+            // 官方确认无邀请记录:与库内 invited 标记交叉校验(只报告不自动改)
+            if a.invite_role.as_deref() == Some("invited") {
+                result.conflicts.push(format!(
+                    "{}: 官方无邀请记录但库内标记为被邀请者",
+                    a.label
+                ));
+            }
+            continue; // 不动邀请标记(保留手工标记作为补充)
         }
 
         // 官方确认:邀请者
@@ -237,7 +289,7 @@ pub async fn add_account_via_oauth(
     // 3. 轮询至 ready / failed / 过期并入库
     let expires_at = data["expires_at"].as_i64().unwrap_or(0);
     let interval_sec = data["poll_interval_sec"].as_i64().unwrap_or(3).clamp(1, 30);
-    poll_and_save_account(db, http, &flow_id, &poll_token, expires_at, interval_sec, || {
+    poll_and_save_account_public(db, http, &flow_id, &poll_token, expires_at, interval_sec, || {
         cancel.is_cancelled().then(|| "已取消".to_string())
     })
     .await
@@ -311,7 +363,7 @@ pub async fn login_via_embedded_window(
     let _ = win.set_focus();
 
     // 3. 轮询至 ready / failed / 过期 / 取消 / 窗口被关,并入库
-    poll_and_save_account(db, http, &flow_id, &poll_token, expires_at, interval_sec, || {
+    poll_and_save_account_public(db, http, &flow_id, &poll_token, expires_at, interval_sec, || {
         if batch.is_cancelled() {
             Some("队列已取消".into())
         } else if app.get_webview_window("login-flow").is_none() {
@@ -361,7 +413,10 @@ pub async fn link_secret_to_account(db: &SqlitePool, secret_id: i64, account_id:
 
 /// 轮询 OAuth 会话至 ready,提取凭证并去重入库(系统浏览器流与内嵌窗口流共用)。
 /// `abort` 返回 Some(原因) 时中止等待(用户取消/窗口被关)。
-async fn poll_and_save_account<F>(
+///
+/// 对注册流水线开放(register::flow 复用同一套凭证提取与入库逻辑,
+/// 避免两处维护"JWT/zai token/user_info 怎么解析"的规则)。
+pub async fn poll_and_save_account_public<F>(
     db: &SqlitePool,
     http: &crate::zcode::api::ZaiClient,
     flow_id: &str,
@@ -487,6 +542,8 @@ where
             user_info,
             zai_access_token: zai_access,
             zai_refresh_token: zai_refresh,
+            invite_role: None,
+            invited_by: None,
         },
     )
     .await?)

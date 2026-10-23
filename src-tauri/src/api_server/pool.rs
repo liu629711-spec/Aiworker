@@ -113,7 +113,84 @@ pub struct PoolEntry {
     /// model → until 映射；upstream 6004 等文案含 "可在其他模型继续" 时用，
     /// 冻结粒度为 (uid, model)，而非整账号。空字典表示无按模型冷却条目。
     pub per_model_cooldowns: std::collections::HashMap<String, i64>,
+    // ── ZCode 套餐画像（仅 zcode 池有值；其余池恒 None）──
+    /// 套餐门闸快照：None = 从未同步过画像（fail-open，保持历史行为）；
+    /// Some 则按画像过滤（模型集合 / 夜间窗口 / 额度耗尽 / 燃烧顺序）
+    pub plan: Option<PlanGate>,
 }
+
+/// ZCode 套餐门闸（池内快照，由 `zcode::plan_profile::PlanProfile` 归一化而来）。
+///
+/// 语义分工：
+/// - `servable_models` **空 = 上游明确判定该账号没有任何可用权益** → 不可选号
+///   （与"画像未知"区分开：未知是 `plan: None`，仍然可选）
+/// - 模型/时段/额度过滤在取号时按请求逐次判定（见 `PlanGate::serves`）
+/// - 燃烧顺序 `burn_rank` + `expiry_key` 决定同池内的优先次序
+#[derive(Debug, Clone, Default)]
+pub struct PlanGate {
+    /// new_account | task_card | global_build | start_plan | other
+    pub kind: String,
+    /// 该账号持有的全部形态（逗号分隔，Key 级套餐路由按此匹配）
+    pub kinds: String,
+    /// 可服务模型（小写，逗号分隔；已按 zcode_catalog 归一化）
+    pub models: String,
+    /// 聚合时段口径：daily | daily_night | …
+    pub period: String,
+    /// true = 只有夜间档权益（白天不可选号）
+    pub night_only: bool,
+    pub grant_units: i64,
+    pub remaining_units: i64,
+    /// 最早到期时间（unix 秒）
+    pub ends_at: Option<i64>,
+    /// 画像同步时间（unix 秒）
+    pub synced_at: i64,
+}
+
+impl PlanGate {
+    /// 是否有任何可用权益（空模型集 = 上游明确说没有 → 不可入池候选）
+    pub fn has_entitlement(&self) -> bool {
+        !self.models.trim().is_empty()
+    }
+
+    /// 该账号当前能否服务指定模型（入参模型需已归一化，比较忽略大小写）
+    pub fn serves(&self, model_lc: &str) -> bool {
+        if model_lc.is_empty() {
+            return true;
+        }
+        self.models
+            .split(',')
+            .any(|m| m.trim().eq_ignore_ascii_case(model_lc))
+    }
+
+    /// 燃烧顺序权重（越小越先烧）：新号赠送 > 任务卡 > Global Build > Start Plan
+    pub fn burn_rank(&self) -> i64 {
+        match self.kind.as_str() {
+            "new_account" => 0,
+            "task_card" => 1,
+            "global_build" => 2,
+            "start_plan" => 3,
+            _ => 4,
+        }
+    }
+
+    /// 同形态内的次级排序键：先过期先烧；无到期时间排最后
+    pub fn expiry_key(&self) -> i64 {
+        self.ends_at.filter(|v| *v > 0).unwrap_or(i64::MAX)
+    }
+
+    /// 是否命中 Key 级套餐路由白名单（空 = 不限）
+    pub fn kind_allowed(&self, allow: Option<&HashSet<String>>) -> bool {
+        let Some(allow) = allow else { return true };
+        if allow.is_empty() {
+            return true;
+        }
+        self.kinds
+            .split(',')
+            .any(|k| allow.contains(k.trim()))
+            || allow.contains(self.kind.as_str())
+    }
+}
+
 
 /// 默认构造：全零运行态（新入池账号）。sync_from_* 的增量合并用
 /// `..PoolEntry::default()` 补足未显式列出的字段，避免漏字段导致编译错误
@@ -144,6 +221,7 @@ impl Default for PoolEntry {
             global_region: false,
             refresh_invalid: false,
             per_model_cooldowns: std::collections::HashMap::new(),
+            plan: None,
         }
     }
 }
@@ -778,7 +856,12 @@ impl ApiPool {
 
     /// 从 ZCode 账号同步池（z.ai GLM 池）：账号源 = zcode.sqlite（zcode 域管理，
     /// 网关只读），增量合并语义同 sync_from_qoder（保留冷却/熔断/限频运行态）。
-    /// 凭证快照仅作入池门槛与兜底——请求期真凭证经 zcode_identity 回调按次解析
+    /// 凭证快照仅作入池门槛与兜底——请求期真凭证经 zcode_identity 回调按次解析。
+    ///
+    /// 套餐门槛（2026-10-23 套餐池改造）：`plan` 随入池一并写入。与历史版本的差别
+    /// 只在"已同步画像且模型集为空"的账号——它们**照旧入池但 `selectable` 会挡掉**，
+    /// 这样既能立刻停掉 13/15 个无套餐号的无效消耗，又保留 `pool_status` 里对
+    /// 这些账号的可见性（用户能看懂为什么它们不可用）。
     pub fn sync_from_zcode(&self, accounts: &[ZCodeSyncAccount], enabled: &[String]) {
         let mut entries = safe_lock(&self.entries);
         let enabled_set: HashSet<&str> = enabled.iter().map(|s| s.as_str()).collect();
@@ -794,6 +877,11 @@ impl ApiPool {
                     e.jwt = a.access_token.clone();
                     e.device_id = a.device_mid.clone();
                     e.refresh_invalid = false;
+                    // 画像只在本次带上时覆盖（None = 未同步，保留池内旧快照，
+                    // 避免装配层漏传把已生效的套餐门闸擦掉）
+                    if a.plan.is_some() {
+                        e.plan = a.plan.clone();
+                    }
                 }
                 None => {
                     entries.insert(a.uid.clone(), PoolEntry {
@@ -801,6 +889,7 @@ impl ApiPool {
                         name: a.name.clone(),
                         jwt: a.access_token.clone(),
                         device_id: a.device_mid.clone(),
+                        plan: a.plan.clone(),
                         ..PoolEntry::default()
                     });
                 }
@@ -809,6 +898,25 @@ impl ApiPool {
         entries.retain(|uid, _| keep.contains(uid));
         let mut inflight = safe_lock(&self.inflight);
         inflight.retain(|uid, _| entries.contains_key(uid));
+    }
+
+    /// 运行期回写套餐画像（监控域画像同步后调用）：只改 plan 字段，不重建池，
+    /// 不动白名单/冷却/在途计数。`None` 值表示该账号本次没拿到画像 → 保留旧值。
+    pub fn update_zcode_plans(&self, updates: &[(String, Option<PlanGate>)]) {
+        if updates.is_empty() {
+            return;
+        }
+        let mut entries = safe_lock(&self.entries);
+        for (uid, plan) in updates {
+            if let (Some(e), Some(p)) = (entries.get_mut(uid), plan.as_ref()) {
+                e.plan = Some(p.clone());
+            }
+        }
+    }
+
+    /// 读取某账号的套餐门闸快照（错误分类用：1113 细分需要知道"是没权益还是没额度"）
+    pub fn plan_of(&self, uid: &str) -> Option<PlanGate> {
+        safe_lock(&self.entries).get(uid).and_then(|e| e.plan.clone())
     }
 
     /// 账号区域查询（免费档记账用）：Some(true)=海外、Some(false)=国内、
@@ -1012,6 +1120,163 @@ impl ApiPool {
             e.last_used = now;
         }
         Some((account, event))
+    }
+
+    /// ZCode 套餐感知取号（2026-10-23 套餐池改造）。
+    ///
+    /// 与通用 `pick_excluding_constrained_ev_region` 的差别只有三处，其余（专一锁定、
+    /// busy 过滤与降级、防惊群、last_used 记账）完全复用同一套语义：
+    /// 1. **模型维度过滤**：请求模型不在账号 `servable_models` 内直接跳过，不发请求；
+    /// 2. **时段维度过滤**：只有夜间档权益的账号在白天跳过（不冷却、不计错）；
+    /// 3. **套餐燃烧顺序**：`new_account > task_card > global_build > start_plan`，
+    ///    同形态内先到期先烧，同档内才交给池策略挑——这样临时额度先烧完，
+    ///    Start Plan 这类长期订阅留作底座（用户 2026-10-23 定的口径）。
+    ///
+    /// 画像未知（`plan: None`）的账号 fail-open 仍然可选，但排在所有已知套餐之后，
+    /// 避免它们抢走临时额度的消耗顺位。
+    pub fn pick_zcode(
+        &self,
+        tried: &HashSet<String>,
+        allowed: Option<&HashSet<String>>,
+        dedicated: Option<&str>,
+        plan_kinds: Option<&HashSet<String>>,
+        model: &str,
+        now: i64,
+        hour: u32,
+    ) -> Option<(PickedAccount, Option<String>)> {
+        let model_lc = model.trim().to_lowercase();
+        // 专一模式：绑定账号 healthy 且画像允许 → 直接锁定（专一不让位）
+        if let Some(uid) = dedicated {
+            if !tried.contains(uid) {
+                let entries = safe_lock(&self.entries);
+                let reserve = self.reserve_credits();
+                let no_tried = HashSet::new();
+                let hit = entries
+                    .get(uid)
+                    .filter(|e| selectable(e, &no_tried, now, reserve))
+                    .filter(|e| plan_gate_ok(e, &model_lc, plan_kinds, now, hour))
+                    .map(|e| PickedAccount {
+                        uid: e.uid.clone(),
+                        jwt: e.jwt.clone(),
+                        device_id: e.device_id.clone(),
+                        machine_id: e.machine_id.clone(),
+                        domain: e.domain.clone(),
+                        enterprise_id: e.enterprise_id.clone(),
+                        global_region: e.global_region,
+                        over_limit: false,
+                    });
+                drop(entries);
+                if let Some(p) = hit {
+                    let mut entries = safe_lock(&self.entries);
+                    if let Some(e) = entries.get_mut(uid) {
+                        e.last_used = now;
+                    }
+                    return Some((p, None));
+                }
+            }
+        }
+        let mut entries = safe_lock(&self.entries);
+        let strategy = *safe_lock(&self.strategy);
+        let reserve = self.reserve_credits();
+        // 画像/时段过滤在 selectable 之后做：先摘掉无权益账号，再按模型与窗口收窄。
+        // plan_blocked 只用于可观测（"有健康号但都不服务这个模型"是最常见的一种 4xx 根因）
+        let plan_blocked = entries
+            .values()
+            .filter(|e| selectable(e, tried, now, reserve))
+            .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
+            .count();
+        let all_cands: Vec<&PoolEntry> = entries
+            .values()
+            .filter(|e| selectable(e, tried, now, reserve))
+            .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
+            .filter(|e| plan_gate_ok(e, &model_lc, plan_kinds, now, hour))
+            .collect();
+        let inflight = self.inflight_snapshot();
+        let limit = self.concurrency_limit();
+        let (cands, busy_fallback) = busy_filter(&all_cands, &inflight, limit);
+        let rand_seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() ^ (d.subsec_nanos() as u64).wrapping_mul(0x9e3779b97f4a7c15))
+            .unwrap_or(0);
+        let mut picked = if busy_fallback {
+            all_cands
+                .iter()
+                .copied()
+                .min_by_key(|e| inflight_of(e, &inflight))
+        } else {
+            pick_plan_first(&cands, strategy, rand_seed, now, &inflight)
+        }?;
+        // 防惊群：同 100ms 内重复选中且还有其他候选 → 让位（同档内重新挑）
+        if !busy_fallback && cands.len() > 1 {
+            let mut recent = safe_lock(&self.recent_pick);
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            if recent.0 == picked.uid && now_ms - recent.1 < 100 {
+                let others: Vec<&PoolEntry> = cands
+                    .iter()
+                    .copied()
+                    .filter(|e| e.uid != picked.uid)
+                    .collect();
+                if let Some(alt) =
+                    pick_plan_first(&others, strategy, rand_seed.wrapping_add(1), now, &inflight)
+                {
+                    picked = alt;
+                }
+            }
+            *recent = (picked.uid.clone(), now_ms);
+        }
+        let account = PickedAccount {
+            uid: picked.uid.clone(),
+            jwt: picked.jwt.clone(),
+            device_id: picked.device_id.clone(),
+            machine_id: picked.machine_id.clone(),
+            domain: picked.domain.clone(),
+            enterprise_id: picked.enterprise_id.clone(),
+            global_region: picked.global_region,
+            over_limit: busy_fallback,
+        };
+        // 可观测：套餐过滤/降级事件（无则 None，调用方只在 Some 时记日志）
+        let event = if all_cands.is_empty() && plan_blocked > 0 {
+            Some(format!(
+                "plan_filtered model={} blocked={} (模型/时段/额度/套餐白名单不匹配)",
+                model_lc, plan_blocked
+            ))
+        } else if limit > 0 && busy_fallback {
+            Some(format!(
+                "busy_fallback picked={} inflight={} limit={}",
+                picked.uid,
+                inflight_of(picked, &inflight),
+                limit
+            ))
+        } else {
+            None
+        };
+        drop(cands);
+        if let Some(e) = entries.get_mut(&account.uid) {
+            e.last_used = now;
+        }
+        Some((account, event))
+    }
+
+    /// 池内某模型的可选账号数（ZCode 路由「无可用账号」时报错用）：
+    /// 返回 (可服务该模型的健康账号数, 池内健康账号总数)
+    pub fn zcode_model_stats(&self, model: &str, now: i64, hour: u32) -> (usize, usize) {
+        let entries = safe_lock(&self.entries);
+        let reserve = self.reserve_credits();
+        let no_tried = HashSet::new();
+        let healthy = entries
+            .values()
+            .filter(|e| selectable(e, &no_tried, now, reserve))
+            .count();
+        let model_lc = model.trim().to_lowercase();
+        let for_model = entries
+            .values()
+            .filter(|e| selectable(e, &no_tried, now, reserve))
+            .filter(|e| plan_gate_ok(e, &model_lc, None, now, hour))
+            .count();
+        (for_model, healthy)
     }
 
     /// F-77④ 粘性让位取号：粘性账号 busy（inflight ≥ 并发上限）且池内存在其他
@@ -1455,6 +1720,50 @@ impl ApiPool {
                 state: e.state_str(now).to_string(),
                 inflight: inflight.get(&e.uid).copied().unwrap_or(0),
                 refresh_invalid: e.refresh_invalid,
+                // 按模型冷却快照（已过滤过期）：账号级 cooling/hard_credit 之外的
+                // 第二维度——账号健康但某个模型被限。前端据此逐模型展示「哪个模型
+                // 没额度、什么时候恢复」，用户才知道该换哪个模型接着用
+                per_model_cooldowns: e
+                    .per_model_cooldowns
+                    .iter()
+                    .filter(|(_, until)| **until > now)
+                    .map(|(m, u)| (m.clone(), *u))
+                    .collect(),
+                // 套餐画像（仅 zcode 池有值）：网关页按套餐分组展示、
+                // 「为什么这个号不可选」的解释全靠这几个字段
+                plan_kind: e.plan.as_ref().map(|p| p.kind.clone()),
+                plan_kinds: e
+                    .plan
+                    .as_ref()
+                    .map(|p| {
+                        p.kinds
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                plan_models: e
+                    .plan
+                    .as_ref()
+                    .map(|p| {
+                        p.models
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                plan_period: e
+                    .plan
+                    .as_ref()
+                    .map(|p| p.period.clone())
+                    .filter(|s| !s.is_empty()),
+                plan_night_only: e.plan.as_ref().map(|p| p.night_only).unwrap_or(false),
+                plan_remaining_units: e.plan.as_ref().map(|p| p.remaining_units),
+                plan_grant_units: e.plan.as_ref().map(|p| p.grant_units),
+                plan_ends_at: e.plan.as_ref().and_then(|p| p.ends_at),
+                plan_synced_at: e.plan.as_ref().map(|p| p.synced_at),
             })
             .collect();
         out.sort_by(|a, b| a.uid.cmp(&b.uid));
@@ -1687,19 +1996,31 @@ pub struct QoderSyncAccount {
 }
 
 /// ZCode 账号入池同步结构（z.ai GLM 池）：uid = zcode.sqlite accounts.id 字符串化。
-/// access_token/device_mid 为入池快照（请求期经 identity 回调重读最新值）
+/// access_token/device_mid 为入池快照（请求期经 identity 回调重读最新值）。
+///
+/// `plan` 为套餐画像快照——`None` = 该账号从未同步过画像（fail-open 仍可入池），
+/// `Some` 且模型集为空 = 上游明确判定无可用权益（不入池，避免撞 1113）。
 pub struct ZCodeSyncAccount {
     pub uid: String,
     pub name: String,
     pub access_token: String,
     pub device_mid: String,
+    pub plan: Option<PlanGate>,
 }
 
 /// 候选过滤：healthy + 未 tried + 积分未过期 + 非零积分 + 非 hard_credit 冷却
 /// `reserve`：账号保留剩余积分阈值（issue #91，≥ 0；0 = 仅过滤零积分）
+///
+/// ZCode 套餐硬门闸在此处一并生效（模型无关的那一半）：画像已同步且模型集为空
+/// = 上游说这号没任何权益，任何模型都不该选它。模型/时段维度在 `pick_zcode` 里判。
 fn selectable(e: &PoolEntry, tried: &HashSet<String>, now: i64, reserve: f64) -> bool {
     if tried.contains(&e.uid) || !e.healthy(now) {
         return false;
+    }
+    if let Some(p) = &e.plan {
+        if !p.has_entitlement() {
+            return false;
+        }
     }
     // 跳过积分已过期的（expire_time=0 视为无过期时间，不跳过）
     if let Some(exp) = e.credits_expire_at {
@@ -1746,6 +2067,73 @@ fn busy_filter<'a>(
     } else {
         (idle, false)
     }
+}
+
+/// ZCode 套餐门闸判定（模型无关 + 模型相关两半合并在这里）。
+///
+/// `plan: None`（画像从未同步）→ **fail-open 放行**，保持改造前的可用性；
+/// 有画像则逐条判：有无权益 → 是否服务该模型 → Key 级套餐白名单 → 夜间窗口
+/// → 到期 → 额度耗尽。
+fn plan_gate_ok(
+    e: &PoolEntry,
+    model_lc: &str,
+    plan_kinds: Option<&HashSet<String>>,
+    now: i64,
+    hour: u32,
+) -> bool {
+    let Some(p) = &e.plan else { return true };
+    if !p.has_entitlement() {
+        return false;
+    }
+    if !p.serves(model_lc) {
+        return false;
+    }
+    if !p.kind_allowed(plan_kinds) {
+        return false;
+    }
+    // 夜间档：只有夜间权益的账号在白天跳过（不冷却不计错，到点自然可用）
+    if p.night_only && !crate::zcode::plan_profile::in_night_window(hour) {
+        return false;
+    }
+    if let Some(end) = p.ends_at {
+        if end > 0 && now >= end {
+            return false;
+        }
+    }
+    if p.grant_units > 0 && p.remaining_units <= 0 {
+        return false;
+    }
+    true
+}
+
+/// 套餐燃烧顺序排序键：(形态权重, 到期时间)。越小越先烧。
+/// 无画像账号归到最后一档（9），免得抢临时额度的顺位。
+fn plan_order(e: &PoolEntry) -> (i64, i64) {
+    match &e.plan {
+        Some(p) => (p.burn_rank(), p.expiry_key()),
+        None => (9, i64::MAX),
+    }
+}
+
+/// 套餐优先挑选：先在「最该烧的那一档」内收窄，再交给池策略挑具体账号。
+/// 档内仍保留池策略（expire_first/weighted/…）的均衡与随机性，不会把并发全压到一个号上。
+fn pick_plan_first<'a>(
+    cands: &[&'a PoolEntry],
+    strategy: PoolStrategy,
+    rand_seed: u64,
+    now: i64,
+    inflight: &HashMap<String, u32>,
+) -> Option<&'a PoolEntry> {
+    if cands.is_empty() {
+        return None;
+    }
+    let best_key = cands.iter().map(|e| plan_order(e)).min()?;
+    let tier: Vec<&'a PoolEntry> = cands
+        .iter()
+        .copied()
+        .filter(|e| plan_order(e) == best_key)
+        .collect();
+    pick_by_strategy(&tier, strategy, rand_seed, now, inflight).or_else(|| tier.first().copied())
 }
 
 /// 按策略从候选集中挑选（纯函数，便于单测）；
@@ -1868,7 +2256,8 @@ pub fn next_0000(now: i64) -> i64 {
     day_start + 86400 - 8 * 3600
 }
 
-fn now_ts() -> i64 {
+/// 当前 Unix 秒（池内统一时间源；wb_route 模型冷却快照复用）
+pub fn now_ts() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -2408,6 +2797,7 @@ mod tests {
             per_model_cooldowns: std::collections::HashMap::new(),
             domain: String::new(), enterprise_id: String::new(), global_region: false,
             refresh_invalid: false,
+            plan: None,
         };
         let e_b = crate::api_server::pool::PoolEntry {
             last_used: 1000 - 3 * 3600, // 闲置 3 小时
@@ -2422,6 +2812,7 @@ mod tests {
                 per_model_cooldowns: std::collections::HashMap::new(),
                 domain: String::new(), enterprise_id: String::new(), global_region: false,
                 refresh_invalid: false,
+                plan: None,
             }
         };
         let now = 1000 + 60;
@@ -2492,6 +2883,7 @@ mod tests {
             enterprise_id: String::new(),
             global_region: false,
             refresh_invalid: false,
+            plan: None,
         }
     }
 
@@ -3332,6 +3724,28 @@ mod tests {
         assert_eq!(pool.status_list()[0].inflight, 1);
         h.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(pool.status_list()[0].inflight, 0);
+    }
+
+    /// 按模型冷却快照必须外传（前端可见性，2026-10-22）：账号级 cooling 之外
+    /// 的第二维度。此前 status_list 不带 per_model_cooldowns，账号在某个模型
+    /// 上被冷却到次日 00:00 时前端只显示「就绪」——用户无从知道该换哪个模型。
+    /// 过期条目须过滤（前端拿到的都是生效中的）。
+    #[test]
+    fn status_list_reports_per_model_cooldowns() {
+        let pool = build_pool(&[("uid_a", 10.0, 0)]);
+        let now = now_ts();
+        // 生效中的两条 + 已过期的一条
+        pool.per_model_cooldown_until("uid_a", "qwen3.8-flash", now + 3600);
+        pool.per_model_cooldown_until("uid_a", "deepseek-flash", now + 7200);
+        pool.per_model_cooldown_until("uid_a", "stale-model", now - 60);
+        let map = &pool.status_list()[0].per_model_cooldowns;
+        assert_eq!(map.len(), 2, "过期条目必须过滤，实际 {:?}", map);
+        assert_eq!(map.get("qwen3.8-flash"), Some(&(now + 3600)));
+        assert_eq!(map.get("deepseek-flash"), Some(&(now + 7200)));
+        assert!(!map.contains_key("stale-model"), "已过期不得外传");
+        // 无按模型冷却时为空 map（不是 None，前端 ?? {} 兜底同效）
+        let pool_b = build_pool(&[("uid_b", 10.0, 0)]);
+        assert!(pool_b.status_list()[0].per_model_cooldowns.is_empty());
     }
 
     #[test]

@@ -82,6 +82,9 @@ reqwest = { version = "0.12", features = ["json"] }
 tiny_http = "0.12"
 # 统一错误类型(zcode::error)
 thiserror = "2"
+# 马甲邮箱注册收验证码:Gmail IMAP 客户端(register/imap.rs)。
+# runtime-tokio 走 tokio-rustls(项目已有 0.26),避免引入 async-std 生态
+async-imap = { version = "0.10", default-features = false, features = ["runtime-tokio"] }
 log = "0.4"
 # zcode 域打开系统浏览器/领取页(OAuth 与 claim 流程)
 tauri-plugin-opener = "2"

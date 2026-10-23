@@ -477,23 +477,31 @@ fn model_from_item(item: &Value) -> Option<WbModel> {
     // 数字形态或旧键（rate/ratio/price/creditRate）兜底。
     // credits 键存在但为空串（/v3/config 的 default-model/Auto 智能路由不标价）→
     // 无计价信息，条目跳过：解析成 0.0 会混入免费档（rate==0 判定）。
+    //
+    // 2026-10-22：`priceFactor` 与 `price_factor` 一并识别（Qoder 侧上游已确认
+    // 会下发「限时免费」= priceFactor:0 + originalPriceFactor:原价；Buddy 目录
+    // 来自另一端点，字段形态可能跟进同一命名）。**只读当前生效价，不读
+    // originalPriceFactor**——后者是划线原价，当兜底会把限免模型误判成付费。
     let rate = match dig_f64(item, &["rate", "ratio", "price", "creditRate"]) {
         Some(r) => r,
-        None => match item.get("credits") {
-            Some(Value::String(s)) if s.trim().is_empty() => return None,
-            other => other
-                .and_then(|x| match x {
-                    Value::Number(n) => n.as_f64(),
-                    Value::String(s) => s
-                        .trim()
-                        .trim_start_matches(['x', 'X'])
-                        .trim()
-                        .split_whitespace()
-                        .next()
-                        .and_then(|n| n.parse().ok()),
-                    _ => None,
-                })
-                .unwrap_or(0.0),
+        None => match dig_f64(item, &["priceFactor", "price_factor"]) {
+            Some(r) => r,
+            None => match item.get("credits") {
+                Some(Value::String(s)) if s.trim().is_empty() => return None,
+                other => other
+                    .and_then(|x| match x {
+                        Value::Number(n) => n.as_f64(),
+                        Value::String(s) => s
+                            .trim()
+                            .trim_start_matches(['x', 'X'])
+                            .trim()
+                            .split_whitespace()
+                            .next()
+                            .and_then(|n| n.parse().ok()),
+                        _ => None,
+                    })
+                    .unwrap_or(0.0),
+            },
         },
     };
     // 档位：顶层旧键 → reasoning.supportedEfforts 数组 → reasoning.effort 固定单档（统一小写）

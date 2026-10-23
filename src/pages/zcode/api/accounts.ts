@@ -33,9 +33,26 @@ export const accountsApi = {
     }),
   /** 自动同步邀请关系(官方奖励中心接口):返回统计 */
   syncInvite: () =>
-    invoke<{ inviters: number; linked: number; unmatched: string[]; errors: string[] }>(
-      "zcode_accounts_sync_invite",
-    ),
+    invoke<{
+      inviters: number;
+      linked: number;
+      unmatched: string[];
+      errors: string[];
+      conflicts: string[];
+    }>("zcode_accounts_sync_invite"),
+  /** 刷新各账号邀请资格(邀请码/active·locked/预计开放时间/已邀请人数) */
+  syncInviteQualification: () =>
+    invoke<{
+      synced: number;
+      active: number;
+      locked: number;
+      errors: string[];
+    }>("zcode_accounts_sync_invite_qualification"),
+  /** 生成某账号的邀请链接(无资格/无码会报错) */
+  inviteLink: (id: number) => invoke<string>("zcode_accounts_invite_link", { id }),
+  /** 发起邀请捆绑:浏览器打开本地验证码页,成功后自动标记 invited + invited_by */
+  bindInvite: (accountId: number, inviterId: number) =>
+    invoke<void>("zcode_accounts_bind_invite", { accountId, inviterId }),
   /** 批量账密登录:按 secret 条目 id 逐个经内嵌窗口导入,返回接受的条目数 */
   batchLogin: (secretIds: number[]) =>
     invoke<number>("zcode_accounts_batch_login", { secretIds }),

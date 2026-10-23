@@ -74,6 +74,8 @@ pub struct ResolvedKey {
     /// 组/标签维度已配置（展开后即使空集也视为受约束——空展开 = 该池无可取号
     /// 账号，走既有 no_healthy_account 路径，而非「不限」）
     pub org_constrained: bool,
+    /// 套餐形态白名单（2026-10-23 套餐池改造；仅 zcode 池消费，空 = 不限）
+    pub plan_kinds: Vec<String>,
 }
 
 /// 解析池前缀标记（issue #30）：`"trae:x"` → (Some("trae"), "x")；裸 uid → (None, 原串)。
@@ -100,6 +102,11 @@ pub struct PoolConstraint {
     /// 仅国内账号、None=不限。取号侧覆盖/收窄模型区域推导——Key 是用户的显式
     /// 意图（国内号池用国内 Key、海外号池用海外 Key 的硬隔离手段）
     pub want_global: Option<bool>,
+    /// 套餐形态约束（2026-10-23 套餐池改造，仅 zcode 池）：Some(集合) = 只能命中
+    /// 这些套餐形态的账号（new_account/task_card/global_build/start_plan/other）；
+    /// None/空集 = 不限。典型用法：给外部智能体的 Key 限定「只烧任务卡与新号，
+    /// 别动我的 Start Plan 底座」。
+    pub plan_kinds: Option<std::collections::HashSet<String>>,
 }
 
 impl ResolvedKey {
@@ -115,6 +122,7 @@ impl ResolvedKey {
             allowed_groups: e.allowed_groups.clone(),
             allowed_tags: e.allowed_tags.clone(),
             org_constrained: false,
+            plan_kinds: e.plan_kinds.clone(),
         }
     }
 
@@ -181,12 +189,20 @@ impl ResolvedKey {
         } else {
             None
         };
+        // 套餐形态约束（2026-10-23 套餐池改造）：仅 zcode 池有意义——其它池没有
+        // 套餐概念，传非空值视为配置错误，直接忽略（不制造"Key 全不可用"的坑）
+        let plan_kinds: Option<HashSet<String>> = if pool == "zcode" && !self.plan_kinds.is_empty() {
+            Some(self.plan_kinds.iter().map(|s| s.trim().to_string()).collect())
+        } else {
+            None
+        };
         // 组/标签维度已配置时不得提前返回 None（空展开 = 该池排除，非「不限」）；
         // 仅区域约束（无白名单/专一/组标签）同样不得提前返回——区域是独立约束维度
         if self.allowed_accounts.is_empty()
             && self.dedicated_account.is_empty()
             && !self.org_constrained
             && key_want_global.is_none()
+            && plan_kinds.is_none()
         {
             return None;
         }
@@ -220,13 +236,13 @@ impl ResolvedKey {
                 Some((dpool, duid)) if dpool == pool => {
                     let mut allowed = scoped;
                     allowed.insert(duid.clone());
-                    Some(PoolConstraint { allowed: Some(allowed), dedicated: Some(duid), want_global: key_want_global })
+                    Some(PoolConstraint { allowed: Some(allowed), dedicated: Some(duid), want_global: key_want_global, plan_kinds: plan_kinds.clone() })
                 }
                 // 专一锁池：非归属池整体排除（预检判不健康 → 走归属池）
                 Some(_) => {
-                    Some(PoolConstraint { allowed: Some(HashSet::new()), dedicated: None, want_global: key_want_global })
+                    Some(PoolConstraint { allowed: Some(HashSet::new()), dedicated: None, want_global: key_want_global, plan_kinds: plan_kinds.clone() })
                 }
-                None => Some(PoolConstraint { allowed: Some(scoped), dedicated: None, want_global: key_want_global }),
+                None => Some(PoolConstraint { allowed: Some(scoped), dedicated: None, want_global: key_want_global, plan_kinds: plan_kinds.clone() }),
             }
         } else if self.constrains_pool(pool) {
             // 旧语义：constrains_pool 已判定本池受约束；白名单可空（issue #30
@@ -234,10 +250,10 @@ impl ResolvedKey {
             // 与重构前 wb_route/trae_pool_constraints 的独立提取行为一致）
             let allowed = (!self.allowed_accounts.is_empty())
                 .then(|| self.allowed_accounts.iter().cloned().collect());
-            Some(PoolConstraint { allowed, dedicated: dedicated.map(|(_, u)| u), want_global: key_want_global })
+            Some(PoolConstraint { allowed, dedicated: dedicated.map(|(_, u)| u), want_global: key_want_global, plan_kinds: plan_kinds.clone() })
         } else if key_want_global.is_some() {
             // 仅区域约束（无白名单/专一/组标签）：区域单独生效（2026-10-17 海外接入）
-            Some(PoolConstraint { allowed: None, dedicated: None, want_global: key_want_global })
+            Some(PoolConstraint { allowed: None, dedicated: None, want_global: key_want_global, plan_kinds: plan_kinds.clone() })
         } else {
             None
         }
@@ -296,6 +312,7 @@ pub fn ensure_overseas_pool_keys(data_dir: &Path) {
             daily_stats: vec![],
             allowed_groups: vec![],
             allowed_tags: vec![],
+            plan_kinds: vec![],
         });
         changed = true;
     }
@@ -309,12 +326,54 @@ pub fn ensure_overseas_pool_keys(data_dir: &Path) {
     let _ = crate::store::db(data_dir).kv_set(FLAG, &true);
 }
 
+/// ZCode 号池专用 Key 预置（2026-10-21，用户裁决「直接帮我设置好到 ZCode 内」）：
+/// bind_pool=zcode 钉死 ZCode 池。区域不适用（z.ai 无国内/海外账号之分，region=""）。
+/// 幂等：kv 标记置位后不再创建（用户删除后不复活）；同 id 已存在亦跳过。
+/// Key 值编译期固定——ZCode provider_config.json 直写需要预知值；泄露面 =
+/// 本机回环网关，可在 Key 管理器随时重建。
+pub fn ensure_zcode_pool_key(data_dir: &Path) {
+    const FLAG: &str = "zcode_pool_key_provisioned";
+    if crate::store::db(data_dir).kv_get::<bool>(FLAG) {
+        return;
+    }
+    let mut file = load(data_dir);
+    if !file.keys.iter().any(|k| k.id == "key-zcode-pool") {
+        file.keys.push(ApiKeyEntry {
+            id: "key-zcode-pool".into(),
+            name: "ZCode 号池".into(),
+            key: "ck_zc0depool20261021a5f19c3e7d2b8046".into(),
+            enabled: true,
+            daily_limit: 0,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            used_date: String::new(),
+            used_today: 0,
+            allowed_accounts: vec![],
+            schedule_mode: "expire_first".into(),
+            dedicated_account: String::new(),
+            region: String::new(),
+            bind_pool: "zcode".into(),
+            daily_stats: vec![],
+            allowed_groups: vec![],
+            allowed_tags: vec![],
+            plan_kinds: vec![],
+        });
+        save(data_dir, &file);
+        crate::fs_utils::app_log(
+            data_dir,
+            "已预置 ZCode 号池专用 Key：bind_pool=zcode 钉死（API 管理弹窗可见）",
+        );
+    }
+    let _ = crate::store::db(data_dir).kv_set(FLAG, &true);
+}
+
 /// 一次性迁移（2026-10-17，用户裁决）：存量 Key（region 为空且非海外预置 Key）
 /// 统一补「仅国内」——国内号池用国内 Key、海外号池用海外 Key 的硬隔离收尾。
 /// Trae 池无区域概念，region=cn 对其无副作用。kv 标记幂等，用户之后可随时在
 /// Key 管理器改回。
-pub fn normalize_legacy_key_regions(data_dir: &Path) {
-    const FLAG: &str = "legacy_key_region_cn_applied";
+pub fn normalize_legacy_key_regions(data_dir: &Path) {    const FLAG: &str = "legacy_key_region_cn_applied";
     if crate::store::db(data_dir).kv_get::<bool>(FLAG) {
         return;
     }
@@ -353,7 +412,7 @@ pub struct KeyDailyStat {
 }
 
 /// API Key 条目
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ApiKeyEntry {
     /// 唯一标识（前端生成）
     pub id: String,
@@ -406,6 +465,12 @@ pub struct ApiKeyEntry {
     /// 共享标签 id 白名单（tag_ 前缀）；空 = 不通过该维度限制。语义同上
     #[serde(default)]
     pub allowed_tags: Vec<String>,
+    /// 套餐形态白名单（2026-10-23 套餐池改造，仅 zcode 池生效）：
+    /// 空 = 不限；非空 = 只允许命中这些形态的账号
+    /// （new_account / task_card / global_build / start_plan / other）。
+    /// 用途：给外部智能体的 Key 限定「只烧临时额度，别动长期订阅底座」
+    #[serde(default)]
+    pub plan_kinds: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -792,6 +857,7 @@ mod tests {
             allowed_groups: vec![],
             allowed_tags: vec![],
             region: String::new(),
+            plan_kinds: vec![],
         }
     }
 

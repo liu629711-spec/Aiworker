@@ -4,7 +4,7 @@ use crate::zcode::db::models::{self, Account};
 use crate::zcode::error::AppResult;
 use crate::zcode::state::ZcodeState;
 
-use super::{events, service};
+use super::{events, invite, service};
 
 #[tauri::command]
 pub async fn zcode_accounts_list(state: State<'_, ZcodeState>) -> AppResult<Vec<Account>> {
@@ -97,7 +97,77 @@ pub async fn zcode_accounts_sync_invite(
         "linked": result.linked,
         "unmatched": result.unmatched,
         "errors": result.errors,
+        "conflicts": result.conflicts,
     }))
+}
+
+/// 刷新各账号的邀请资格(官方 referral/summary 的 inviter 节点):
+/// 邀请码 / active·locked 状态 / 预计开放时间 / 已邀请人数。返回统计。
+#[tauri::command]
+pub async fn zcode_accounts_sync_invite_qualification(
+    app: AppHandle,
+    state: State<'_, ZcodeState>,
+) -> AppResult<serde_json::Value> {
+    let result = invite::sync_invite_qualification(&state.db, &state.http).await?;
+    events::emit_accounts_changed(&app)?;
+    Ok(serde_json::json!({
+        "synced": result.synced,
+        "active": result.active,
+        "locked": result.locked,
+        "errors": result.errors,
+    }))
+}
+
+/// 生成某账号的邀请链接(有资格才给;无码/冷却中报错)。
+#[tauri::command]
+pub async fn zcode_accounts_invite_link(
+    state: State<'_, ZcodeState>,
+    id: i64,
+) -> AppResult<String> {
+    let account = crate::zcode::db::repo::fetch_by_id(&state.db, id)
+        .await?
+        .ok_or_else(|| crate::zcode::error::AppError::Other("账号不存在".into()))?;
+    let code = account
+        .invite_code
+        .as_deref()
+        .and_then(invite::normalize_code)
+        .ok_or_else(|| {
+            crate::zcode::error::AppError::Other(
+                "该账号没有邀请码,请先点「同步资格」刷新".into(),
+            )
+        })?;
+    invite::invite_link(&code).ok_or_else(|| {
+        crate::zcode::error::AppError::Other("邀请码格式非法,请重新同步资格".into())
+    })
+}
+
+/// 发起邀请捆绑:系统浏览器打开本地捆绑页(完成阿里云验证码),Rust 持 JWT 调 bind-code,
+/// 成功后把被邀请账号标记 invited 并记 invited_by。预检失败直接报错,不开页面。
+#[tauri::command]
+pub async fn zcode_accounts_bind_invite(
+    app: AppHandle,
+    state: State<'_, ZcodeState>,
+    account_id: i64,
+    inviter_id: i64,
+) -> AppResult<()> {
+    let accounts = crate::zcode::db::repo::list(&state.db).await?;
+    let account = accounts
+        .iter()
+        .find(|a| a.id == account_id)
+        .ok_or_else(|| crate::zcode::error::AppError::Other("被邀请账号不存在".into()))?;
+    let inviter = accounts
+        .iter()
+        .find(|a| a.id == inviter_id)
+        .ok_or_else(|| crate::zcode::error::AppError::Other("主号账号不存在".into()))?;
+    // 预检(不发起网络请求):自己绑自己/已绑定/主号冷却/主号无码
+    invite::check_bind_precondition(account, inviter)?;
+
+    let port = state.claims.ensure_server(&app, &state.db, &state.http)?;
+    let url = format!(
+        "http://127.0.0.1:{port}/bind?account={account_id}&inviter={inviter_id}"
+    );
+    super::oauth::open_in_system_browser(&app, &url)?;
+    Ok(())
 }
 
 /// 账密管理:全部条目(含每个已导入账号的行 + 独立录入条目)

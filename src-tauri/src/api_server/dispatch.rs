@@ -84,6 +84,25 @@ pub(crate) fn split_pool_prefix(model: &str) -> Option<(TargetPool, &str)> {
     Some((TargetPool::parse(prefix)?, bare.trim()))
 }
 
+/// 区域后缀标记（2026-10-23 Agent 接入中心）：Qoder/Buddy 两池存在**同 id 跨区
+/// 重名**（实测 Qoder CN 13 个模型中有 11 个在 Global 区同名），仅凭模型 id
+/// 无法表达「我要国内那个」还是「我要海外那个」——原先只能靠 Key 的 region
+/// 字段间接约束。给模型 id 加显式区域后缀，让**一个 Key 也能点名区域**，
+/// 客户端里两个同名模型可区分（`qoder/GLM-5.3@cn` vs `qoder/GLM-5.3@global`）。
+///
+/// 语法：`<任意模型 id>@cn` / `<任意模型 id>@global`（大小写不敏感）。
+/// 只剥离**最后一个** `@`，模型名本身含 `@` 时前缀部分原样保留。
+pub(crate) fn split_region_suffix(model: &str) -> (&str, Option<bool>) {
+    let Some((base, tag)) = model.rsplit_once('@') else {
+        return (model, None);
+    };
+    match tag.trim().to_lowercase().as_str() {
+        "cn" | "domestic" | "国内" => (base, Some(false)),
+        "global" | "overseas" | "海外" => (base, Some(true)),
+        _ => (model, None),
+    }
+}
+
 // ==================== 调度策略配置（§4.2） ====================
 
 /// 池间调度策略
@@ -239,6 +258,10 @@ pub struct Resolved {
     /// 内部落 app_log；本字段供调度测试断言与 Phase 2 资源页展示预留）
     #[allow(dead_code)]
     pub fallback_from: Option<TargetPool>,
+    /// 区域后缀显式提示（2026-10-23）：模型 id 带 `@cn` / `@global` 时置位，
+    /// 下游按此**覆盖** Key 的 region 约束（显式 > 隐式）与目录区域推导。
+    /// 典型用途：同一 id 在两区都存在的模型（Qoder 11/13 个）靠后缀区分。
+    pub region_hint: Option<bool>,
 }
 
 /// 回退原因（供 warn 日志）
@@ -393,6 +416,11 @@ pub fn resolve_target(
         Some((pool, bare)) => (Some(pool), bare),
         None => (None, model),
     };
+    // 区域后缀（2026-10-23）：`xxx@cn` / `xxx@global` 剥离并记下显式区域。
+    // 放在池前缀之后——两者可叠加（`qoder/GLM-5.3@global`）。显式区域在
+    // 下游覆盖 Key 的 region 约束与目录区域推导。
+    let (model, region_hint) = split_region_suffix(model);
+    let model = model.trim();
     // ⓪ 自定义模型直达（custom_models.json 命中 enabled 条目）：用户显式配置
     // 优先于内置目录；单源无跨池回退，模型名原样透传（custom_route 按条目
     // base_url/key 直连）。mtime 缓存读取，未配置时零开销跳过。
@@ -407,6 +435,7 @@ pub fn resolve_target(
                 effort_hint: None,
                 max_mode_hint: false,
                 fallback_from: None,
+                region_hint,
             });
         }
     }
@@ -610,6 +639,7 @@ pub fn resolve_target(
                     effort_hint: effort_for(pool, &sources),
                     max_mode_hint: max_mode_for(pool, &sources),
                     fallback_from: None,
+                    region_hint,
                 });
             }
         }
@@ -703,6 +733,7 @@ pub fn resolve_target(
                     effort_hint: effort_for(pool, &sources),
                     max_mode_hint: max_mode_for(pool, &sources),
                     fallback_from: fallback_from.map(|(p, _)| p),
+                    region_hint,
                 });
             }
             Err(reason) => {
@@ -1177,6 +1208,7 @@ mod tests {
                 daily_stats: vec![],
                 allowed_groups: vec![],
                 allowed_tags: vec![],
+                plan_kinds: vec![],
                 region: String::new(),
             });
             crate::store::docs::api_keys_save(&crate::store::db(&self.dir), &file).unwrap();
@@ -1217,6 +1249,8 @@ mod tests {
                     name: "zai".into(),
                     access_token: "tk".into(),
                     device_mid: "mid".into(),
+                    // None = 画像未同步：fail-open，保持改造前的测试语义
+                    plan: None,
                 }],
                 &["16".to_string()],
             );
@@ -1268,6 +1302,31 @@ mod tests {
         assert_eq!(split_pool_prefix("openai/gpt-4o"), None);
         assert_eq!(split_pool_prefix("trae/"), None);
         assert_eq!(split_pool_prefix("glm-5.3"), None);
+    }
+
+    /// 区域后缀解析（2026-10-23）：@cn/@global 剥离并给出显式区域
+    #[test]
+    fn region_suffix_parses_cn_and_global() {
+        assert_eq!(split_region_suffix("GLM-5.3@cn"), ("GLM-5.3", Some(false)));
+        assert_eq!(split_region_suffix("GLM-5.3@global"), ("GLM-5.3", Some(true)));
+        assert_eq!(split_region_suffix("GLM-5.3@GLOBAL"), ("GLM-5.3", Some(true)));
+        assert_eq!(split_region_suffix("GLM-5.3@海外"), ("GLM-5.3", Some(true)));
+        assert_eq!(split_region_suffix("GLM-5.3@国内"), ("GLM-5.3", Some(false)));
+        // 无后缀/未知后缀 → 原样返回，不误吞 @（模型名本身可能含 @）
+        assert_eq!(split_region_suffix("GLM-5.3"), ("GLM-5.3", None));
+        assert_eq!(split_region_suffix("user@host.model"), ("user@host.model", None));
+        // 只剥最后一个 @
+        assert_eq!(split_region_suffix("a@b@cn"), ("a@b", Some(false)));
+    }
+
+    /// 池前缀 + 区域后缀可叠加：qoder/GLM-5.3@global
+    #[test]
+    fn pool_prefix_and_region_suffix_compose() {
+        let (pool, bare) = split_pool_prefix("qoder/GLM-5.3@global").unwrap();
+        assert_eq!(pool, TargetPool::Qoder);
+        let (model, region) = split_region_suffix(bare);
+        assert_eq!(model, "GLM-5.3");
+        assert_eq!(region, Some(true));
     }
 
     /// ZCode 池前缀锁定（zcode/GLM-5.3 → 单池候选，model 归一化为目录 id）

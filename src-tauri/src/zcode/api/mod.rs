@@ -1,6 +1,6 @@
 mod client;
 
-pub use client::ZaiClient;
+pub use client::{detect_proxy, ZaiClient};
 
 /// ZCode 客户端版本(逆向自 3.14.5,客户端升级后需同步更新,见 HANDOFF §6.4)
 pub const APP_VERSION: &str = "3.14.5";

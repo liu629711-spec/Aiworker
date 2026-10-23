@@ -3,12 +3,14 @@ import { RefreshCw, Save, Coins, ToggleLeft, Activity, Gauge } from 'lucide-reac
 import PageHeader from '../../components/PageHeader';
 import { Badge, Spinner, StatCard } from '../../components/ui';
 import { PoolHealthBadges } from '../../components/api/PoolHealthBadges';
+import { ModelCooldownBanner } from '../../components/api/ModelCooldownBanner';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
 import type {
   ApiServiceStatus,
   ApiPoolFile,
+  ModelCooldown,
   PoolStatus,
   TagView,
   UsageDayView,
@@ -153,6 +155,8 @@ export default function BuddyApiService() {
   const [usage, setUsage] = useState<UsageDayView[]>([]);
   // WB 池实时状态（F-77⑤ 可观测：per-account inflight 在途计数）
   const [wbPool, setWbPool] = useState<PoolStatus[]>([]);
+  // 进程级模型冷却快照（模型整体排队/限流，与账号级 per_model_cooldowns 互补）
+  const [wbModelCooldowns, setWbModelCooldowns] = useState<ModelCooldown[]>([]);
   // 模型目录定时同步配置（wb_catalog_sync_enabled/hhmm 存 app Settings，独立部分保存）
   const [catSync, setCatSync] = useState({ enabled: true, hhmm: '05:45' });
   const [savingCatSync, setSavingCatSync] = useState(false);
@@ -218,6 +222,35 @@ export default function BuddyApiService() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // 服务运行中轮询 WB 池实时状态（3s，同 Trae/Qoder 页惯例）：在途并发徽标与
+  // **按模型冷却**徽标都靠它刷新——免费额度一撞上（114/115/119 → 冷却至次日
+  // 00:00），页面要能自己变成「模型名 冷却至 00:00」，否则用户看到的永远是
+  // 进页面那一刻的旧快照，不知道该换哪个模型
+  const refreshWbPoolStatus = useCallback(async () => {
+    if (!status?.running) {
+      setWbPool([]);
+      setWbModelCooldowns([]);
+      return;
+    }
+    try {
+      const [pool, cooldowns] = await Promise.all([
+        api.apiServer.wbPoolStatus(),
+        api.apiServer.wbModelCooldowns(),
+      ]);
+      setWbPool(pool);
+      setWbModelCooldowns(cooldowns);
+    } catch {
+      /* 轮询失败静默：下次轮询/手动刷新兜底，不弹 toast 打扰 */
+    }
+  }, [status?.running]);
+
+  useEffect(() => {
+    void refreshWbPoolStatus();
+    if (!status?.running) return;
+    const id = setInterval(() => void refreshWbPoolStatus(), 3000);
+    return () => clearInterval(id);
+  }, [refreshWbPoolStatus]);
 
   // 当日 WB 用量（query_recent 含今日；仅用于「今日使用」池指标）
   const loadTodayUsage = useCallback(async () => {
@@ -542,6 +575,13 @@ export default function BuddyApiService() {
                     </div>
                   </div>
                 )}
+              </div>
+            )}
+            {/* 进程级模型冷却横幅（模型整体排队/限流）：与账号行的按模型冷却徽标
+                是两个维度——这个换账号也绕不过，只能等或换模型 */}
+            {wbModelCooldowns.length > 0 && (
+              <div className="mb-2">
+                <ModelCooldownBanner items={wbModelCooldowns} />
               </div>
             )}
             {accountsError ? (

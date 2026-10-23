@@ -29,8 +29,16 @@ export type ViewKey =
   | 'qoder-credits'
   | 'qoder-api-service'
   | 'qoder-settings'
-  // ZCode 生态（zai-claim 移植：账号余额监控 / 切换 / WorkBuddy 多账号）
-  | 'zcode';
+  // ZCode 生态（zai-claim 移植：账号余额监控 / 切换 / 邀请关系分组）
+  // 各功能是独立导航项（对齐 QODER_NAV 模式），不再聚在单一页内切 tab
+  | 'zcode-accounts'
+  | 'zcode-pool'
+  | 'zcode-secrets'
+  | 'zcode-register'
+  | 'zcode-invite'
+  | 'zcode-masks'
+  // Agent 接入中心（2026-10-23：全局页，侧边栏底部入口）
+  | 'agent-integration';
 
 /** 侧边栏应用切换（左下角 Tab）：Trae 当前菜单 / Buddy / Qoder（F-80）/ 豆包 */
 export type AppKey = 'trae' | 'buddy' | 'qoder' | 'doubao' | 'zcode';
@@ -41,7 +49,7 @@ export const APP_HOME_VIEW: Record<AppKey, ViewKey> = {
   buddy: 'buddy-overview',
   qoder: 'qoder-overview',
   doubao: 'doubao-overview',
-  zcode: 'zcode',
+  zcode: 'zcode-accounts',
 };
 
 
@@ -571,7 +579,7 @@ export interface ApiServiceStatus {
 // ---- 统一网关（unified-api-gateway-design §3.1/§8.1）----
 /** 统一模型目录来源池标记（enabled 为运行时派生，不落盘） */
 export interface UnifiedModelSource {
-  pool: 'trae' | 'buddy' | 'qoder' | 'custom';
+  pool: 'trae' | 'buddy' | 'qoder' | 'custom' | 'zcode';
   rate: number | null;
   enabled: boolean;
 }
@@ -691,6 +699,48 @@ export interface PoolStatus {
   inflight?: number;
   /** refresh_token 是否已判定失效（F-78 批次 3：展示「Token 失效」徽标，需重新 OAuth 登录） */
   refresh_invalid?: boolean;
+  /**
+   * 按模型冷却快照：模型名 → 冷却截止 Unix 秒。
+   * 账号本身健康（其他模型/积分照常可用），只是这一个模型被上游限到截止时刻
+   * （Qoder 免费额度 114/115/119 → 次日 00:00；Buddy 6004 → 官方重置时刻）。
+   * 后端已过滤过期条目；旧后端未返回时为 undefined。
+   */
+  per_model_cooldowns?: Record<string, number>;
+  // ── ZCode 套餐画像（2026-10-23 套餐池改造；仅 zcode 池返回，其余池为 undefined）──
+  /** 归一化套餐形态：new_account | task_card | global_build | start_plan | other */
+  plan_kind?: string;
+  /** 该账号持有的全部形态（同号可能既是 Global Build 又是 Start Plan） */
+  plan_kinds?: string[];
+  /** 可服务模型（空 = 没有任何可用权益，选号会跳过） */
+  plan_models?: string[];
+  /** 聚合时段口径：daily | daily_night */
+  plan_period?: string;
+  /** 只有夜间档权益（白天不可选，窗口 23:00→09:00） */
+  plan_night_only?: boolean;
+  /** 剩余额度（token） */
+  plan_remaining_units?: number;
+  /** 发放总额度（token） */
+  plan_grant_units?: number;
+  /** 最早到期时间（unix 秒） */
+  plan_ends_at?: number;
+  /** 画像同步时间（unix 秒）；undefined = 从未同步（选号 fail-open） */
+  plan_synced_at?: number;
+}
+
+/**
+ * 进程级模型冷却条目（模型级排队/限流，与账号级 per_model_cooldowns 互补）。
+ * 账号级回答「哪个账号的哪个模型没额度」；这个回答「该模型整体在排队」——
+ * Qoder 海外排队换号照样排，所以是模型级现象。来源：路由层进程级冷却表
+ * （排队退避 5–30s / Server 渐进冷却 30s→8min）。后端已过滤过期条目。
+ */
+export interface ModelCooldown {
+  model: string;
+  /** 是否海外区（Qoder 双区冷却键隔离；Buddy 恒 false） */
+  global?: boolean;
+  /** 剩余冷却秒数 */
+  remaining_secs: number;
+  /** 连续失败片段数（0 = 排队退避短窗；>0 = Server 渐进冷却计数） */
+  fails?: number;
 }
 
 export interface ApiPoolFile {
@@ -857,6 +907,58 @@ export interface KeyScopedModels {
   qoder: string[];
 }
 
+/** Agent 接入中心（2026-10-23）：本机 agent 检测结果（agent_integration_scan） */
+export interface DetectedAgent {
+  agent_id: 'workbuddy' | 'zcode' | 'claude' | 'codex' | 'opencode' | 'gemini' | 'cursor' | 'trae' | 'qoder' | 'codebuddy';
+  label: string;
+  desc: string;
+  /** 按目录锚点判定是否安装 */
+  detected: boolean;
+  /** 是否支持一键写入（false = 仅检测展示，无文件级自定义渠道入口） */
+  writable: boolean;
+  /** 配置落盘绝对路径 */
+  config_path: string;
+}
+
+/** 单条模型写入摘要（WB 写入结果 models 数组元素） */
+export interface ProvisionedModel {
+  id: string;
+  key_name: string;
+  /** 区域：'cn' | 'global' | ''（无后缀 = 该区独有或无区域概念） */
+  region?: 'cn' | 'global' | '';
+}
+
+/** agent_integration_apply 返回（各 agent 形状略有差异，取并集为可选字段） */
+export interface AgentApplyResult {
+  ok: boolean;
+  path?: string;
+  /** WorkBuddy：写入条目数 / 保留的用户自定义条数 / 清除的旧 AIWork 条数 */
+  added?: number;
+  kept_foreign?: number;
+  removed_aiwork?: number;
+  /** 写入的国内/海外区模型数（同 id 跨区重名时两区各计一条） */
+  cn_count?: number;
+  global_count?: number;
+  models?: ProvisionedModel[];
+  /** ZCode 批量：成功数 / 总数 / 每 Key 明细 */
+  applied?: number;
+  total?: number;
+  details?: Array<{ key_id: string; key_name: string; result: Record<string, unknown> }>;
+  /** agent_integration_clear：移除条数 / Claude 是否确有清除 */
+  removed?: number;
+  cleared?: boolean;
+  /** Claude/Codex/opencode：生效端点与模型 */
+  base_url?: string;
+  model?: string;
+  key_name?: string;
+  /** Codex：profile 名与提示 */
+  profile?: string;
+  hint?: string;
+  /** opencode：provider id */
+  provider_id?: string;
+  error?: string;
+}
+
 /** 免费模型用量计数快照：{family: {uid: {model: {count, last_success, exhausted_at, reset_at}}}} */
 export type FreeUsageSnapshot = Record<string, Record<string, Record<string, {
   count?: number;
@@ -914,6 +1016,10 @@ export interface ApiKeyEntry {
   allowed_groups?: string[];
   /** 共享标签 id 白名单（tag_ 前缀）；空 = 不通过该维度限制 */
   allowed_tags?: string[];
+  /** 套餐形态白名单（2026-10-23 套餐池改造，仅 bind_pool=zcode 生效）：
+   * 空 = 不限；非空 = 只允许命中这些形态的账号
+   * （new_account / task_card / global_build / start_plan / other） */
+  plan_kinds?: string[];
   /** 按日请求统计（升序，保留最近 90 天） */
   daily_stats: ApiKeyDailyStat[];
 }

@@ -1,8 +1,9 @@
 /**
- * ZCode 账号工作台（zai-claim 功能，按 AI Work Studio 设计语言重写）。
+ * ZCode 账号管理页（zai-claim 功能，按 AI Work Studio 设计语言重写）。
  *
- * 子视图：ZCode 账号（余额监控/切换/邀请关系分组） | WorkBuddy（多账号捕获/切换/海外登录）。
- * 数据逻辑与 Rust 命令（zcode_* / zcode_wb_*）一一对应。
+ * 侧边栏顶级导航项之一：账号余额监控 / 一键切换 / 邀请关系分组。
+ * 其余功能（邀请档案 / 自动注册 / 马甲邮箱 / 号池调度 / 账密批量登录 /
+ * 海外号池 / Buddy 海外）各自独立成页，见 Sidebar.tsx 的 ZCODE_NAV。
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
@@ -10,29 +11,22 @@ import {
   RefreshCw,
   Plus,
   Download,
-  Camera,
   Trash2,
   SwitchCamera,
   Link2,
   Tag,
   ChevronDown,
   ChevronRight,
-  MonitorCheck,
   CircleAlert,
   Info,
-  KeyRound,
-  Globe,
 } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
-import { Badge, EmptyState, StatCard } from '../../components/ui';
+import { Badge, EmptyState, Modal, StatCard } from '../../components/ui';
 import { cn } from '../../lib/cn';
 import { accountsApi, onAccountsChanged } from './api/accounts';
 import { monitorApi, onRefreshing, onSnapshot } from './api/monitor';
 import type { Refreshing } from './api/monitor';
-import SecretsPanel from './SecretsPanel';
-import WbOverseasPanel from './WbOverseasPanel';
-import OverseasPoolPanel from './OverseasPoolPanel';
-import { fmtExpire, fmtTime, fmtUnits } from './format';
+import { fmtDateTime, fmtExpire, fmtTime, fmtUnits, inNightWindow, planKindLabel, NIGHT_WINDOW_TEXT } from './format';
 import type { Account, AccountLive, Snapshot } from './types';
 
 type Tone = 'slate' | 'brand' | 'green' | 'amber' | 'red' | 'blue' | 'violet';
@@ -67,6 +61,66 @@ function RoleBadge({
     >
       <Tag size={11} /> 标记
     </button>
+  );
+}
+
+/** 邀请资格徽标：已获得(可出邀请码/复制链接) / 待开放(带预计获得时间) / 未查 */
+function InviteQualificationBadge({
+  code,
+  state,
+  unlockAt,
+  invitedCount,
+}: {
+  code: string | null;
+  state: string | null;
+  unlockAt: number | null;
+  invitedCount: number | null;
+}) {
+  if (state === 'active') {
+    return (
+      <span className="inline-flex items-center gap-1">
+        <Badge tone="amber" title="已获得邀请资格：可生成邀请链接给新号注册">
+          👑 可邀请
+        </Badge>
+        {code && (
+          <button
+            className="chip bg-slate-100 font-mono text-slate-600 hover:bg-slate-200 dark:bg-zinc-800 dark:text-zinc-300"
+            title={`邀请码 ${code} —— 点击复制邀请链接 https://zcode.z.ai/invite/${code}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              void navigator.clipboard?.writeText(`https://zcode.z.ai/invite/${code}`).catch(() => {});
+            }}
+          >
+            {code}
+          </button>
+        )}
+        {invitedCount != null && (
+          <span className="text-xs text-slate-400" title="已成功邀请的人数">
+            已邀 {invitedCount}
+          </span>
+        )}
+      </span>
+    );
+  }
+  if (state === 'locked') {
+    const when = unlockAt ? fmtDateTime(unlockAt) : null;
+    return (
+      <Badge
+        tone="slate"
+        title={
+          when
+            ? `该账号尚未获得邀请资格，预计 ${when} 之后开放（官方按账号年龄/邀请人数判定，工具只能展示）`
+            : '该账号尚未获得邀请资格（官方按账号年龄/邀请人数判定）'
+        }
+      >
+        ⏳ {when ? `${when} 后拥有邀请资格` : '暂未拥有邀请资格'}
+      </Badge>
+    );
+  }
+  return (
+    <Badge tone="slate" title="尚未查询邀请资格：点右上角「同步资格」刷新">
+      资格未查
+    </Badge>
   );
 }
 
@@ -152,6 +206,7 @@ function AccountCard({
   onCheck,
   onRemove,
   onSetRole,
+  onBind,
   onSwitch,
 }: {
   account: AccountLive;
@@ -160,6 +215,7 @@ function AccountCard({
   onCheck: (id: number) => void;
   onRemove: (id: number) => void;
   onSetRole: (id: number, role: '' | 'inviter' | 'invited', invitedBy?: number) => void;
+  onBind: (id: number) => void;
   onSwitch: (id: number) => void;
 }) {
   const [activePlanId, setActivePlanId] = useState<string | null>(null);
@@ -220,10 +276,25 @@ function AccountCard({
       )}
     >
       {/* 头部：徽标 + 名称 + 操作 */}
-      <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center gap-2">
         <RoleBadge
           role={account.invite_role}
           onMark={() => onSetRole(account.id, 'inviter')}
+        />
+        {!account.invite_role && (
+          <button
+            className="chip bg-sky-100 text-sky-600 hover:bg-sky-200 dark:bg-sky-500/15 dark:text-sky-300"
+            title="把这个账号捆绑到某个主号名下（走官方 bind-code 接口，需完成验证码）"
+            onClick={() => onBind(account.id)}
+          >
+            <Link2 size={11} /> 捆绑
+          </button>
+        )}
+        <InviteQualificationBadge
+          code={account.invite_code}
+          state={account.invite_state}
+          unlockAt={account.invite_unlock_at}
+          invitedCount={account.invited_count}
         />
         <span
           className="truncate text-sm font-semibold text-slate-800 dark:text-zinc-100"
@@ -287,12 +358,45 @@ function AccountCard({
                   )}
                   onClick={() => setActivePlanId(p.plan_id)}
                 >
+                  {p.plan_kind && (
+                    <span className="mr-1 opacity-70">{planKindLabel(p.plan_kind)}</span>
+                  )}
                   {p.name}
                 </button>
               ))}
               <span className="ml-1 text-xs text-slate-400">
                 到期 {fmtExpire(plan.ends_at)}
               </span>
+            </div>
+          )}
+
+          {/* 套餐画像摘要：可用模型 / 夜间档窗口 / 最早到期 / 无权益告警。
+              这三条正是网关选号的判据，摆出来用户才知道「为什么这个号能用/不能用」 */}
+          {(account.servable_models?.length ||
+            account.plan_night_only ||
+            account.profile_synced_at) && (
+            <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-400">
+              {account.servable_models?.length ? (
+                <span title="上游 capabilities 给出的可服务模型；请求其他模型网关会直接跳过这个号">
+                  可用模型 {account.servable_models.join(' / ')}
+                </span>
+              ) : (
+                <span className="text-rose-500" title="该账号当前没有任何可用权益，网关选号会跳过它">
+                  无可用权益（网关不会选它）
+                </span>
+              )}
+              {account.plan_night_only && (
+                <span
+                  className={inNightWindow() ? 'text-emerald-500' : 'text-amber-500'}
+                  title={`夜间档额度只在 ${NIGHT_WINDOW_TEXT} 生效`}
+                >
+                  夜间档 {NIGHT_WINDOW_TEXT}
+                  {inNightWindow() ? '（窗口内）' : '（当前窗外，白天不可用）'}
+                </span>
+              )}
+              {account.plan_ends_at ? (
+                <span>最早到期 {fmtExpire(account.plan_ends_at)}</span>
+              ) : null}
             </div>
           )}
 
@@ -335,6 +439,7 @@ function InviteeRow({
   onCheck,
   onRemove,
   onSetRole,
+  onBind,
   onSwitch,
 }: {
   account: AccountLive;
@@ -345,6 +450,7 @@ function InviteeRow({
   onCheck: (id: number) => void;
   onRemove: (id: number) => void;
   onSetRole: (id: number, role: '' | 'inviter' | 'invited', invitedBy?: number) => void;
+  onBind: (id: number) => void;
   onSwitch: (id: number) => void;
 }) {
   const [confirming, setConfirming] = useState(false);
@@ -384,6 +490,12 @@ function InviteeRow({
           <ChevronRight size={14} className="shrink-0 text-slate-400" />
         )}
         <Link2 size={13} className="shrink-0 text-sky-500" />
+        <InviteQualificationBadge
+          code={account.invite_code}
+          state={account.invite_state}
+          unlockAt={account.invite_unlock_at}
+          invitedCount={account.invited_count}
+        />
         <span
           className="truncate text-sm text-slate-700 dark:text-zinc-200"
           title={account.email ?? account.label}
@@ -443,6 +555,7 @@ function InviteeRow({
             onCheck={onCheck}
             onRemove={onRemove}
             onSetRole={onSetRole}
+            onBind={onBind}
             onSwitch={onSwitch}
           />
         </div>
@@ -451,7 +564,7 @@ function InviteeRow({
   );
 }
 
-export default function ZCodePage() {
+export default function ZCodeAccountsPage() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [importing, setImporting] = useState<'idle' | 'oauth' | 'local'>('idle');
@@ -467,8 +580,10 @@ export default function ZCodePage() {
   const [checking, setChecking] = useState<Set<number>>(new Set());
   const [switching, setSwitching] = useState<Set<number>>(new Set());
   const [syncingInvite, setSyncingInvite] = useState(false);
-  // 顶层视图切换：zcode=账号管理 / secrets=账密与批量登录
-  const [view, setView] = useState<'zcode' | 'secrets' | 'wb' | 'overseas'>('zcode');
+  // 邀请资格刷新中(官方 referral/summary)
+  const [syncingQualification, setSyncingQualification] = useState(false);
+  // 捆绑弹窗:待捆绑的账号 id(未标记邀请关系的账号点「捆绑」时打开)
+  const [bindTarget, setBindTarget] = useState<number | null>(null);
 
   const refreshAccounts = useCallback(() => {
     accountsApi.list().then(setAccounts).catch((e) => console.error(e));
@@ -574,6 +689,37 @@ export default function ZCodePage() {
     }
   };
 
+  // 刷新邀请资格：官方 referral/summary 拉各账号的邀请码/资格状态/开放时间
+  const syncQualification = async () => {
+    setActionError(null);
+    setSyncingQualification(true);
+    try {
+      const r = await accountsApi.syncInviteQualification();
+      const parts = [`已查询 ${r.synced} 个账号`, `可邀请 ${r.active}`, `暂未获得资格 ${r.locked}`];
+      if (r.errors.length > 0) {
+        parts.push(`失败: ${r.errors.join('、')}`);
+      }
+      setActionError(`✅ ${parts.join(' | ')}`);
+    } catch (e) {
+      setActionError(String(e));
+    } finally {
+      setSyncingQualification(false);
+    }
+  };
+
+  // 发起捆绑:预检在 Rust 侧做,失败会直接抛错(自己绑自己/已绑定/主号暂未获得资格/主号无码)
+  const startBind = async (inviterId: number) => {
+    if (bindTarget == null) return;
+    setActionError(null);
+    try {
+      await accountsApi.bindInvite(bindTarget, inviterId);
+      setBindTarget(null);
+      setActionError('✅ 已打开捆绑验证页，完成验证码后自动标记邀请关系');
+    } catch (e) {
+      setActionError(String(e));
+    }
+  };
+
   const switchAccount = async (id: number) => {
     setActionError(null);
     setSwitching((s) => new Set(s).add(id));
@@ -599,7 +745,23 @@ export default function ZCodePage() {
       nickname: null,
       email: null,
       invite_role: a.invite_role ?? null,
-      invited_by: null,
+      invited_by: a.invited_by ?? null,
+      invite_code: a.invite_code ?? null,
+      invite_state: a.invite_state ?? null,
+      invite_unlock_at: a.invite_unlock_at ?? null,
+      invited_count: a.invited_count ?? null,
+      invited_weekly: a.invited_weekly ?? null,
+      invite_cap: a.invite_cap ?? null,
+      invite_capped: a.invite_capped ?? null,
+      night_card_days: a.night_card_days ?? null,
+      night_card_state: a.night_card_state ?? null,
+      weekend_progress: a.weekend_progress ?? null,
+      weekend_target: a.weekend_target ?? null,
+      weekly_reset_used: a.weekly_reset_used ?? null,
+      task_login_device: a.task_login_device ?? null,
+      task_bind_code: a.task_bind_code ?? null,
+      task_send_message: a.task_send_message ?? null,
+      invitee_state: a.invitee_state ?? null,
       is_current: a.is_current,
       plans: [],
       balances: [],
@@ -646,12 +808,25 @@ export default function ZCodePage() {
     });
 
   const currentCount = source.filter((a) => a.is_current).length;
+  // 可作捆绑目标的主号:已获得邀请资格且持有邀请码(按已邀请人数升序,优先"有空位"的)
+  const bindCandidates = source
+    .filter((a) => a.invite_state === 'active' && a.invite_code)
+    .sort((a, b) => (a.invited_count ?? 0) - (b.invited_count ?? 0) || a.id - b.id);
+  // 邀请资格统计(官方口径:active=可邀请, locked=尚未获得资格)
+  const inviteActiveCount = source.filter((a) => a.invite_state === 'active').length;
+  const inviteLockedCount = source.filter((a) => a.invite_state === 'locked').length;
+  // 尚未获得资格的账号里,预计开放时间最早的几个(按时间升序,给用户一个预期)
+  const inviteUnlocking = source
+    .filter((a) => a.invite_state === 'locked' && a.invite_unlock_at)
+    .sort((a, b) => (a.invite_unlock_at ?? 0) - (b.invite_unlock_at ?? 0))
+    .slice(0, 2)
+    .map((a) => `${a.nickname ?? a.label} ${fmtDateTime(a.invite_unlock_at)}`);
 
   return (
     <div className="animate-fade-in">
       <PageHeader
-        title="ZCode 账号工作台"
-        desc="ZCode 多账号余额监控 · 一键切换 · 邀请关系分组"
+        title="ZCode · 账号管理"
+        desc="多账号余额监控 · 一键切换 · 邀请关系分组"
         actions={
           <>
             <button
@@ -662,73 +837,57 @@ export default function ZCodePage() {
             >
               <Link2 size={15} /> {syncingInvite ? '同步中…' : '同步邀请'}
             </button>
-            {view === 'zcode' && (
-              <button className="btn-outline" onClick={refreshAll} disabled={refreshing.active}>
-                <RefreshCw size={15} className={refreshing.active ? 'animate-spin' : ''} />
-                {refreshing.active
-                  ? `刷新中 ${refreshing.done}/${refreshing.total}`
-                  : '刷新用量'}
-              </button>
-            )}
+            <button
+              className="btn-outline"
+              disabled={syncingQualification}
+              onClick={syncQualification}
+              title="从官方 referral/summary 刷新各账号的邀请码、邀请资格(active/locked)与预计开放时间"
+            >
+              <RefreshCw size={15} className={syncingQualification ? 'animate-spin' : ''} />
+              {syncingQualification ? '查询中…' : '同步资格'}
+            </button>
+            <button className="btn-outline" onClick={refreshAll} disabled={refreshing.active}>
+              <RefreshCw size={15} className={refreshing.active ? 'animate-spin' : ''} />
+              {refreshing.active
+                ? `刷新中 ${refreshing.done}/${refreshing.total}`
+                : '刷新用量'}
+            </button>
           </>
         }
       />
 
-      {/* 子视图切换 */}
-      <div className="mb-4 flex items-center gap-1 rounded-xl bg-slate-100 p-1 dark:bg-zinc-900">
-        {(
-          [
-            { key: 'zcode', label: 'ZCode 账号', icon: Users },
-            { key: 'secrets', label: '账密 · 批量登录', icon: KeyRound },
-            { key: 'wb', label: 'Buddy 海外', icon: Globe },
-            { key: 'overseas', label: '海外号池', icon: KeyRound },
-          ] as const
-        ).map(({ key, label, icon: Icon }) => (
-          <button
-            key={key}
-            className={cn(
-              'flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm font-medium transition',
-              view === key
-                ? 'bg-white text-slate-800 shadow-sm dark:bg-zinc-800 dark:text-zinc-100'
-                : 'text-slate-500 hover:text-slate-700 dark:text-zinc-400',
-            )}
-            onClick={() => setView(key)}
-          >
-            <Icon size={14} /> {label}
-          </button>
-        ))}
+      {/* 统计卡 */}
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        <StatCard label="账号总数" value={source.length} hint="z.ai 账号" tone="brand" />
+        <StatCard
+          label="主号组"
+          value={families.length}
+          hint={`${looseInvitees.length} 个小号未归属`}
+          tone="amber"
+        />
+        <StatCard
+          label="使用中账号"
+          value={currentCount}
+          hint="当前 ZCode 登录"
+          tone="green"
+        />
+        <StatCard
+          label="可邀请 / 待开放"
+          value={`${inviteActiveCount} / ${inviteLockedCount}`}
+          hint={
+            inviteUnlocking.length > 0
+              ? `最早 ${inviteUnlocking[0]} 后拥有资格`
+              : '官方按账号年龄/邀请人数判定'
+          }
+          tone="amber"
+        />
+        <StatCard
+          label="最近余额更新"
+          value={fmtTime(snapshot?.last_balance_at ?? null)}
+          hint={`活动检测 ${fmtTime(snapshot?.last_preview_at ?? null)}`}
+          tone="slate"
+        />
       </div>
-
-      {view === 'secrets' ? (
-        <SecretsPanel />
-      ) : view === 'wb' ? (
-        <WbOverseasPanel />
-      ) : view === 'overseas' ? (
-        <OverseasPoolPanel />
-      ) : (
-        <>
-          {/* 统计卡 */}
-          <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-            <StatCard label="账号总数" value={source.length} hint="z.ai 账号" tone="brand" />
-            <StatCard
-              label="主号组"
-              value={families.length}
-              hint={`${looseInvitees.length} 个小号未归属`}
-              tone="amber"
-            />
-            <StatCard
-              label="使用中账号"
-              value={currentCount}
-              hint="当前 ZCode 登录"
-              tone="green"
-            />
-            <StatCard
-              label="最近余额更新"
-              value={fmtTime(snapshot?.last_balance_at ?? null)}
-              hint={`活动检测 ${fmtTime(snapshot?.last_preview_at ?? null)}`}
-              tone="slate"
-            />
-          </div>
 
           {actionError && (
             <div className="mt-4 flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-600 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300">
@@ -812,6 +971,7 @@ export default function ZCodePage() {
                         onCheck={check}
                         onRemove={removeAccount}
                         onSetRole={setInviteRole}
+                          onBind={setBindTarget}
                         onSwitch={switchAccount}
                       />
                       {invitees.length > 0 && (
@@ -827,6 +987,7 @@ export default function ZCodePage() {
                               onCheck={check}
                               onRemove={removeAccount}
                               onSetRole={setInviteRole}
+                          onBind={setBindTarget}
                               onSwitch={switchAccount}
                             />
                           ))}
@@ -853,6 +1014,7 @@ export default function ZCodePage() {
                           onCheck={check}
                           onRemove={removeAccount}
                           onSetRole={setInviteRole}
+                          onBind={setBindTarget}
                           onSwitch={switchAccount}
                         />
                       ))}
@@ -877,6 +1039,7 @@ export default function ZCodePage() {
                           onCheck={check}
                           onRemove={removeAccount}
                           onSetRole={setInviteRole}
+                          onBind={setBindTarget}
                           onSwitch={switchAccount}
                         />
                       ))}
@@ -886,8 +1049,57 @@ export default function ZCodePage() {
               </>
             )}
           </div>
-        </>
-      )}
+
+          {/* 捆绑弹窗：把未标记账号绑到某个主号名下 */}
+          <Modal
+            open={bindTarget != null}
+            onClose={() => setBindTarget(null)}
+            title="捆绑到主号"
+            widthClass="max-w-xl"
+          >
+            {bindTarget != null && (
+              <div className="space-y-3">
+                <p className="text-sm text-slate-500 dark:text-zinc-400">
+                  目标账号：
+                  <span className="font-medium text-slate-700 dark:text-zinc-200">
+                    {source.find((a) => a.id === bindTarget)?.nickname ??
+                      source.find((a) => a.id === bindTarget)?.label}
+                  </span>
+                  。选择主号后会打开本地验证页，完成阿里云验证码即调用官方 bind-code
+                  接口完成捆绑，并自动标记「被邀请」与归属。
+                </p>
+                {bindCandidates.length === 0 ? (
+                  <p className="rounded-xl bg-amber-50 px-3 py-2 text-sm text-amber-700 dark:bg-amber-500/10 dark:text-amber-300">
+                    暂无可选主号：需要至少一个账号已获得邀请资格（👑
+                    可邀请）。点右上角「同步资格」刷新。
+                  </p>
+                ) : (
+                  <div className="space-y-2">
+                    {bindCandidates.map((inv) => (
+                      <button
+                        key={inv.id}
+                        className="row-hover flex w-full items-center gap-3 rounded-xl border border-slate-200 px-3 py-2.5 text-left dark:border-zinc-800"
+                        onClick={() => startBind(inv.id)}
+                      >
+                        <Badge tone="amber">👑 可邀请</Badge>
+                        <span className="min-w-0 flex-1 truncate text-sm text-slate-700 dark:text-zinc-200">
+                          {inv.nickname ?? inv.label}
+                        </span>
+                        <span className="shrink-0 font-mono text-xs text-slate-400">
+                          {inv.invite_code}
+                        </span>
+                        {inv.invited_count != null && (
+                          <span className="shrink-0 text-xs text-slate-400">
+                            已邀 {inv.invited_count}
+                          </span>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </Modal>
     </div>
   );
 }

@@ -33,94 +33,161 @@
   <h2>🎁 领取限时活动</h2>
   <p class="acct" id="acct"></p>
   <p id="status">正在加载验证码组件…</p>
-  <button id="btn" style="display:none">开始验证并领取</button>
+  <!-- 验证码挂载点:阿里云 SDK 会在这里建DOM,TRACELESS 模式下不渲染任何可见滑块 -->
+  <div id="captcha-host"></div>
+  <!-- SDK 要求存在一个 button 句柄;getInstance 后由脚本自动 click 触发验证 -->
+  <button id="captcha-trigger" type="button" hidden tabindex="-1" aria-hidden="true"></button>
 </div>
-<script src="https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js"></script>
 <script>
+/*
+ * 与 bind.html 同一套时序(照抄官方邀请页):
+ *   window.AliyunCaptchaConfig 必须在 SDK **加载前**写入,SDK 在 eval 阶段据此
+ *   决定验证码服务端点;写晚/只传给 initAliyunCaptcha 会让 TRACELESS 场景静默卡死。
+ *   拿参数用 success(param, region),不是 captchaVerifyCallback。
+ */
 (function () {
   var q = new URLSearchParams(location.search);
   var account = q.get("account");
   var planId = q.get("plan");
   var statusEl = document.getElementById("status");
   var acctEl = document.getElementById("acct");
-  var btn = document.getElementById("btn");
-  var captchaCfg = null;
-  var initialized = false;
+  var trigger = document.getElementById("captcha-trigger");
+  var busy = false;
+  var sdkPromise = null;
 
   function setStatus(text, cls) {
     statusEl.textContent = text;
     statusEl.className = cls || "";
   }
 
+  function loadSdk() {
+    if (window.initAliyunCaptcha) return Promise.resolve();
+    if (sdkPromise) return sdkPromise;
+    sdkPromise = new Promise(function (resolve, reject) {
+      var s = document.createElement("script");
+      var timer = setTimeout(function () {
+        s.remove();
+        sdkPromise = null;
+        reject(new Error("验证码 SDK 加载超时"));
+      }, 15000);
+      s.src = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js";
+      s.async = true;
+      s.onload = function () { clearTimeout(timer); resolve(); };
+      s.onerror = function () { clearTimeout(timer); s.remove(); sdkPromise = null; reject(new Error("验证码 SDK 加载失败")); };
+      document.head.appendChild(s);
+    });
+    return sdkPromise;
+  }
+
+  function submit(captchaVerifyParam, region) {
+    return fetch("/claim-submit", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        account: account,
+        plan_id: planId,
+        captcha_verify_param: captchaVerifyParam,
+        region: region
+      })
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        window.__claimResult = { ok: !!res.ok, message: res.message };
+        if (res.ok) {
+          setStatus("✅ " + res.message, "ok");
+        } else {
+          setStatus("❌ " + res.message, "err");
+          busy = false;
+        }
+      })
+      .catch(function (e) {
+        window.__claimResult = { ok: false, message: "提交失败:" + e };
+        setStatus("❌ 提交失败:" + e, "err");
+        busy = false;
+      });
+  }
+
+  function run(captchaCfg) {
+    if (busy) return;
+    busy = true;
+    setStatus("正在验证…");
+
+    window.AliyunCaptchaConfig = {
+      region: captchaCfg.region,
+      prefix: captchaCfg.prefix
+    };
+
+    loadSdk()
+      .then(function () {
+        if (typeof window.initAliyunCaptcha !== "function") {
+          throw new Error("验证码 SDK 未就绪");
+        }
+        window.initAliyunCaptcha({
+          SceneId: captchaCfg.sceneId,
+          mode: "popup",
+          language: "cn",
+          element: "#captcha-host",
+          button: "#captcha-trigger",
+          delayBeforeSuccess: false,
+          getInstance: function () {
+            setTimeout(function () {
+              try {
+                trigger.click();
+              } catch (e) {
+                setStatus("验证码触发失败:" + e, "err");
+                busy = false;
+              }
+            }, 50);
+          },
+          success: function (captchaVerifyParam, region) {
+            var r = region || captchaCfg.region;
+            if (!captchaVerifyParam) {
+              setStatus("无需验证,正在提交领取…");
+            } else {
+              setStatus("验证完成,正在提交领取…");
+            }
+            submit(captchaVerifyParam, r);
+          },
+          fail: function () {
+            setStatus("验证未通过,请重试", "err");
+            busy = false;
+          },
+          onError: function (err) {
+            setStatus("验证码出错:" + (err && err.message ? err.message : err), "err");
+            busy = false;
+          },
+          onClose: function () {
+            if (!busy) return;
+            setStatus("验证窗口已关闭,可刷新重试", "err");
+            busy = false;
+          }
+        });
+      })
+      .catch(function (e) {
+        setStatus("验证码组件初始化失败:" + (e && e.message ? e.message : e), "err");
+        busy = false;
+      });
+  }
+
   fetch("/claim-config?account=" + encodeURIComponent(account) + "&plan=" + encodeURIComponent(planId))
     .then(function (r) { return r.json(); })
     .then(function (cfg) {
-      if (!cfg.ok) { setStatus("加载失败:" + cfg.error, "err"); return; }
+      if (!cfg.ok) { setStatus("加载失败:" + (cfg.error || "未知错误"), "err"); return; }
       acctEl.textContent = "账号:" + cfg.label;
-      captchaCfg = cfg.captcha || {};
-      if (!captchaCfg.sceneId) { setStatus("服务端未返回验证码配置", "err"); return; }
-      setStatus("就绪,点击下方按钮开始");
-      btn.style.display = "";
+      var captchaCfg = cfg.captcha || {};
+      if (captchaCfg.enabled === false) {
+        setStatus("服务端未开启验证码,正在提交领取…");
+        submit("", captchaCfg.region || "cn");
+        return;
+      }
+      if (!captchaCfg.sceneId || !captchaCfg.prefix || !captchaCfg.region) {
+        setStatus("服务端验证码配置不完整", "err");
+        return;
+      }
+      setStatus("正在准备验证码…");
+      run(captchaCfg);
     })
     .catch(function (e) { setStatus("加载失败:" + e, "err"); });
-
-  btn.addEventListener("click", function () {
-    if (initialized) return;
-    initialized = true;
-    btn.disabled = true;
-    setStatus("请在弹出的验证窗口中完成验证…");
-    try {
-      initAliyunCaptcha({
-        SceneId: captchaCfg.sceneId,
-        mode: "popup",
-        prefix: captchaCfg.prefix,
-        region: captchaCfg.region,
-        element: "#captcha-element",
-        button: "#btn",
-        captchaVerifyCallback: function (captchaVerifyParam) {
-          setStatus("验证完成,正在提交领取…");
-          return fetch("/claim-submit", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              account: account,
-              plan_id: planId,
-              captcha_verify_param: captchaVerifyParam,
-              region: captchaCfg.region
-            })
-          })
-            .then(function (r) { return r.json(); })
-            .then(function (res) {
-              window.__claimResult = { ok: !!res.ok, message: res.message };
-              if (res.ok) {
-                setStatus("✅ " + res.message, "ok");
-                return { captchaResult: true };
-              }
-              setStatus("❌ " + res.message + "(可点击按钮重试)", "err");
-              btn.disabled = false;
-              initialized = false;
-              return { captchaResult: false };
-            })
-            .catch(function (e) {
-              window.__claimResult = { ok: false, message: "提交失败:" + e };
-              setStatus("❌ 提交失败:" + e, "err");
-              btn.disabled = false;
-              initialized = false;
-              return { captchaResult: false };
-            });
-        },
-        onCaptchaError: function (err) {
-          setStatus("验证码出错:" + err, "err");
-          btn.disabled = false;
-          initialized = false;
-        }
-      });
-    } catch (e) {
-      setStatus("验证码组件初始化失败:" + e, "err");
-      btn.disabled = false;
-      initialized = false;
-    }
-  });
 })();
 </script>
 </body>

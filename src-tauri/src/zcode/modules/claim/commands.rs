@@ -27,7 +27,7 @@ pub async fn zcode_claim_start(
     if !claims.mark_busy(account_id) {
         return Err(AppError::Other("该账号已有领取流程进行中".into()));
     }
-    let port = claims.ensure_server(&state.db, &state.http)?;
+    let port = claims.ensure_server(&app, &state.db, &state.http)?;
 
     let url = format!(
         "http://127.0.0.1:{port}/claim?account={account_id}&plan={}",

@@ -109,11 +109,27 @@ impl QoderRegion {
     }
 }
 
-/// 输出上限固定 32768。
+/// 请求侧输出上限：**固定 32768，不得调大**。
 ///
 /// 蓝本实测：超过约 32K 后上游行为退化（关闭思考时仍输出思考内容，
 /// 约 49K 起返回空内容甚至直接断连）。这是上游的实际约束，不是保守取值。
+/// 本常量用于两个「真」用途：
+///  ① `make_qoder_request` 里 `max_tokens.min(MAX_OUTPUT_TOKENS)`——发往
+///     上游的实际请求参数；
+///  ② 目录条目的 `maxOutputTokens`（网关 `/v1/models` 对外声明）。
+///
+/// 注意区分 `AGENT_CONFIG_MAX_OUTPUT_TOKENS`：后者只写入客户端配置文件做
+/// 展示/校验元数据，不参与请求构造。两者刻意分离——客户端元数据对齐生态
+/// 惯例（128K），真实请求仍按上游硬约束（32K）。
 pub const MAX_OUTPUT_TOKENS: i64 = 32_768;
+
+/// 写入客户端配置的「输出上限」元数据（Agent 接入中心用）。
+///
+/// 对齐 ZCode 生态惯例 128000（ZCode 静态目录 GLM 全系 `max_tokens: 128_000`、
+/// 用户实测 ZCode 默认界面亦为 128K 量级）。**仅元数据**：WorkBuddy 把它当
+/// 模型能力展示与表单校验上限，不参与 `max_tokens` 请求构造；真实请求仍由
+/// `MAX_OUTPUT_TOKENS`（32K）钳制。
+pub const AGENT_CONFIG_MAX_OUTPUT_TOKENS: i64 = 128_000;
 
 /// 目录条目没给上下文长度时的兜底
 const DEFAULT_CONTEXT_WINDOW: i64 = 200_000;
@@ -162,7 +178,13 @@ fn vendor_of(id: &str) -> Option<&'static str> {
 }
 
 /// 内置兜底清单（蓝本静态快照）：(id, key, reasoning, supports_effort, efforts,
-/// vision, enabled, price_factor)。
+/// vision, enabled, price_factor, context_window)。
+///
+/// `context_window` 按 **Qoder 客户端 `contextConfig` 的最大档**取（2026-10-23
+/// 实测 Qoder 5.x `aicoding.modelConfigs.cache`）：几乎每个模型都有 `1M` 档，
+/// 而 `maxInputTokens` 字段只是**默认档**（180k/200k），不能当上限用。
+/// 此前整表共用 `DEFAULT_CONTEXT_WINDOW = 200_000` 一刀切，导致 DeepSeek-Flash
+/// 等 1M 模型在 Agent 接入中心被写成 200k（用户实测反馈「肯定不止这一个」）。
 ///
 /// `enabled` 只是「免费档通常可用」的保守猜测；真实可用性以远程清单的
 /// `enable` 为准。**不过滤不可用模型**：用户需要看到完整清单（分清
@@ -170,23 +192,23 @@ fn vendor_of(id: &str) -> Option<&'static str> {
 ///
 /// 倍率取**正常价**：断网/未登录才用这张表，折扣由远程刷新如实带回。
 fn fallback(region: QoderRegion) -> Vec<Value> {
-    let global: &[(&str, &str, bool, bool, &[&str], bool, bool, &str)] = &[
-        ("Qwen3.8-Flash", "qfmodel", true, true, &["low", "medium", "xhigh"], true, true, "0.0"),
-        ("Qwen3.8-Max", "qmodel_38max", true, true, &["low", "medium", "xhigh"], true, true, "0.5"),
+    let global: &[(&str, &str, bool, bool, &[&str], bool, bool, &str, i64)] = &[
+        ("Qwen3.8-Flash", "qfmodel", true, true, &["low", "medium", "xhigh"], true, true, "0.0", 1_000_000),
+        ("Qwen3.8-Max", "qmodel_38max", true, true, &["low", "medium", "xhigh"], true, true, "0.5", 1_000_000),
         // 产品决策下线的模型（Auto/Ultimate/Performance/Efficient/Sonus/Cantus）
         // 不进兜底表——远程清单带回也会被 `REMOVED_MODEL_IDS` 过滤（parse_catalog）
-        ("Qwen3.7-Max", "qmodel_latest", true, true, &[], true, false, "0.5"),
+        ("Qwen3.7-Max", "qmodel_latest", true, true, &[], true, false, "0.5", 1_000_000),
         // `Qwen3.7-Plus` 带连字符：上游 display_name 就是这个形态（远程刷新走
         // display_name 去空白）；少连字符会让同一模型产出两种 id
-        ("Qwen3.7-Plus", "qmodel", false, false, &[], true, false, "0.1"),
-        ("Kimi-K3", "kmodel_latest", false, false, &[], true, false, "0.8"),
-        ("Kimi-K2.8-Preview", "kmodel", false, false, &[], true, false, "0.3"),
-        ("GLM-5.3", "gmodel", true, true, &[], true, false, "0.6"),
-        ("GLM-5.3-Flash", "gfmodel", true, true, &[], true, false, "0.1"),
-        ("DeepSeek-V4-Pro", "dmodel", true, true, &[], true, false, "0.8"),
-        ("DeepSeek-Flash", "dfmodel", true, true, &[], true, false, "0.2"),
+        ("Qwen3.7-Plus", "qmodel", false, false, &[], true, false, "0.1", 1_000_000),
+        ("Kimi-K3", "kmodel_latest", false, false, &[], true, false, "0.8", 1_000_000),
+        ("Kimi-K2.8-Preview", "kmodel", false, false, &[], true, false, "0.3", 1_000_000),
+        ("GLM-5.3", "gmodel", true, true, &[], true, false, "0.6", 1_000_000),
+        ("GLM-5.3-Flash", "gfmodel", true, true, &[], true, false, "0.1", 1_000_000),
+        ("DeepSeek-V4-Pro", "dmodel", true, true, &[], true, false, "0.8", 1_000_000),
+        ("DeepSeek-Flash", "dfmodel", true, true, &[], true, false, "0.2", 1_000_000),
         // 名称漂移修正（2026-10-01 CN 实抓）：上游 mmodel 现为 MiniMax-M2.7
-        ("MiniMax-M2.7", "mmodel", false, false, &[], true, false, "0.2"),
+        ("MiniMax-M2.7", "mmodel", false, false, &[], true, false, "0.2", 1_000_000),
     ];
     // CN 表对齐 2026-10-01 model/list 全量实抓（temp/qoder_model_list_full.json，
     // 67856B 真签名直通）——倍率/名称/efforts/is_vl 全按上游实抓值：
@@ -197,24 +219,24 @@ fn fallback(region: QoderRegion) -> Vec<Value> {
     // thinking 档位白名单：Qwen3.8 [xhigh,low,medium]、GLM-5.3 系 [high,low,max]、
     // DeepSeek 系 [high,max(,low)]、Kimi 系 [high,low,max]；Qwen3.7 系 tc 有但
     // efforts 空 = 不支持档位；MiniMax-M2.7 无 thinking_config。
-    let cn: &[(&str, &str, bool, bool, &[&str], bool, bool, &str)] = &[
-        ("Qwen3.8-Max", "qmodel_38max", true, true, &["xhigh", "low", "medium"], true, false, "0.5"),
-        ("Qwen3.8-Flash", "qfmodel", true, true, &["xhigh", "low", "medium"], true, false, "0.0"),
-        ("Qwen3.7-Max", "qmodel_latest", true, false, &[], true, false, "0.5"),
-        ("Qwen3.7-Plus", "qmodel", true, false, &[], true, false, "0.1"),
-        ("Qwen3.7-Flash", "q37fmodel", true, false, &[], true, false, "0.1"),
-        ("DeepSeek-V4-Pro", "dmodel", true, true, &["high", "max"], true, false, "0.5"),
-        ("DeepSeek-Flash", "dfmodel", true, true, &["high", "max", "low"], true, false, "0.1"),
-        ("GLM-5.3", "gmodel", true, true, &["high", "low", "max"], true, false, "0.8"),
-        ("GLM-5.3-Flash", "gfmodel", true, true, &["high", "max"], true, false, "0.1"),
-        ("GLM-5.2", "gm51model", true, true, &["high", "max"], true, false, "0.6"),
-        ("Kimi-K3", "kmodel_latest", true, true, &["high", "low", "max"], true, false, "1.4"),
-        ("Kimi-K2.8-Preview", "kmodel", true, true, &["high", "low", "max"], true, false, "0.8"),
-        ("MiniMax-M2.7", "mmodel", false, false, &[], false, false, "0.2"),
+    let cn: &[(&str, &str, bool, bool, &[&str], bool, bool, &str, i64)] = &[
+        ("Qwen3.8-Max", "qmodel_38max", true, true, &["xhigh", "low", "medium"], true, false, "0.5", 1_000_000),
+        ("Qwen3.8-Flash", "qfmodel", true, true, &["xhigh", "low", "medium"], true, false, "0.0", 1_000_000),
+        ("Qwen3.7-Max", "qmodel_latest", true, false, &[], true, false, "0.5", 1_000_000),
+        ("Qwen3.7-Plus", "qmodel", true, false, &[], true, false, "0.1", 1_000_000),
+        ("Qwen3.7-Flash", "q37fmodel", true, false, &[], true, false, "0.1", 1_000_000),
+        ("DeepSeek-V4-Pro", "dmodel", true, true, &["high", "max"], true, false, "0.5", 1_000_000),
+        ("DeepSeek-Flash", "dfmodel", true, true, &["high", "max", "low"], true, false, "0.1", 1_000_000),
+        ("GLM-5.3", "gmodel", true, true, &["high", "low", "max"], true, false, "0.8", 1_000_000),
+        ("GLM-5.3-Flash", "gfmodel", true, true, &["high", "max"], true, false, "0.1", 1_000_000),
+        ("GLM-5.2", "gm51model", true, true, &["high", "max"], true, false, "0.6", 1_000_000),
+        ("Kimi-K3", "kmodel_latest", true, true, &["high", "low", "max"], true, false, "1.4", 1_000_000),
+        ("Kimi-K2.8-Preview", "kmodel", true, true, &["high", "low", "max"], true, false, "0.8", 1_000_000),
+        ("MiniMax-M2.7", "mmodel", false, false, &[], false, false, "0.2", 1_000_000),
     ];
     let rows = if region == QoderRegion::Cn { cn } else { global };
     rows.iter()
-        .map(|(id, key, reasoning, supports_effort, efforts, vision, enabled, factor)| {
+        .map(|(id, key, reasoning, supports_effort, efforts, vision, enabled, factor, ctx)| {
             entry(
                 id,
                 key,
@@ -222,7 +244,7 @@ fn fallback(region: QoderRegion) -> Vec<Value> {
                 if *supports_effort { efforts } else { &[] },
                 *vision,
                 *enabled,
-                DEFAULT_CONTEXT_WINDOW,
+                *ctx,
                 "system",
                 &credits_of_text(factor),
             )
@@ -242,12 +264,28 @@ fn credits_of_text(plain: &str) -> String {
     format!("x{} credits", plain.trim())
 }
 
-/// 上游 `price_factor` → 展示文本（远程路径）。
+/// 上游倍率字段 → 展示文本（远程路径）。
 ///
-/// `price_factor = 0` 是**合法值**（免费档），不能当缺失去掉；返回**字符串**
+/// 兼容两种命名（2026-10-22 实测上游已改驼峰）：
+/// - `price_factor`（snake，2026-10-01 抓包形态）
+/// - `priceFactor`（camel，2026-10-22 抓包形态）
+///
+/// **只读「当前生效价」，绝不回退 `originalPriceFactor`**：后者是划线原价
+/// （DeepSeek-Flash 实测 `priceFactor:0` + `originalPriceFactor:0.1`，即
+/// 「限时免费，原价 0.1x」）。若把原价当兜底，折扣模型会被算成付费，
+/// 与界面显示的「0.1x ~~0.1~~ 0x」相反。
+///
+/// **为何必须兼容驼峰**：`free_tier_models()` 用本函数结果判 0 倍率，取不到就
+/// `continue` 跳过。上游改字段名后所有模型都被判「非免费」——DeepSeek-Flash
+/// 限时免费因此长期不出现在账号页免费模型列，也不参与「额度耗尽」标注。
+///
+/// `factor = 0` 是**合法值**（免费/限时免费），不能当缺失去掉；返回**字符串**
 /// 而非数字，避免下游真值判定把数字 0 当假值丢键（「免费」变「未知」）。
 fn credits_of(item: &Value) -> String {
-    let factor = match item.get("price_factor") {
+    let raw = item
+        .get("price_factor")
+        .or_else(|| item.get("priceFactor"));
+    let factor = match raw {
         Some(Value::Number(number)) => number.as_f64(),
         Some(Value::String(text)) => text.trim().parse::<f64>().ok(),
         _ => None,
@@ -477,8 +515,9 @@ pub fn list() -> Vec<Value> {
 }
 
 /// 免费档清单合并（免费额度可见性）：新清单（目录刷新）与既有账号数据合并，
-/// **保留既有 `exhausted_at` / `reset_at`**（额度错误码驱动的耗尽与恢复时刻标注）
-/// ——目录刷新/积分刷新只换 id/name/rate/region 部分，不抹掉耗尽历史。
+/// 保留 `exhausted_at`（额度错误码驱动的耗尽标注），但 `reset_at` 到期即自动
+/// 清除耗尽标注——否则昨天 00:00 重置的免费额度，账号页徽标永远停在琥珀色
+/// 「已用完」，与实际可用状态相反（免费额度按日重置，标注必须跟着重置）。
 /// 两处回写点（qoder_credits 积分链路、qoder_catalog 目录链路）与 Buddy 域
 /// 共用本函数，保证语义一致。
 pub fn merge_free_models(prev: &[Value], fresh: &[Value]) -> Vec<Value> {
@@ -491,10 +530,16 @@ pub fn merge_free_models(prev: &[Value], fresh: &[Value]) -> Vec<Value> {
                 .iter()
                 .find(|p| p.get("id").and_then(Value::as_str) == Some(id.as_str()))
             {
-                // 耗尽标注与恢复时刻：均由错误码驱动记录，刷新时保留
-                for key in ["exhausted_at", "reset_at"] {
-                    if let Some(v) = old.get(key).filter(|v| !v.is_null()) {
-                        m[key] = v.clone();
+                // 耗尽标注与恢复时刻：均由错误码驱动记录，刷新时保留；
+                // reset_at 已过 = 上游额度已重置 → 两个字段一并清除（自愈）
+                if free_exhaustion_expired(old) {
+                    m["exhausted_at"] = Value::Null;
+                    m["reset_at"] = Value::Null;
+                } else {
+                    for key in ["exhausted_at", "reset_at"] {
+                        if let Some(v) = old.get(key).filter(|v| !v.is_null()) {
+                            m[key] = v.clone();
+                        }
                     }
                 }
             }
@@ -669,16 +714,32 @@ fn envelope_error(payload: &Value) -> Option<String> {
 ///
 /// 只收 `chat` 数组；缺 `key` 或缺 `display_name` 的条目丢弃；对外 id 用
 /// `display_name` **去空白**（蓝本 toModelId）——名称可读，请求时映射回 key。
+///
+/// **字段命名双兼容（2026-10-22）**：上游在不同端点上分别下发 snake_case
+/// （`gateway.qoder.com.cn/algo/api/v2/model/list`，2026-10-01 抓包）与
+/// camelCase（IDE 侧 `openapi.qoder.sh` 的 environments/agent 配置，含
+/// `displayName`/`priceFactor`/`maxInputTokens`）。解析层统一按 `pick()` 双读，
+/// 否则换端点后整张目录都会解析不出倍率/上下文长度，`free_tier_models()`
+/// 更会把所有模型判成「非免费」——DeepSeek-Flash 限时免费因此长期漏显。
 fn parse_catalog(payload: &Value) -> Vec<Value> {
+    // 同义字段双读：snake 优先（网关主路径），camel 兜底（IDE 端点形态）
+    fn pick<'a>(item: &'a Value, snake: &str, camel: &str) -> Option<&'a Value> {
+        item.get(snake).or_else(|| item.get(camel))
+    }
     let Some(chat) = payload.get("chat").and_then(Value::as_array) else {
         return Vec::new();
     };
     let mut models: Vec<Value> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
     for item in chat {
-        let key = item.get("key").and_then(Value::as_str).unwrap_or("").trim();
-        let display = item
-            .get("display_name")
+        // key 的等价字段：snake 端点叫 `key`；camel 端点叫 `value`（option 项）
+        // 或 `modelId`（agent 配置项）。三者任一即可定位上游模型。
+        let key = pick(item, "key", "value")
+            .or_else(|| item.get("modelId"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let display = pick(item, "display_name", "displayName")
             .and_then(Value::as_str)
             .unwrap_or("")
             .trim();
@@ -699,17 +760,37 @@ fn parse_catalog(payload: &Value) -> Vec<Value> {
         }
         seen.push(lowered);
 
-        let vision = item.get("is_vl").map(truthy).unwrap_or(false);
-        let reasoning = item.get("is_reasoning").map(truthy).unwrap_or(false)
-            || item.get("thinking_config").map(truthy).unwrap_or(false);
-        // 上游在该模型条目里声明支持的思考档位（键名即档位值），请求时白名单用
-        let efforts: Vec<Value> = item
-            .pointer("/thinking_config/enabled/efforts")
+        let vision = pick(item, "is_vl", "isVl")
+            .or_else(|| pick(item, "is_vl", "supportsVision"))
+            .map(truthy)
+            .unwrap_or(false);
+        let reasoning = pick(item, "is_reasoning", "isReasoning")
+            .map(truthy)
+            .unwrap_or(false)
+            || pick(item, "thinking_config", "thinkingConfig")
+                .map(truthy)
+                .unwrap_or(false);
+        // 上游在该模型条目里声明支持的思考档位（键名即档位值），请求时白名单用。
+        // camel 端点直接给 `efforts: ["high","max"]` 数组（无 thinking_config 包裹）
+        let efforts: Vec<Value> = pick(item, "thinking_config", "thinkingConfig")
+            .and_then(|tc| tc.pointer("/enabled/efforts"))
             .and_then(Value::as_object)
             .map(|map| map.keys().map(|k| Value::String(k.clone())).collect())
+            .or_else(|| {
+                item.get("efforts")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .filter(|s| !s.is_empty() && *s != "none")
+                            .map(|s| Value::String(s.to_string()))
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|v: &Vec<Value>| !v.is_empty())
+            })
             .unwrap_or_default();
-        let context_window = item
-            .get("max_input_tokens")
+        let context_window = pick(item, "max_input_tokens", "maxInputTokens")
+            .or_else(|| pick(item, "contextWindow", "context_window"))
             .and_then(Value::as_i64)
             .filter(|v| *v > 0)
             .unwrap_or(DEFAULT_CONTEXT_WINDOW);
@@ -775,6 +856,60 @@ fn now_ts() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// 免费模型「已用完」标注是否已过期（应自愈清除）。
+///
+/// 判据是 `reset_at`（UTC+8 的 "YYYY-MM-DD HH:MM:SS"，由 119 文案语义写入）：
+/// 到点即上游额度已重置，`merge_free_models` 随之清掉 exhausted_at/reset_at。
+/// 无法解析（文案形态变化/历史数据缺失）时保守不清除——宁可多显示一会儿
+/// 「已用完」，也不要在解析失败时把真实耗尽状态误判成可用。
+/// 无 reset_at 但有 exhausted_at 视为未过期（WB 域部分文案不带重置时刻）。
+fn free_exhaustion_expired(entry: &Value) -> bool {
+    let Some(reset_at) = entry.get("reset_at").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(until) = parse_cn_datetime(reset_at) else {
+        return false;
+    };
+    (now_ts() as i64) >= until
+}
+
+/// 解析 "YYYY-MM-DD HH:MM:SS"（按 UTC+8 解释）为 Unix 秒；形态不符返回 None。
+/// 手写切片解析，避免为此引入 chrono 解析格式依赖（项目内零正则同源约定）
+fn parse_cn_datetime(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 19 {
+        return None;
+    }
+    let digits = |i: usize, j: usize| -> Option<i64> {
+        s.get(i..j)
+            .and_then(|seg| (!seg.is_empty() && seg.bytes().all(|c| c.is_ascii_digit())).then(|| seg.parse::<i64>().ok()))
+            .flatten()
+    };
+    // 分隔符宽松：空格或 T 皆可（前端两种形态都出现过）
+    if !matches!(&b[4], b'-') || !matches!(&b[7], b'-') || !matches!(&b[10], b' ' | b'T') {
+        return None;
+    }
+    if !matches!(&b[13], b':') || !matches!(&b[16], b':') {
+        return None;
+    }
+    let (y, mo, d) = (digits(0, 4)?, digits(5, 7)?, digits(8, 10)?);
+    let (h, mi, sec) = (digits(11, 13)?, digits(14, 16)?, digits(17, 19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    Some(days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + sec - 8 * 3600)
+}
+
+/// 公历日期 → Unix 天数（Howard Hinnant days_from_civil，跨 1970/万年历无误）
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
 }
 
 // ==================== ③ 错误分类 ====================
@@ -2527,9 +2662,24 @@ mod tests {
     /// （耗尽与恢复历史不被刷新抹掉）；新出现/消失的模型如实反映。
     #[test]
     fn merge_free_models_preserves_exhaustion_history() {
+        // reset_at 取未来时刻：否则按「到期自愈」语义会被清掉（固化行为见
+        // merge_free_models_clears_expired_exhaustion），本用例要验的是保留路径
+        let future = {
+            use chrono::TimeZone;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                + 3600;
+            chrono::FixedOffset::east_opt(8 * 3600)
+                .and_then(|tz| tz.timestamp_opt(now, 0).single())
+                .unwrap()
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        };
         let prev = vec![
             json!({"id": "A", "name": "老A名", "rate": 0.0, "region": "cn",
-                   "exhausted_at": "2026-10-16 10:00:00", "reset_at": "2026-10-17 00:00:00"}),
+                   "exhausted_at": "2026-10-16 10:00:00", "reset_at": future}),
             json!({"id": "B", "name": "B", "rate": 0.0, "region": "cn"}),
         ];
         let fresh = vec![
@@ -2542,7 +2692,7 @@ mod tests {
         // A：新元数据 + 保留耗尽/恢复历史
         assert_eq!(merged[0]["name"], json!("新A名"));
         assert_eq!(merged[0]["exhausted_at"], json!("2026-10-16 10:00:00"));
-        assert_eq!(merged[0]["reset_at"], json!("2026-10-17 00:00:00"));
+        assert_eq!(merged[0]["reset_at"], json!(future));
         // C：新条目无标注
         assert_eq!(merged[1]["id"], json!("C"));
         assert!(merged[1].get("exhausted_at").is_none());
@@ -2551,6 +2701,73 @@ mod tests {
         let first = merge_free_models(&[], &fresh);
         assert_eq!(first.len(), 2);
         assert!(first[0].get("exhausted_at").is_none());
+    }
+
+    /// 恢复时刻已过 → 自动清除耗尽标注（自愈）：免费额度按日重置，昨天
+    /// 00:00 重置的模型今天必须回到「可用」，徽标不能停在琥珀色
+    #[test]
+    fn merge_free_models_clears_expired_exhaustion() {
+        let prev = vec![json!({"id": "A", "name": "A", "rate": 0.0, "region": "cn",
+                               "exhausted_at": "2026-10-16 10:00:00",
+                               "reset_at": "2026-10-17 00:00:00"})];
+        let fresh = vec![json!({"id": "A", "name": "A", "rate": 0.0, "region": "cn"})];
+        let merged = merge_free_models(&prev, &fresh);
+        assert!(merged[0]["exhausted_at"].is_null(), "过期标注应清除");
+        assert!(merged[0]["reset_at"].is_null(), "过期恢复时刻应清除");
+    }
+
+    /// 恢复时刻在未来 → 保留耗尽标注（不能误伤当天仍在冷却的模型）
+    #[test]
+    fn merge_free_models_keeps_future_exhaustion() {
+        let future = {
+            use chrono::TimeZone;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                + 3600;
+            let cn = chrono::FixedOffset::east_opt(8 * 3600)
+                .and_then(|tz| tz.timestamp_opt(now, 0).single())
+                .unwrap();
+            cn.format("%Y-%m-%d %H:%M:%S").to_string()
+        };
+        let prev = vec![json!({"id": "A", "name": "A", "rate": 0.0, "region": "cn",
+                               "exhausted_at": "2026-10-16 10:00:00",
+                               "reset_at": future})];
+        let fresh = vec![json!({"id": "A", "name": "A", "rate": 0.0, "region": "cn"})];
+        let merged = merge_free_models(&prev, &fresh);
+        assert_eq!(merged[0]["exhausted_at"], json!("2026-10-16 10:00:00"), "未来恢复时刻应保留");
+        assert_eq!(merged[0]["reset_at"], json!(future));
+    }
+
+    /// reset_at 缺失/无法解析时保守保留（宁可多显示一会儿，不误判成可用）
+    #[test]
+    fn merge_free_models_keeps_unparseable_reset() {
+        for bad in ["", "明天 00:00", "2026-10-17", "not-a-date"] {
+            let prev = vec![json!({"id": "A", "name": "A", "rate": 0.0,
+                                   "exhausted_at": "2026-10-16 10:00:00",
+                                   "reset_at": bad})];
+            let fresh = vec![json!({"id": "A", "name": "A", "rate": 0.0})];
+            let merged = merge_free_models(&prev, &fresh);
+            assert_eq!(merged[0]["exhausted_at"], json!("2026-10-16 10:00:00"), "reset_at={bad} 应保留");
+        }
+        // 无 reset_at 但有 exhausted_at：同样保留（WB 域部分文案不带重置时刻）
+        let prev = vec![json!({"id": "A", "name": "A", "exhausted_at": "2026-10-16 10:00:00"})];
+        let merged = merge_free_models(&prev, &[json!({"id": "A", "name": "A"})]);
+        assert_eq!(merged[0]["exhausted_at"], json!("2026-10-16 10:00:00"));
+    }
+
+    /// UTC+8 日期时间解析：已知纪元秒锚点（2026-10-21 00:00:00 +0800 = 1792512000）
+    #[test]
+    fn parse_cn_datetime_anchors_on_epoch() {
+        assert_eq!(parse_cn_datetime("2026-10-21 00:00:00"), Some(1792512000));
+        assert_eq!(parse_cn_datetime("1970-01-01 08:00:00"), Some(0), "UTC+8 零点对齐 Unix 0");
+        assert_eq!(parse_cn_datetime("2026-10-21T12:30:45"), Some(1792512000 + 12 * 3600 + 30 * 60 + 45));
+        assert_eq!(parse_cn_datetime("2026-10-21"), None, "长度不足");
+        assert_eq!(parse_cn_datetime("2026/10/21 00:00:00"), None, "分隔符不符");
+        assert_eq!(parse_cn_datetime("2026-13-21 00:00:00"), None, "月份越界");
+        assert_eq!(parse_cn_datetime("2026-10-32 00:00:00"), None, "日期越界");
+        assert_eq!(parse_cn_datetime("2026-10-21 25:00:00"), None, "小时越界");
     }
 
     /// 倍率解析容错（复用 credits_rate_of）：带 x 前缀 / 单位尾巴 / 空白均可；
@@ -3177,7 +3394,127 @@ mod tests {
         assert_eq!(credits_rate_of(&text_of(flash, "credits")), Some(0.0));
     }
 
+    /// 2026-10-22 回归：上游 camelCase 目录必须与 snake_case 等价解析。
+    ///
+    /// 背景：网关主路径（`gateway.qoder.com.cn/algo/api/v2/model/list`）是
+    /// snake_case，但 IDE 侧端点下发 camelCase（`displayName` / `priceFactor` /
+    /// `maxInputTokens` / `efforts` 裸数组）。若只读 snake，换端点后：
+    /// ① 所有条目因缺 `display_name` 被丢弃；② 即便有名字，倍率也解析不出，
+    /// `free_tier_models()` 会把**所有模型**判成非免费——DeepSeek-Flash 限时
+    /// 免费（`priceFactor:0` + `originalPriceFactor:0.1`）因此长期漏显。
+    /// 本用例把实抓形态钉住，防止再次退回单命名。
     #[test]
+    fn parse_catalog_accepts_camel_case_fields() {
+        // 取 2026-10-22 实抓的 camelCase 形态（app 日志 proxy_req_2026-10-22）
+        let payload = json!({
+            "chat": [
+                {
+                    "value": "dfmodel",
+                    "modelId": "dfmodel",
+                    "displayName": "DeepSeek-Flash",
+                    "isEnabled": true,
+                    "priceFactor": 0,
+                    "originalPriceFactor": 0.1,
+                    "contextWindow": 200000,
+                    "maxInputTokens": 1000000,
+                    "efforts": ["high", "max", "low", "none"]
+                },
+                {
+                    "modelId": "gmodel",
+                    "displayName": "GLM-5.3",
+                    "priceFactor": 0.8,
+                    "maxInputTokens": 200000
+                }
+            ]
+        });
+        let models = parse_catalog(&payload);
+        assert_eq!(models.len(), 2, "camel 条目不得因缺 display_name 被丢弃");
+
+        let ds = models
+            .iter()
+            .find(|m| text_of(m, "id") == "DeepSeek-Flash")
+            .expect("camel displayName 必须解析出 DeepSeek-Flash");
+        // 关键：限时免费读「当前生效价」0，绝不回退 originalPriceFactor(0.1)
+        assert_eq!(
+            credits_rate_of(&text_of(ds, "credits")),
+            Some(0.0),
+            "priceFactor=0 才是实际计费；originalPriceFactor 是划线原价，不得当兜底"
+        );
+        // 上下文长度取 camel 端点的 maxInputTokens（输出侧键名同为 maxInputTokens）
+        assert_eq!(
+            ds.get("maxInputTokens").and_then(Value::as_i64),
+            Some(1000000)
+        );
+
+        // 付费模型倍率照常
+        let glm = models
+            .iter()
+            .find(|m| text_of(m, "id") == "GLM-5.3")
+            .expect("缺 GLM-5.3");
+        assert_eq!(credits_rate_of(&text_of(glm, "credits")), Some(0.8));
+    }
+
+    /// 免费档判定必须把 `priceFactor:0` 的 DeepSeek-Flash 收进来（端到端）。
+    /// 这是用户侧「账号页免费模型列看不到 DeepSeek-Flash」的直接回归。
+    #[test]
+    fn free_tier_includes_camel_zero_price_models() {
+        let _g = catalog_test_guard();
+        // 注入 camelCase 远程目录（含限免的 DeepSeek-Flash）
+        adopt_remote(
+            QoderRegion::Cn,
+            &json!({"statusCodeValue": 200, "chat": [
+                {"modelId": "dfmodel", "displayName": "DeepSeek-Flash",
+                 "priceFactor": 0, "originalPriceFactor": 0.1, "maxInputTokens": 1000000},
+                {"modelId": "qfmodel", "displayName": "Qwen3.8-Flash",
+                 "priceFactor": 0, "maxInputTokens": 1000000},
+                {"modelId": "gmodel", "displayName": "GLM-5.3",
+                 "priceFactor": 0.8, "maxInputTokens": 200000}
+            ]}),
+        )
+        .expect("camel 目录应被采纳");
+
+        let free = free_tier_models();
+        let cn_free: Vec<String> = free
+            .iter()
+            .filter(|m| m.get("region").and_then(Value::as_str) == Some("cn"))
+            .filter_map(|m| m.get("id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        assert!(
+            cn_free.iter().any(|id| id == "DeepSeek-Flash"),
+            "限时免费（priceFactor=0）的 DeepSeek-Flash 必须在免费档清单里；实得 {cn_free:?}"
+        );
+        assert!(
+            !cn_free.iter().any(|id| id == "GLM-5.3"),
+            "0.8 倍率的 GLM-5.3 不得混入免费档；实得 {cn_free:?}"
+        );
+    }
+
+    #[test]
+    /// 兜底表上下文上限（2026-10-23 用户实测反馈修复）：
+    /// 此前整表共用 DEFAULT_CONTEXT_WINDOW=200_000，导致 DeepSeek-Flash 等
+    /// 1M 模型在 Agent 接入中心被写成 200k。Qoder 客户端 contextConfig 里
+    /// 几乎每个模型都有 1M 档，兜底表必须如实带上，不得一刀切。
+    #[test]
+    fn fallback_carries_real_context_window() {
+        for region in [QoderRegion::Cn, QoderRegion::Global] {
+            for m in fallback(region) {
+                let id = m.get("id").and_then(Value::as_str).unwrap_or("");
+                let ctx = m.get("maxInputTokens").and_then(Value::as_i64).unwrap_or(0);
+                assert_eq!(
+                    ctx, 1_000_000,
+                    "{region:?} 区模型 {id} 上下文应为 1M（Qoder contextConfig 最大档），实得 {ctx}"
+                );
+            }
+        }
+        // 用户点名的那条必须包含在内
+        let ds = fallback(QoderRegion::Cn)
+            .into_iter()
+            .find(|m| m.get("id").and_then(Value::as_str) == Some("DeepSeek-Flash"))
+            .expect("DeepSeek-Flash 必须在兜底表");
+        assert_eq!(ds.get("maxInputTokens").and_then(Value::as_i64), Some(1_000_000));
+    }
+
     fn resolve_fallback_by_id_name_and_key() {
         let hit_key = resolve("qfmodel", QoderRegion::Cn).expect("upstreamKey 应可命中");
         assert_eq!(hit_key["id"], "Qwen3.8-Flash");

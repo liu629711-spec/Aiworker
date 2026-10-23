@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>捆绑邀请关系</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: #0f141a; color: #e8ecf1;
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif; font-size: 14px;
+  }
+  .card {
+    width: 420px; padding: 22px 24px; text-align: center;
+    background: #161d26; border: 1px solid #243040; border-radius: 10px;
+  }
+  h2 { margin: 0 0 6px; font-size: 17px; }
+  .acct { margin: 0 0 4px; color: #8b98a5; font-family: Consolas, monospace; font-size: 13px; }
+  .code { margin: 0 0 14px; color: #f0c674; font-family: Consolas, monospace; font-size: 15px; letter-spacing: 1px; }
+  #status { margin: 12px 0; min-height: 20px; color: #b8c2cc; word-break: break-all; }
+  #status.ok { color: #6fd08c; }
+  #status.err { color: #f0a0ab; }
+  button {
+    background: #2a5d43; color: #eafff3; border: 1px solid #357a58; border-radius: 6px;
+    padding: 8px 22px; font-size: 14px; cursor: pointer;
+  }
+  button:hover { background: #31714f; }
+  button:disabled { opacity: .5; cursor: default; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>🔗 捆绑邀请关系</h2>
+  <p class="acct" id="acct"></p>
+  <p class="code" id="code"></p>
+  <p id="status">正在加载验证码组件…</p>
+  <!-- 验证码挂载点:阿里云 SDK 会在这里建DOM,TRACELESS 模式下不渲染任何可见滑块 -->
+  <div id="captcha-host"></div>
+  <!-- SDK 要求存在一个 button 句柄;getInstance 后由脚本自动 click 触发验证 -->
+  <button id="captcha-trigger" type="button" hidden tabindex="-1" aria-hidden="true"></button>
+</div>
+<script>
+/*
+ * 验证码时序(照抄官方 zcode.z.ai/cn/invite/<code> 页,逆向自 page-5ed88aa9c34b9702.js):
+ *   1) 先读 /bind-config 拿 region/prefix/sceneId
+ *   2) **在加载 SDK 之前**写 window.AliyunCaptchaConfig = {region, prefix}
+ *      —— SDK 在 eval 阶段就会读它决定验证码服务端点,写晚了就落到默认 cn 端点,
+ *         服务端返回 TRACELESS 时 SDK 静默不建 UI、也不回调,表现就是"点了没反应"
+ *   3) 用 getInstance 拿到实例后自动 click 隐藏按钮发起验证
+ *   4) success(verifyParam, region) 拿到可直接塞进请求头的参数
+ *
+ * 反之旧实现用 captchaVerifyCallback + 可见 button,依赖 SDK 自己渲染 UI;
+ * TRACELESS 场景下不会渲染任何东西,于是永久卡在"请在弹出的验证窗口中完成验证"。
+ */
+(function () {
+  var q = new URLSearchParams(location.search);
+  var account = q.get("account");
+  var inviter = q.get("inviter");
+  var statusEl = document.getElementById("status");
+  var acctEl = document.getElementById("acct");
+  var codeEl = document.getElementById("code");
+  var host = document.getElementById("captcha-host");
+  var trigger = document.getElementById("captcha-trigger");
+  var busy = false;
+  var sdkPromise = null;
+
+  function setStatus(text, cls) {
+    statusEl.textContent = text;
+    statusEl.className = cls || "";
+  }
+
+  // 把最终结果写进 location.hash,供 Rust 侧轮询 win.url() 的 fragment 读取。
+  // 与注册流水线的 __zflowReport 同一套通道(title 在 Tauri 里读的是 OS 窗口标题,
+  // 收不到 document.title,hash 才是能真实读回的)。
+  function report(ok, message) {
+    try {
+      location.hash =
+        "zflow=" + (ok ? "__zcodeBindDone" : "__zcodeBindFailed") + ":1";
+    } catch (e) {}
+    window.__bindReport = { ok: !!ok, message: message || "" };
+  }
+
+  function loadSdk() {
+    if (window.initAliyunCaptcha) return Promise.resolve();
+    if (sdkPromise) return sdkPromise;
+    sdkPromise = new Promise(function (resolve, reject) {
+      var s = document.createElement("script");
+      var timer = setTimeout(function () {
+        s.remove();
+        sdkPromise = null;
+        reject(new Error("验证码 SDK 加载超时"));
+      }, 15000);
+      s.src = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js";
+      s.async = true;
+      s.onload = function () { clearTimeout(timer); resolve(); };
+      s.onerror = function () { clearTimeout(timer); s.remove(); sdkPromise = null; reject(new Error("验证码 SDK 加载失败")); };
+      document.head.appendChild(s);
+    });
+    return sdkPromise;
+  }
+
+  function submit(captchaVerifyParam, region) {
+    return fetch("/bind-submit", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        account: account,
+        inviter: inviter,
+        captcha_verify_param: captchaVerifyParam,
+        region: region
+      })
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        window.__bindResult = { ok: !!res.ok, message: res.message };
+        if (res.ok) {
+          setStatus("✅ " + res.message, "ok");
+          report(true, res.message);
+        } else {
+          setStatus("❌ " + res.message, "err");
+          report(false, res.message);
+          busy = false;
+        }
+      })
+      .catch(function (e) {
+        window.__bindResult = { ok: false, message: "提交失败:" + e };
+        setStatus("❌ 提交失败:" + e, "err");
+        report(false, "提交失败:" + e);
+        busy = false;
+      });
+  }
+
+  function run(captchaCfg) {
+    if (busy) return;
+    busy = true;
+    setStatus("正在验证…");
+
+    // 必须在 SDK 加载前设置:SDK 在 eval 阶段读取它计算验证码服务端点
+    window.AliyunCaptchaConfig = {
+      region: captchaCfg.region,
+      prefix: captchaCfg.prefix
+    };
+
+    loadSdk()
+      .then(function () {
+        if (typeof window.initAliyunCaptcha !== "function") {
+          throw new Error("验证码 SDK 未就绪");
+        }
+        window.initAliyunCaptcha({
+          SceneId: captchaCfg.sceneId,
+          mode: "popup",
+          language: "cn",
+          element: "#captcha-host",
+          button: "#captcha-trigger",
+          delayBeforeSuccess: false,
+          getInstance: function () {
+            // 实例就绪后自动发起;延迟一帧确保 SDK 已挂好隐藏按钮
+            setTimeout(function () {
+              try {
+                trigger.click();
+              } catch (e) {
+                setStatus("验证码触发失败:" + e, "err");
+                busy = false;
+              }
+            }, 50);
+          },
+          success: function (captchaVerifyParam, region) {
+            var r = region || captchaCfg.region;
+            if (!captchaVerifyParam) {
+              // 服务端关闭验证码时 SDK 会回空串,直接提交
+              setStatus("无需验证,正在提交捆绑…");
+            } else {
+              setStatus("验证完成,正在提交捆绑…");
+            }
+            submit(captchaVerifyParam, r);
+          },
+          fail: function () {
+            setStatus("验证未通过,请重试", "err");
+            report(false, "验证未通过");
+            busy = false;
+          },
+          onError: function (err) {
+            var m = err && err.message ? err.message : err;
+            setStatus("验证码出错:" + m, "err");
+            report(false, "验证码出错:" + m);
+            busy = false;
+          },
+          onClose: function () {
+            if (!busy) return;
+            setStatus("验证窗口已关闭,可重新点击按钮", "err");
+            report(false, "验证窗口已关闭");
+            busy = false;
+          }
+        });
+      })
+      .catch(function (e) {
+        setStatus("验证码组件初始化失败:" + (e && e.message ? e.message : e), "err");
+        busy = false;
+      });
+  }
+
+  fetch("/bind-config?account=" + encodeURIComponent(account) + "&inviter=" + encodeURIComponent(inviter))
+    .then(function (r) { return r.json(); })
+    .then(function (cfg) {
+      if (!cfg.ok) {
+        var err = cfg.error || "未知错误";
+        setStatus("加载失败:" + err, "err");
+        report(false, "加载失败:" + err);
+        return;
+      }
+      acctEl.textContent = "被邀请账号:" + cfg.account_label;
+      codeEl.textContent = "主号邀请码:" + cfg.invite_code + " (" + cfg.inviter_label + ")";
+      var captchaCfg = cfg.captcha || {};
+      if (captchaCfg.enabled === false) {
+        setStatus("服务端未开启验证码,正在提交捆绑…");
+        submit("", captchaCfg.region || "cn");
+        return;
+      }
+      if (!captchaCfg.sceneId || !captchaCfg.prefix || !captchaCfg.region) {
+        setStatus("服务端验证码配置不完整", "err");
+        return;
+      }
+      setStatus("正在准备验证码…");
+      // 配置一到就自动跑,不需要用户再点一次
+      run(captchaCfg);
+    })
+    .catch(function (e) { setStatus("加载失败:" + e, "err"); });
+})();
+</script>
+</body>
+</html>

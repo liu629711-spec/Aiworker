@@ -5,7 +5,7 @@ use tauri::{Manager, State};
 
 use crate::fs_utils;
 use crate::models::{
-    AccountCooldownsFile, ApiPoolFile, ApiServiceStatus, DeviceMap, PoolStatus,
+    AccountCooldownsFile, ApiPoolFile, ApiServiceStatus, DeviceMap, ModelCooldown, PoolStatus,
     RemainingCreditsFile,
 };
 use crate::state::AppState;
@@ -932,7 +932,9 @@ fn apply_pool_snapshot(
     // ZCode 池装配（z.ai GLM 池）：账号源 = zcode.sqlite accounts 表（zcode 域
     // 管理，网关只读），无分组/标签筛选（v1 全量入池，白名单由 zcode_enabled_uids
     // 表达）；凭证入池门槛 = zai_access_token 非空（请求期真凭证经 zcode_identity
-    // 回调按次读取最新值，池内快照仅作入池门槛与不可用时的兜底）
+    // 回调按次读取最新值，池内快照仅作入池门槛与不可用时的兜底）。
+    // 套餐画像（plan_*）随账号一并入池：模型/时段/额度/燃烧顺序的判定在池内完成，
+    // 装配层只负责搬运（画像由 monitor 域的 billing/current 同步写入）。
     let zcode_accounts = crate::commands::zcode_pool::list_pool_accounts(state);
     let zcode_sync: Vec<crate::api_server::pool::ZCodeSyncAccount> = zcode_accounts
         .iter()
@@ -941,6 +943,7 @@ fn apply_pool_snapshot(
             name: a.label.clone(),
             access_token: a.access_token.clone(),
             device_mid: a.device_mid.clone(),
+            plan: a.plan.clone(),
         })
         .collect();
     let zcode_ids: Vec<String> = zcode_sync.iter().map(|a| a.uid.clone()).collect();
@@ -1031,6 +1034,22 @@ pub fn push_credits_if_running(
         &state.data_dir,
         &format!("API服务池积分回写(运行期): n={}", pool_credits.len()),
     );
+}
+
+/// 网关运行中回写 ZCode 套餐门闸（2026-10-23 套餐池改造）：
+/// 监控域每轮 `billing/balance` 归一化出画像后调用，让选号立刻按新画像过滤
+/// （临时额度烧完、夜间档开关、模型权益变化）。只改门闸，不动白名单/冷却/在途计数；
+/// 服务未运行时 no-op。
+pub fn push_zcode_plans_if_running(
+    runtime: &Mutex<Option<ApiServerRuntime>>,
+    updates: &[(String, Option<crate::api_server::pool::PlanGate>)],
+) {
+    if updates.is_empty() {
+        return;
+    }
+    let guard = safe_lock(runtime);
+    let Some(rt) = guard.as_ref() else { return };
+    rt.shared.zcode_pool.update_zcode_plans(updates);
 }
 
 /// pool_set 字段合并（纯函数，便于单测）：未传（None）保留 existing 原值，传值覆盖。
@@ -1404,6 +1423,31 @@ pub fn qoder_pool_status(runtime: State<'_, Mutex<Option<ApiServerRuntime>>>) ->
     }
 }
 
+/// 进程级模型冷却快照（Qoder：排队/限流致冷，前端「模型冷却」横幅）。
+/// 与 qoder_pool_status 的账号级 per_model_cooldowns 互补——那个回答「哪个
+/// 账号的哪个模型没额度」，这个回答「该模型整体在排队」。
+/// 服务未运行时返回空数组。
+#[tauri::command]
+pub fn qoder_model_cooldowns(
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+) -> Vec<ModelCooldown> {
+    let guard = safe_lock(&runtime);
+    match guard.as_ref() {
+        Some(_rt) => super::super::api_server::qoder_route::model_cooldown_snapshot(),
+        None => vec![],
+    }
+}
+
+/// 进程级模型冷却快照（Buddy 域，同 qoder_model_cooldowns 语义）
+#[tauri::command]
+pub fn wb_model_cooldowns(runtime: State<'_, Mutex<Option<ApiServerRuntime>>>) -> Vec<ModelCooldown> {
+    let guard = safe_lock(&runtime);
+    match guard.as_ref() {
+        Some(rt) => super::super::api_server::wb_route::model_cooldown_snapshot(&rt.shared),
+        None => vec![],
+    }
+}
+
 /// ZCode 池实时状态（z.ai GLM 池；含 per-account inflight 在途计数）。
 /// 服务未运行时返回空列表（前端候选列表显示「暂无上游账号候选」）
 #[tauri::command]
@@ -1680,12 +1724,22 @@ pub fn overseas_access_info(state: State<'_, AppState>) -> Result<serde_json::Va
 // ==================== 额度中心 / 接入配置 / 连通性自测（2026-10-17）====================
 
 /// Key 生效范围内的模型清单（池绑定 + 区域约束推导，带池前缀，分组返回）。
-/// 接入配置生成与自测模型选择共用。
-fn key_scope_models(state: &AppState, entry: &crate::api_server::api_keys::ApiKeyEntry) -> Value {
+/// 接入配置生成与自测模型选择共用。Agent 接入中心（agent_integration）批量
+/// 展开各 Key 模型同样走此函数——2026-10-23 由 &AppState 收窄为 &Path（只用
+/// data_dir），脱离 State 亦可复用/测试。
+///
+/// 区域语义（2026-10-23）：Buddy/Qoder 两池存在**同 id 跨区重名**（实测 Qoder
+/// CN 13 个里 11 个在 Global 同名）。当 Key **未限定区域**时，同名模型两区各
+/// 出一条并加 `@cn` / `@global` 后缀，让客户端里能区分（否则海外那条被去重
+/// 吞掉、用户以为只有一个）。Key 已限定区域时按该区展开、不加后缀（无歧义）。
+pub(crate) fn key_scope_models(
+    data_dir: &std::path::Path,
+    entry: &crate::api_server::api_keys::ApiKeyEntry,
+) -> Value {
     let want_global = crate::api_server::api_keys::parse_region(&entry.region);
-    let mut out = json!({"trae": [], "buddy": [], "qoder": []});
+    let mut out = json!({"trae": [], "buddy": [], "qoder": [], "zcode": []});
     if entry.bind_pool.is_empty() || entry.bind_pool == "trae" {
-        let trae: Vec<String> = crate::store::db(&state.data_dir)
+        let trae: Vec<String> = crate::store::db(data_dir)
             .kv_get::<Vec<Value>>("api_models")
             .iter()
             .filter_map(|m| m.get("id").and_then(Value::as_str).map(|s| format!("trae/{}", s)))
@@ -1693,33 +1747,79 @@ fn key_scope_models(state: &AppState, entry: &crate::api_server::api_keys::ApiKe
         out["trae"] = json!(trae);
     }
     if entry.bind_pool.is_empty() || entry.bind_pool == "buddy" {
-        let models: Vec<String> = match want_global {
-            Some(true) => crate::api_server::wb_catalog::list_global(&state.data_dir)
-                .iter()
-                .map(|m| format!("buddy/{}", m.id))
-                .collect(),
-            _ => crate::api_server::wb_catalog::load(&state.data_dir)
-                .iter()
-                .map(|m| format!("buddy/{}", m.id))
-                .collect(),
-        };
-        out["buddy"] = json!(models);
+        let (cn, gl) = (
+            crate::api_server::wb_catalog::list_region(data_dir, false),
+            crate::api_server::wb_catalog::list_global(data_dir),
+        );
+        // WbModel 是结构体，转 Value 供通用函数处理
+        let cn_v: Vec<Value> = cn.iter().map(|m| json!({"id": m.id})).collect();
+        let gl_v: Vec<Value> = gl.iter().map(|m| json!({"id": m.id})).collect();
+        out["buddy"] = json!(region_tagged_models("buddy", &cn_v, &gl_v, want_global));
     }
     if entry.bind_pool.is_empty() || entry.bind_pool == "qoder" {
-        let models: Vec<String> = crate::tasks::qoder_upstream::list()
+        let cn = crate::tasks::qoder_upstream::catalog_for_region(
+            crate::tasks::qoder_upstream::QoderRegion::Cn,
+        );
+        let gl = crate::tasks::qoder_upstream::catalog_for_region(
+            crate::tasks::qoder_upstream::QoderRegion::Global,
+        );
+        out["qoder"] = json!(region_tagged_models("qoder", &cn, &gl, want_global));
+    }
+    if entry.bind_pool.is_empty() || entry.bind_pool == "zcode" {
+        // ZCode 池无区域概念（z.ai 账号不分区），静态目录直取
+        let models: Vec<String> = crate::api_server::zcode_catalog::list_json()
             .into_iter()
-            .filter(|m| {
-                want_global.map_or(true, |w| {
-                    m.get("region").and_then(Value::as_str) == Some(if w { "global" } else { "cn" })
-                })
-            })
             .filter_map(|m| {
                 m.get("id")
                     .and_then(Value::as_str)
-                    .map(|s| format!("qoder/{}", s))
+                    .map(|s| format!("zcode/{}", s))
             })
             .collect();
-        out["qoder"] = json!(models);
+        out["zcode"] = json!(models);
+    }
+    out
+}
+
+/// 双区模型清单 → 带区域后缀的模型 id 列表。
+///
+/// - Key 限定区域（`want_global = Some(_)`）：只出该区，**不加后缀**（无歧义，
+///   保持历史语义，老客户端零影响）
+/// - Key 不限区域：两区**同名**模型各出一条并加 `@cn`/`@global`；只在单区存在
+///   的模型直接出裸名（无歧义，不必加后缀噪音）
+fn region_tagged_models(
+    pool: &str,
+    cn: &[serde_json::Value],
+    gl: &[serde_json::Value],
+    want_global: Option<bool>,
+) -> Vec<String> {
+    let ids = |list: &[serde_json::Value]| -> Vec<String> {
+        list.iter()
+            .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect()
+    };
+    let (cn_ids, gl_ids) = (ids(cn), ids(gl));
+    let mut out: Vec<String> = Vec::new();
+    match want_global {
+        // 限定单区：只出该区裸名
+        Some(true) => out.extend(gl_ids.iter().map(|i| format!("{pool}/{i}"))),
+        Some(false) => out.extend(cn_ids.iter().map(|i| format!("{pool}/{i}"))),
+        // 不限区域：同名加后缀，独有裸名
+        None => {
+            for id in &cn_ids {
+                if gl_ids.iter().any(|g| g.eq_ignore_ascii_case(id)) {
+                    out.push(format!("{pool}/{id}@cn"));
+                } else {
+                    out.push(format!("{pool}/{id}"));
+                }
+            }
+            for id in &gl_ids {
+                if cn_ids.iter().any(|c| c.eq_ignore_ascii_case(id)) {
+                    out.push(format!("{pool}/{id}@global"));
+                } else {
+                    out.push(format!("{pool}/{id}"));
+                }
+            }
+        }
     }
     out
 }
@@ -1740,6 +1840,7 @@ pub async fn api_key_test(state: State<'_, AppState>, key_id: String) -> Result<
     let host = if gs.host.trim().is_empty() { "127.0.0.1" } else { gs.host.trim() };
     let model = match (entry.bind_pool.as_str(), crate::api_server::api_keys::parse_region(&entry.region)) {
         ("qoder", _) => "qoder/qwen3.8-flash",
+        ("zcode", _) => "zcode/GLM-5.3-Flash",
         ("buddy", Some(true)) => "buddy/deepseek-v4.1-flash",
         ("buddy", _) => "buddy/hy3",
         ("trae", _) => "trae/glm-5.3-flash",
@@ -1825,7 +1926,7 @@ pub fn api_key_models(state: State<'_, AppState>, key_id: String) -> Result<Valu
         .into_iter()
         .find(|k| k.id == key_id)
         .ok_or_else(|| format!("Key 不存在: {}", key_id))?;
-    Ok(key_scope_models(&state, &entry))
+    Ok(key_scope_models(&state.data_dir, &entry))
 }
 
 /// ③b 直写本机 ZCode agent 供应商配置（~/.zcode/v2/provider_config.json）：
@@ -1837,9 +1938,18 @@ pub fn zcode_provider_write(state: State<'_, AppState>, key_id: String) -> Resul
         .into_iter()
         .find(|k| k.id == key_id)
         .ok_or_else(|| format!("Key 不存在: {}", key_id))?;
-    let models = key_scope_models(&state, &entry);
+    zcode_provider_write_one(&state.data_dir, &entry)
+}
+
+/// zcode_provider_write 的可复用核心（Agent 接入中心批量写入同用此函数）：
+/// 幂等新增/更新 provider id=aiwork-<key_id>，写前时间戳备份，写后回读校验。
+pub(crate) fn zcode_provider_write_one(
+    data_dir: &std::path::Path,
+    entry: &crate::api_server::api_keys::ApiKeyEntry,
+) -> Result<Value, String> {
+    let models = key_scope_models(data_dir, entry);
     let mut all: Vec<String> = Vec::new();
-    for g in ["trae", "buddy", "qoder"] {
+    for g in ["trae", "buddy", "qoder", "zcode"] {
         if let Some(arr) = models.get(g).and_then(Value::as_array) {
             all.extend(arr.iter().filter_map(Value::as_str).map(str::to_string));
         }
@@ -1847,67 +1957,63 @@ pub fn zcode_provider_write(state: State<'_, AppState>, key_id: String) -> Resul
     if all.is_empty() {
         return Err("该 Key 生效范围内没有可写入的模型（目录为空）".into());
     }
-    let home = std::env::var("USERPROFILE").map_err(|_| "USERPROFILE 缺失".to_string())?;
-    let path = std::path::Path::new(&home)
-        .join(".zcode")
-        .join("v2")
-        .join("provider_config.json");
+    let home = crate::commands::agent_integration::agent_home().ok_or("USERPROFILE 缺失")?;
+    let path = home.join(".zcode").join("v2").join("provider_config.json");
     let raw = std::fs::read_to_string(&path).map_err(|e| format!("读取 ZCode 配置失败: {}", e))?;
     let mut cfg: Value =
         serde_json::from_str(&raw).map_err(|e| format!("ZCode 配置非 JSON: {}", e))?;
-    let bak = path.with_extension(format!(
-        "json.bak-{}",
-        chrono::Local::now().format("%Y%m%d%H%M%S")
-    ));
-    let _ = std::fs::copy(&path, &bak);
-    let pid = format!("aiwork-{}", key_id);
-    let gs = crate::api_server::gateway_settings::load(&state.data_dir);
-    let provider = json!({
-        "providerId": pid,
+    let pid = format!("aiwork-{}", entry.id);
+    let gs = crate::api_server::gateway_settings::load(data_dir);
+    let provider = zcode_provider_json(entry, &all, gs.port);
+    // 逐模型能力元数据：上下文取目录真实值、输出对齐生态惯例 128K、
+    // 图片能力取目录声明（写进 providerModelRules，ZCode 界面据此显示）
+    let caps = crate::commands::agent_integration::catalog_support(data_dir);
+    let limits: Vec<(String, u64, u64, bool)> = all
+        .iter()
+        .map(|m| {
+            let bare = m.rsplit_once('@').map(|(b, _)| b).unwrap_or(m);
+            let c = caps.get(bare).copied().unwrap_or_default();
+            let out = if c.max_output > 0 {
+                c.max_output
+            } else {
+                crate::tasks::qoder_upstream::AGENT_CONFIG_MAX_OUTPUT_TOKENS as u64
+            };
+            (m.clone(), c.max_input, out, c.image)
+        })
+        .collect();
+    crate::commands::agent_integration::zcode_upsert_provider_with_limits(
+        &mut cfg, &provider, &limits,
+    )?;
+    std::fs::write(&path, serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("写入 ZCode 配置失败: {}", e))?;
+    let _ = crate::fs_utils::app_log(
+        data_dir,
+        &format!(
+            "已写入 ZCode agent 供应商配置: {}（{} 个模型）",
+            pid,
+            all.len(),
+        ),
+    );
+    Ok(json!({"ok": true, "provider_id": pid, "models": all.len()}))
+}
+
+/// ZCode provider 条目 JSON（结构以本机真实 provider_config.json 为准）
+pub(crate) fn zcode_provider_json(
+    entry: &crate::api_server::api_keys::ApiKeyEntry,
+    all: &[String],
+    port: u16,
+) -> Value {
+    json!({
+        "providerId": format!("aiwork-{}", entry.id),
         "providerName": entry.name,
         "config": {
             "group": "standard-personal",
             "access": {"type": "api-key", "apiKey": entry.key},
-            "api": {"type": "anthropic-messages", "baseUrl": format!("http://127.0.0.1:{}/v1", gs.port)},
+            "api": {"type": "anthropic-messages", "baseUrl": format!("http://127.0.0.1:{}/v1", port)},
             "personalModelIds": all,
             "modelOrder": all,
         },
-    });
-    let cfg_obj = cfg
-        .get_mut("config")
-        .and_then(Value::as_object_mut)
-        .ok_or("ZCode 配置缺 config 段")?;
-    let rules = cfg_obj
-        .get_mut("providerConfigRules")
-        .and_then(Value::as_object_mut)
-        .ok_or("ZCode 配置缺 providerConfigRules 段")?;
-    let list = rules.entry("providerRules").or_insert_with(|| json!([]));
-    let arr = list.as_array_mut().ok_or("providerRules 非数组")?;
-    match arr
-        .iter_mut()
-        .find(|r| r.get("providerId").and_then(Value::as_str) == Some(pid.as_str()))
-    {
-        Some(r) => *r = provider,
-        None => arr.push(provider),
-    }
-    let order = cfg_obj.entry("providerOrder").or_insert_with(|| json!([]));
-    if let Some(oarr) = order.as_array_mut() {
-        if !oarr.iter().any(|v| v.as_str() == Some(pid.as_str())) {
-            oarr.push(json!(pid));
-        }
-    }
-    std::fs::write(&path, serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("写入 ZCode 配置失败: {}", e))?;
-    let _ = crate::fs_utils::app_log(
-        &state.data_dir,
-        &format!(
-            "已写入 ZCode agent 供应商配置: {}（{} 个模型，备份 {:?}）",
-            pid,
-            all.len(),
-            bak
-        ),
-    );
-    Ok(json!({"ok": true, "provider_id": pid, "models": all.len(), "backup": bak.to_string_lossy()}))
+    })
 }
 
 /// ② 免费模型用量计数快照（额度中心数据源）
@@ -2291,6 +2397,72 @@ pub fn trae_model_meta_clear(state: State<'_, AppState>, model: String) -> Resul
 }
 
 // ==================== 单元测试：pool_set 合并语义（调度策略收口） ====================
+
+#[cfg(test)]
+mod region_tag_tests {
+    use super::region_tagged_models;
+    use serde_json::json;
+
+    fn ids(list: &[&str]) -> Vec<serde_json::Value> {
+        list.iter().map(|i| json!({"id": i})).collect()
+    }
+
+    #[test]
+    fn unregulated_key_tags_duplicates_with_region() {
+        // 两区重名（Qoder 实况：11/13 个同名）+ 一个 CN 独有 + 一个 Global 独有
+        let cn = ids(&["GLM-5.3", "Qwen3.8-Max", "CN-Only"]);
+        let gl = ids(&["GLM-5.3", "Qwen3.8-Max", "GL-Only"]);
+        let out = region_tagged_models("qoder", &cn, &gl, None);
+        // 同名模型出两条（各带后缀），独有模型出裸名（无后缀噪音）
+        assert_eq!(
+            out,
+            vec![
+                "qoder/GLM-5.3@cn",
+                "qoder/Qwen3.8-Max@cn",
+                "qoder/CN-Only",
+                "qoder/GLM-5.3@global",
+                "qoder/Qwen3.8-Max@global",
+                "qoder/GL-Only",
+            ]
+        );
+    }
+
+    #[test]
+    fn region_limited_key_emits_bare_names_only() {
+        let cn = ids(&["GLM-5.3", "CN-Only"]);
+        let gl = ids(&["GLM-5.3", "GL-Only"]);
+        // 限定国内：只出 CN 区、不加后缀（无歧义，历史语义）
+        assert_eq!(
+            region_tagged_models("qoder", &cn, &gl, Some(false)),
+            vec!["qoder/GLM-5.3", "qoder/CN-Only"]
+        );
+        // 限定海外：只出 Global 区
+        assert_eq!(
+            region_tagged_models("qoder", &cn, &gl, Some(true)),
+            vec!["qoder/GLM-5.3", "qoder/GL-Only"]
+        );
+    }
+
+    #[test]
+    fn no_overlap_emits_no_suffix() {
+        let cn = ids(&["A"]);
+        let gl = ids(&["B"]);
+        assert_eq!(
+            region_tagged_models("buddy", &cn, &gl, None),
+            vec!["buddy/A", "buddy/B"]
+        );
+    }
+
+    #[test]
+    fn duplicate_tagging_is_case_insensitive() {
+        let cn = ids(&["glm-5.3"]);
+        let gl = ids(&["GLM-5.3"]);
+        let out = region_tagged_models("qoder", &cn, &gl, None);
+        assert_eq!(out.len(), 2, "大小写不同的同名模型仍算重名，各出一条");
+        assert!(out.iter().any(|m| m.ends_with("@cn")));
+        assert!(out.iter().any(|m| m.ends_with("@global")));
+    }
+}
 
 #[cfg(test)]
 mod legacy_migration_tests {

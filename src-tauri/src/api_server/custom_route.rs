@@ -26,9 +26,14 @@ use tokio_stream::wrappers::ReceiverStream;
 /// 请求体准备：强制 stream:true（统一 SSE 处理）+ 模型名对齐自定义条目
 fn prep_body(body_vec: &[u8], cm: &CustomModel) -> Vec<u8> {
     let mut v: Value = serde_json::from_slice(body_vec).unwrap_or_else(|_| json!({}));
-    v["stream"] = json!(true);
-    if !cm.name.is_empty() {
-        v["model"] = json!(cm.name);
+    // 2026-10-22 P0：insert() 而非 IndexMut —— serde_json 开 preserve_order 时
+    // Map 是 IndexMap，`v["k"] = ..` 在键不存在时 panic（空 body / 无 model 字段
+    // 的请求必然触发，线程随之死亡）。
+    if let Some(o) = v.as_object_mut() {
+        o.insert("stream".to_string(), json!(true));
+        if !cm.name.is_empty() {
+            o.insert("model".to_string(), json!(cm.name));
+        }
     }
     v.to_string().into_bytes()
 }
@@ -300,7 +305,7 @@ pub async fn custom_aggregate_chat(
         let duration_ms = start_ts.elapsed().as_millis() as u64;
         match (resp, error_info) {
             (Some(mut r), None) => {
-                r["model"] = json!(model);
+                if let Some(o) = r.as_object_mut() { o.insert("model".to_string(), json!(model)); }
                 // 宽口径提取（别名 + 字符串数字形态，审查 P2）
                 let (pt, ct) = r.get("usage").map(wb_sse::u64_pair).unwrap_or((0, 0));
                 // M4 审查修复：缓存读 tokens 旁路入账（未下发得 0 不入账）

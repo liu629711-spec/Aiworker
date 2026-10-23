@@ -76,6 +76,10 @@ export default function ApiKeysManager({
   // issue #25 资源池绑定："" = 跟随全局调度 | "trae" | "buddy" | "qoder"
   const [editBindPool, setEditBindPool] = useState('');
   const [editRegion, setEditRegion] = useState('');
+  // 套餐形态白名单（2026-10-23 套餐池改造，仅 bind_pool=zcode 生效）：
+  // 空 = 不限；非空 = 该 Key 只允许命中这些套餐形态的账号
+  // （典型用法：外部智能体专用 Key 限定「只烧任务卡/新号赠送」，把 Start Plan 底座留给自己）
+  const [editPlanKinds, setEditPlanKinds] = useState<Set<string>>(new Set());
   // issue #30：打开弹框时的原始白名单/专一值（未归一）。保存时若用户未改动勾选
   // （归一化后等价），写回原值——旧裸 uid 数据保持旧语义，避免「仅打开保存一次」
   // 就把 trae 侧从「不限」静默升级为「排除」（混合白名单零条目池 = 排除）
@@ -185,6 +189,7 @@ export default function ApiKeysManager({
       region: newRegion,
       allowed_groups: [],
       allowed_tags: [],
+      plan_kinds: [],
       daily_stats: [],
     };
     // 保存成功后才清空表单：失败时保留用户已填的名称/限额，免重填
@@ -268,6 +273,7 @@ export default function ApiKeysManager({
     setEditDedicated(norm(k.dedicated_account || ''));
     setEditBindPool(k.bind_pool || '');
     setEditRegion(k.region || '');
+    setEditPlanKinds(new Set(k.plan_kinds ?? []));
     setEditGroups(new Set(k.allowed_groups ?? []));
     setEditTags(new Set(k.allowed_tags ?? []));
     // 共享分组/标签候选（全局一份；含各池成员计数）
@@ -332,6 +338,8 @@ export default function ApiKeysManager({
             region: editRegion,
             allowed_groups: [...editGroups],
             allowed_tags: [...editTags],
+            // 仅 zcode 池消费；切回其它池时清空，避免留下无效约束
+            plan_kinds: editBindPool === 'zcode' ? [...editPlanKinds] : [],
           }
         : k,
     );
@@ -946,6 +954,53 @@ export default function ApiKeysManager({
                 Qoder 上游当前未启用：保存后该 Key 的请求将显式报错；请先到 Qoder「资源调度」页
                 或上方「调度策略中心」开启「启用 Qoder 上游」。
               </p>
+            )}
+            {/* 套餐形态约束（2026-10-23 套餐池改造）：仅 ZCode 池有套餐概念 */}
+            {editBindPool === 'zcode' && (
+              <div className="mt-3">
+                <div className="mb-1.5 text-xs font-medium text-slate-500">
+                  套餐形态
+                  <span className="ml-1 font-normal text-slate-400">
+                    （不勾 = 不限；勾选后该 Key 只命中这些形态的账号）
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {[
+                    { key: 'new_account', label: '新号赠送', hint: '短期高额度，最先被消耗' },
+                    { key: 'task_card', label: '任务卡', hint: '邀请奖励发放，一次性' },
+                    { key: 'global_build', label: 'Global Build', hint: '夜间档额度（23:00→次日 09:00）' },
+                    { key: 'start_plan', label: 'Start Plan', hint: '长期订阅底座，建议保留' },
+                    { key: 'other', label: '其他套餐', hint: '未识别形态' },
+                  ].map((k) => {
+                    const on = editPlanKinds.has(k.key);
+                    return (
+                      <button
+                        key={k.key}
+                        title={k.hint}
+                        className={`rounded-full border px-2.5 py-1 text-xs transition ${
+                          on
+                            ? 'border-indigo-400 bg-indigo-50 font-medium text-indigo-600 dark:bg-indigo-500/15 dark:text-indigo-300'
+                            : 'border-slate-200 text-slate-500 hover:border-slate-300 dark:border-zinc-700 dark:text-zinc-400'
+                        }`}
+                        onClick={() =>
+                          setEditPlanKinds((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(k.key)) next.delete(k.key);
+                            else next.add(k.key);
+                            return next;
+                          })
+                        }
+                      >
+                        {k.label}
+                      </button>
+                    );
+                  })}
+                </div>
+                <p className="mt-1 text-[11px] leading-4 text-slate-400">
+                  池内默认消耗顺序：新号赠送 → 任务卡 → Global Build → Start Plan（临时额度先烧，
+                  长期订阅留底）。勾选后这个 Key 只能用到勾中的那一档。
+                </p>
+              </div>
             )}
           </div>
           <div>
