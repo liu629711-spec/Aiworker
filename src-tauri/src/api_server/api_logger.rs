@@ -25,6 +25,10 @@ pub struct ApiLogger {
 struct LoggerState {
     /// 待落盘日志行（FIFO）
     queue: VecDeque<String>,
+    /// 网关事件环形缓冲（观测性：前端「网关事件」时间线数据源）。只收
+    /// sched 级事件（轮换/降权/让位/落池），有界 300 行、与落盘独立；
+    /// 只反映本进程启动后的事件（重启清零，事件是瞬时观测属可接受口径）
+    recent: VecDeque<String>,
     /// 当前打开的日志文件句柄（None = 待打开）
     file: Option<std::fs::File>,
     /// 句柄对应日期（与今日不同则滚动换文件）
@@ -35,6 +39,7 @@ impl LoggerState {
     fn new() -> Self {
         Self {
             queue: VecDeque::new(),
+            recent: VecDeque::new(),
             file: None,
             date: String::new(),
         }
@@ -185,11 +190,26 @@ impl ApiLogger {
     }
 
     /// 记录调度事件日志（F-77）：sticky_yield 让位 / busy 降级取号 / 对冲接管等，
-    /// 单行 `[SCHED]` 前缀写入当日日志，供用量页日志检索与调度行为观测
+    /// 单行 `[SCHED]` 前缀写入当日日志，供用量页日志检索与调度行为观测。
+    /// 同时推入环形缓冲（前端「网关事件」时间线），不依赖文件读取
     pub fn log_sched_event(&self, event: &str) {
         let (h, m, s) = Self::local_hms();
         let line = format!("[{:02}:{:02}:{:02}] [SCHED] {}\n", h, m, s, event);
+        const RECENT_CAP: usize = 300;
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.recent.len() >= RECENT_CAP {
+            st.recent.pop_front();
+        }
+        st.recent.push_back(line.trim_end().to_string());
+        drop(st);
         self.enqueue(line);
+    }
+
+    /// 最近 N 条调度级事件（新→旧；额度中心「网关事件」时间线数据源）。
+    /// 文件落盘走后台 flusher，此处直接读内存环形缓冲——「写后即读」
+    pub fn recent_sched_events(&self, limit: usize) -> Vec<String> {
+        let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.recent.iter().rev().take(limit).cloned().collect()
     }
 
     /// 记录 Debug 级别的完整请求/响应日志

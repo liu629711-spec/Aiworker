@@ -8,7 +8,7 @@
  *   能自动修的给一键动作（Qoder 刷新凭证），其余给处理指引。
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { AlertTriangle, Gauge, RefreshCw, ShieldCheck, Stethoscope } from 'lucide-react';
+import { Activity, AlertTriangle, Gauge, RefreshCw, ShieldCheck, Stethoscope } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge } from '../components/ui';
 import { api, type ApiKeyEntry, type FreeUsageSnapshot, type QoderAccountView, type WorkBuddyAccountView } from '../lib/tauri';
@@ -65,7 +65,8 @@ function FreeUsageCell({
 
 export default function QuotaCenter() {
   const pushToast = useAppStore((s) => s.pushToast);
-  const [tab, setTab] = useState<'overview' | 'health'>('overview');
+  const [tab, setTab] = useState<'overview' | 'health' | 'events'>('overview');
+  const [gwEvents, setGwEvents] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [wbAccounts, setWbAccounts] = useState<WorkBuddyAccountView[]>([]);
   const [qoderAccounts, setQoderAccounts] = useState<QoderAccountView[]>([]);
@@ -96,6 +97,22 @@ export default function QuotaCenter() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // 网关事件时间线（观测性 #1）：进入页签拉一次 + 页签打开期间每 5s 轮询；
+  // 数据是内存环形缓冲（最近 300 条调度级事件），服务未运行时为空
+  const refreshEvents = useCallback(async () => {
+    try {
+      setGwEvents(await api.apiServer.apiRecentEvents(120));
+    } catch {
+      setGwEvents([]);
+    }
+  }, []);
+  useEffect(() => {
+    if (tab !== 'events') return;
+    void refreshEvents();
+    const t = setInterval(() => void refreshEvents(), 5000);
+    return () => clearInterval(t);
+  }, [tab, refreshEvents]);
 
   // 体检问题清单（跨家族）：免费档**按模型逐条**上报——一个账号的两个免费
   // 模型一个用完一个可用是常态，合并成「全部耗尽」会同时掩盖两种事实：
@@ -169,6 +186,7 @@ export default function QuotaCenter() {
         {([
           { key: 'overview', label: '额度总览', icon: Gauge },
           { key: 'health', label: '账号体检', icon: Stethoscope },
+          { key: 'events', label: '网关事件', icon: Activity },
         ] as const).map(({ key, label, icon: Icon }) => (
           <button
             key={key}
@@ -307,7 +325,7 @@ export default function QuotaCenter() {
             </div>
           </section>
         </div>
-      ) : (
+      ) : tab === 'health' ? (
         <div className="rounded-xl border border-slate-200 dark:border-zinc-800">
           {issues.length === 0 ? (
             <div className="flex flex-col items-center gap-2 p-8 text-center">
@@ -356,6 +374,42 @@ export default function QuotaCenter() {
                 ))}
               </tbody>
             </table>
+          )}
+        </div>
+      ) : (
+        /* 网关事件时间线（观测性 #1）：调度级事件（轮换/降权/让位/落池）
+           内存环形缓冲直读，5s 轮询——「号为什么被换/被罚」从此一屏可见 */
+        <div className="rounded-xl border border-slate-200 dark:border-zinc-800">
+          <div className="flex items-center justify-between border-b border-slate-100 px-4 py-2 dark:border-zinc-800">
+            <span className="text-xs text-slate-500 dark:text-zinc-400">
+              最近调度级事件（新→旧，5s 自动刷新；仅本次启动后，上限 300 条）
+            </span>
+            <button
+              className="flex items-center gap-1 text-xs text-slate-400 hover:text-brand-500"
+              onClick={() => void refreshEvents()}
+            >
+              <RefreshCw size={12} /> 刷新
+            </button>
+          </div>
+          {gwEvents.length === 0 ? (
+            <div className="flex flex-col items-center gap-2 p-8 text-center">
+              <Activity size={28} className="text-slate-300 dark:text-zinc-600" />
+              <div className="text-sm font-medium">暂无事件</div>
+              <div className="text-xs text-slate-400">
+                网关未运行，或启动后还没有轮换/降权类调度动作
+              </div>
+            </div>
+          ) : (
+            <div className="max-h-[420px] overflow-y-auto p-3">
+              {gwEvents.map((e, i) => (
+                <div
+                  key={i}
+                  className="whitespace-pre-wrap break-all rounded px-2 py-1 font-mono text-[11px] leading-relaxed text-slate-600 hover:bg-slate-50 dark:text-zinc-300 dark:hover:bg-zinc-800/60"
+                >
+                  {e}
+                </div>
+              ))}
+            </div>
           )}
         </div>
       )}

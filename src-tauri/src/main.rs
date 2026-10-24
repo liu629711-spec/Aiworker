@@ -264,6 +264,7 @@ fn main() {
             commands::api_server::pool_list,
             commands::api_server::pool_set,
             commands::api_server::pool_status,
+            commands::api_server::api_recent_events,
             commands::api_server::wb_pool_status,
             commands::api_server::qoder_pool_status,
             commands::api_server::qoder_model_cooldowns,

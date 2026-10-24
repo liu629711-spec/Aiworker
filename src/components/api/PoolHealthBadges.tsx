@@ -25,6 +25,12 @@ const REASON_LABELS: Record<string, string> = {
   client: '上游请求错误(4xx)',
   consecutive_errors: '连续错误熔断',
   refresh_token_invalid: '凭证失效',
+  // 2026-10-24 新增枚举：hard_credit_downgraded = 积分充足下的降级短冷却
+  //（原样直出用户不可判读）；quota_reset = 冻结到上游恢复时刻
+  hard_credit_downgraded: '额度受限·短冷却(积分充足)',
+  hard_credit_downgraded_model: '模型级额度受限(账号正常)',
+  quota_reset: '日额度受限',
+  hard_cooldown: '积分耗尽',
 };
 
 export function cooldownReasonLabel(reason: string | null | undefined): string {

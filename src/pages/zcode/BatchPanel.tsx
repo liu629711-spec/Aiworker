@@ -35,6 +35,7 @@ import type { BatchStatus, BatchTask } from '../../types';
 const STATUS_META: Record<string, { label: string; tone: 'slate' | 'green' | 'amber' | 'red' | 'blue' }> = {
   pending: { label: '排队中', tone: 'slate' },
   running: { label: '执行中', tone: 'blue' },
+  cancel_requested: { label: '取消中', tone: 'amber' },
   done: { label: '完成', tone: 'green' },
   failed: { label: '失败', tone: 'red' },
   canceled: { label: '已取消', tone: 'slate' },
@@ -210,6 +211,13 @@ export default function BatchPanel() {
         </div>
       )}
 
+      {/* 经济性提示（交互 #4）：入队前先估量——数字来自实测（docs 方案第七八节） */}
+      <div className="mb-3 rounded-lg border border-slate-100 bg-slate-50 px-3 py-2 text-[11px] leading-relaxed text-slate-500 dark:border-zinc-800 dark:bg-zinc-900/60 dark:text-zinc-400">
+        额度参考：单回合 headless 执行约消耗 <b>26 万 input tokens</b>（系统提示+skills+MCP 全量）；
+        夜间档（23:00–09:00）额度理论可跑 <b>~380 单/夜</b>，日间额度约 <b>11 单</b>。
+        排队前先估量，任务结果以 CLI 日志归因（provider_used）为准。
+      </div>
+
       {/* 窗口 / 容量 */}
       <div className="grid grid-cols-4 gap-3">
         <StatCard
@@ -331,9 +339,22 @@ export default function BatchPanel() {
                             {w.label}
                           </Badge>
                         )}
-                        <span className="min-w-0 flex-1 truncate text-xs text-slate-700 dark:text-zinc-200">
+                        <span className="min-w-0 flex-1 truncate text-xs text-slate-700 dark:text-zinc-200" title={t.prompt}>
                           {t.prompt}
                         </span>
+                        {t.status === 'failed' && t.error && (
+                          <span
+                            className="min-w-0 shrink truncate text-[11px] text-rose-500"
+                            title={t.error}
+                          >
+                            {t.error.split('\n')[0]}
+                          </span>
+                        )}
+                        {t.status === 'running' && t.started_at && (
+                          <span className="shrink-0 text-[11px] tabular-nums text-blue-500">
+                            已运行 {Math.max(0, Math.round((Date.now() - t.started_at * 1000) / 1000))}s
+                          </span>
+                        )}
                         {t.status === 'done' && <CheckCircle2 size={13} className="shrink-0 text-emerald-500" />}
                         <span className="shrink-0 text-[11px] text-slate-400">{fmtDuration(t.duration_ms)}</span>
                         <button
@@ -342,10 +363,17 @@ export default function BatchPanel() {
                         >
                           {open ? '收起' : '详情'}
                         </button>
-                        {t.status === 'pending' && (
+                        {(t.status === 'pending' || t.status === 'running' || t.status === 'cancel_requested') && (
                           <button
-                            className="shrink-0 text-slate-400 hover:text-rose-500"
-                            title="取消"
+                            className="shrink-0 text-slate-400 hover:text-rose-500 disabled:opacity-40"
+                            title={
+                              t.status === 'pending'
+                                ? '取消'
+                                : t.status === 'cancel_requested'
+                                  ? '已请求取消，等待本轮执行结束'
+                                  : '请求取消（CLI 无法安全中断，本轮执行完成后生效，最长等 5 分钟）'
+                            }
+                            disabled={t.status === 'cancel_requested'}
                             onClick={() => void act(`c${t.id}`, () => api.apiServer.zcodeBatchCancel(t.id))}
                           >
                             <X size={13} />
@@ -394,7 +422,9 @@ export default function BatchPanel() {
                           )}
                           {t.error && (
                             <div>
-                              <div className="text-[11px] font-medium text-rose-500">错误</div>
+                              <div className="text-[11px] font-medium text-rose-500">
+                                错误（首行已带分类前缀：超时/输出异常/CLI异常/其他）
+                              </div>
                               <pre className="mt-0.5 max-h-48 overflow-y-auto whitespace-pre-wrap break-all rounded bg-rose-50 p-2 text-[11px] leading-4 text-rose-600 dark:bg-rose-900/20 dark:text-rose-300">
                                 {t.error}
                               </pre>

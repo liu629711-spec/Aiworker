@@ -1087,7 +1087,30 @@ export default function QoderAccounts() {
                     <td className="px-4 py-3"><TokenBadge a={a} /></td>
                     <td className="px-4 py-3"><FingerprintBadge a={a} onOpen={setFpViewing} /></td>
                     <td className="px-4 py-3 text-right tabular-nums text-xs">
-                      {a.credits_balance != null ? a.credits_balance.toLocaleString() : '-'}
+                      <div title={a.credits_fetched_at ? `抓取于 ${a.credits_fetched_at}` : undefined}>
+                        {a.credits_balance != null ? a.credits_balance.toLocaleString() : '-'}
+                      </div>
+                      {(() => {
+                        // 新鲜度标注（设计 #3）：探测失败回退旧值且 30 分钟不重试，
+                        // 「显示有积分却被上游拒」的时差要可见（2026-10-23 用户困惑实录）
+                        const at = a.credits_fetched_at;
+                        if (!at) return <div className="text-[10px] text-slate-300 dark:text-zinc-600">未抓取</div>;
+                        const ts = new Date(at.replace(' ', 'T')).getTime();
+                        if (Number.isNaN(ts)) return null;
+                        const ageMin = Math.round((Date.now() - ts) / 60000);
+                        const stale = ageMin >= 30;
+                        return (
+                          <div
+                            className={`text-[10px] ${stale ? 'text-amber-500' : 'text-slate-400 dark:text-zinc-500'}`}
+                            title={`抓取于 ${at}${stale ? '；探测失败会沿用旧值，上游真实额度可能已变化' : ''}`}
+                          >
+                            {stale
+                              ? `延迟 ${ageMin >= 60 ? `${Math.floor(ageMin / 60)}h` : `${ageMin}m`}`
+                              : at.slice(11, 16)}{' '}
+                            抓取
+                          </div>
+                        );
+                      })()}
                     </td>
                     <td className="px-4 py-3">
                       <FreeModelsCell a={a} />

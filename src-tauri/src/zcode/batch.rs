@@ -85,6 +85,17 @@ pub struct BatchStatus {
     pub last_provider: Option<String>,
     /// CLI 入口是否探测到；None = 没找到，批处理不可用
     pub cli_entry: Option<String>,
+    /// 运行中/请求取消的任务（交互 #4：前端显示已运行时长 + 「完成后取消」提示）
+    pub running_task: Option<BatchRunningTask>,
+}
+
+/// 当前正在执行（或等待收尾取消）的任务
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchRunningTask {
+    pub id: i64,
+    pub started_at: i64,
+    /// true = 用户已请求取消，CLI 无法安全中断，执行完成后收尾兑现
+    pub cancel_requested: bool,
 }
 
 /// 批处理运行时（挂在 ZcodeState 上）
@@ -472,8 +483,15 @@ pub async fn list(db: &SqlitePool, limit: i64) -> Result<Vec<BatchTask>, String>
 }
 
 pub async fn cancel(db: &SqlitePool, id: i64) -> Result<(), String> {
+    // pending → 直接取消；running → 请求取消（CLI 无法安全中断，收尾时兑现，
+    // 交互 #4）：running 中改打 cancel_requested，run_one 收尾分支兑现
     sqlx::query("UPDATE batch_tasks SET status='canceled', finished_at=?1 WHERE id=?2 AND status='pending'")
         .bind(now())
+        .bind(id)
+        .execute(db)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query("UPDATE batch_tasks SET status='cancel_requested' WHERE id=?1 AND status='running'")
         .bind(id)
         .execute(db)
         .await
@@ -558,8 +576,32 @@ pub async fn run_one(db: &SqlitePool, force: bool) -> Result<bool, String> {
     .map_err(|e| format!("执行线程 panic: {e}"))?;
     let dur = started.elapsed().as_millis() as i64;
 
+    // 收尾前兑现取消请求（交互 #4）：执行期间用户可请求取消（CLI 无法安全
+    // 中断，单任务最长 5 分钟）——cancel_requested → canceled 并丢弃结果。
+    // 先读后写，调度单线程，竞态窗口仅毫秒级
+    let cancel_requested = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM batch_tasks WHERE id=?1 AND status='cancel_requested'",
+    )
+    .bind(id)
+    .fetch_one(db)
+    .await
+    .unwrap_or(0)
+        > 0;
+
     match res {
         Ok(o) => {
+            if cancel_requested {
+                sqlx::query(
+                    "UPDATE batch_tasks SET status='canceled', error='用户取消（执行完成后生效）', duration_ms=?1, finished_at=?2 WHERE id=?3",
+                )
+                .bind(dur)
+                .bind(now())
+                .bind(id)
+                .execute(db)
+                .await
+                .map_err(|e| e.to_string())?;
+                return Ok(true);
+            }
             sqlx::query(
                 "UPDATE batch_tasks SET status='done', result=?1, provider_used=?2, model_used=?3,
                  input_tokens=?4, output_tokens=?5, duration_ms=?6, finished_at=?7 WHERE id=?8",
@@ -577,10 +619,26 @@ pub async fn run_one(db: &SqlitePool, force: bool) -> Result<bool, String> {
             .map_err(|e| e.to_string())?;
         }
         Err(e) => {
+            // 错误分类前缀（交互 #4）：原始日志文本对用户不可判读，前缀一眼
+            // 分清「超时/输出异常/CLI异常/其他」→ 决定重跑有没有用
+            let tagged = format!("{}{}", classify_err(&e), e);
+            if cancel_requested {
+                sqlx::query(
+                    "UPDATE batch_tasks SET status='canceled', error=?1, duration_ms=?2, finished_at=?3 WHERE id=?4",
+                )
+                .bind("用户取消（执行完成后生效）")
+                .bind(dur)
+                .bind(now())
+                .bind(id)
+                .execute(db)
+                .await
+                .map_err(|e| e.to_string())?;
+                return Ok(true);
+            }
             sqlx::query(
                 "UPDATE batch_tasks SET status='failed', error=?1, duration_ms=?2, finished_at=?3 WHERE id=?4",
             )
-            .bind(&e)
+            .bind(&tagged)
             .bind(dur)
             .bind(now())
             .bind(id)
@@ -590,6 +648,19 @@ pub async fn run_one(db: &SqlitePool, force: bool) -> Result<bool, String> {
         }
     }
     Ok(true)
+}
+
+/// 错误分类前缀（交互 #4）：任务失败原因肉眼可分
+fn classify_err(e: &str) -> &'static str {
+    if e.contains("执行超时") {
+        "[超时] "
+    } else if e.contains("未返回可解析的 JSON") || e.contains("无 response 字段") {
+        "[输出异常] "
+    } else if e.contains("启动 CLI 失败") || e.contains("未找到 zcode.cjs") || e.contains("缺少 provider") {
+        "[CLI异常] "
+    } else {
+        "[其他] "
+    }
 }
 
 /// 汇总状态
@@ -629,6 +700,19 @@ pub async fn status(db: &SqlitePool, running: bool) -> BatchStatus {
     .ok()
     .flatten();
 
+    let running_task: Option<BatchRunningTask> = sqlx::query_as::<_, (i64, i64, String)>(
+        "SELECT id, started_at, status FROM batch_tasks WHERE status IN ('running','cancel_requested') ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .map(|(id, started_at, st)| BatchRunningTask {
+        id,
+        started_at,
+        cancel_requested: st == "cancel_requested",
+    });
+
     let open = window_open();
     BatchStatus {
         running,
@@ -639,6 +723,7 @@ pub async fn status(db: &SqlitePool, running: bool) -> BatchStatus {
         failed_today,
         last_provider,
         cli_entry: find_cli_entry().map(|p| p.display().to_string()),
+        running_task,
     }
 }
 
@@ -653,7 +738,7 @@ pub async fn status(db: &SqlitePool, running: bool) -> BatchStatus {
         // cancel 只认 pending、requeue 只认 failed/canceled、clear 不含 running，
         // 不回收则该行永远卡在「运行中」且三条恢复路都够不着它
         match sqlx::query(
-            "UPDATE batch_tasks SET status='failed', error=?1, finished_at=?2 WHERE status='running'",
+            "UPDATE batch_tasks SET status='failed', error=?1, finished_at=?2 WHERE status IN ('running','cancel_requested')",
         )
         .bind("应用中断，任务未完成")
         .bind(now())

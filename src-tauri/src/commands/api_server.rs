@@ -1417,6 +1417,24 @@ pub fn pool_status(runtime: State<'_, Mutex<Option<ApiServerRuntime>>>) -> Vec<P
     }
 }
 
+/// 网关事件时间线（额度中心「网关事件」页数据源，观测性 #1）：最近 N 条
+/// 调度级事件（轮换/降权/让位/落池），新→旧。内存环形缓冲，只反映本次
+/// 进程启动后的事件；服务未运行时返回空数组
+#[tauri::command]
+pub fn api_recent_events(
+    runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
+    limit: Option<usize>,
+) -> Vec<String> {
+    let guard = safe_lock(&runtime);
+    match guard.as_ref() {
+        Some(rt) => rt
+            .shared
+            .logger
+            .recent_sched_events(limit.unwrap_or(120).min(300)),
+        None => vec![],
+    }
+}
+
 /// 返回运行中 WB 池的实时状态（F-77⑤ 可观测：含 per-account inflight 在途计数）；
 /// 服务未运行时返回空数组
 #[tauri::command]

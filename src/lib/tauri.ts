@@ -886,6 +886,7 @@ export const api = {
     zcodeBatchClear: () => invoke<number>('zcode_batch_clear'),
     /** 立即跑一条（忽略时间窗；白天验通道用） */
     zcodeBatchRunNow: () => invoke<boolean>('zcode_batch_run_now'),
+    apiRecentEvents: (limit?: number) => invoke<string[]>('api_recent_events', { limit: limit ?? 120 }),
     zcodeBatchStart: () => invoke<boolean>('zcode_batch_start'),
     zcodeBatchStop: () => invoke<boolean>('zcode_batch_stop'),
     /** ② 免费模型用量计数快照（额度中心） */

@@ -1949,4 +1949,6 @@ export interface BatchStatus {
   last_provider: string | null;
   /** CLI 入口路径；null = 没探到，批处理不可用 */
   cli_entry: string | null;
+  /** 运行中/请求取消的任务（显示已运行时长 + 「完成后取消」提示） */
+  running_task: { id: number; started_at: number; cancel_requested: boolean } | null;
 }

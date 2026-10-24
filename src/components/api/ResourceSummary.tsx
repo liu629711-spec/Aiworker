@@ -483,6 +483,25 @@ function DispatchCenterCard({
             上游开关与成员在各应用「资源调度」页配置
           </span>
         </div>
+        {(() => {
+          // 负载均衡提示（设计 #5）：ExpireFirst/CreditFirst/Random 对「单会话
+          // 独占一号」零防御（2026-10-23 实测 buddy 池塌成单号），Weighted/P2C
+          // 有近窗防独占。空串语义 = 跟随 Trae 池，逐池算有效策略
+          const trae = pool?.strategy || 'expire_first';
+          const affected = [
+            { name: 'Trae', v: trae },
+            { name: 'Buddy', v: pool?.wb_strategy || trae },
+            { name: 'Qoder', v: pool?.qoder_strategy || trae },
+          ].filter((x) => x.v !== 'weighted' && x.v !== 'p2c');
+          if (affected.length === 0) return null;
+          return (
+            <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-relaxed text-amber-700 dark:border-amber-900/50 dark:bg-amber-900/20 dark:text-amber-300">
+              {affected.map((x) => x.name).join(' / ')} 池当前策略<b>不做负载均衡</b>
+              ：单个长会话会持续独占同一账号（易触发上游限频/断流）。
+              需要「近窗防独占 + 竞速降权」请选 <b>三因子加权随机</b> 或 <b>P2C 随机二选一</b>。
+            </div>
+          );
+        })()}
       </div>
     </div>
   );
