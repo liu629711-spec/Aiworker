@@ -935,13 +935,23 @@ impl ApiPool {
     /// 仅出该区账号（None = 不过滤，历史语义）。粘性绑定区不符 → None（调用方
     /// 回落正常取号——模型区域决定账号区域，粘性不得跨区续用）。
     pub fn pick_by_uid_region(&self, uid: &str, want_global: Option<bool>) -> Option<PickedAccount> {
+        self.pick_by_uid_region_free_tier(uid, want_global, false)
+    }
+
+    /// 同 [pick_by_uid_region]，`free_tier` = 免费档模型请求（零积分豁免）。
+    pub fn pick_by_uid_region_free_tier(
+        &self,
+        uid: &str,
+        want_global: Option<bool>,
+        free_tier: bool,
+    ) -> Option<PickedAccount> {
         let entries = safe_lock(&self.entries);
         let now = now_ts();
         let tried = HashSet::new();
         let reserve = self.reserve_credits();
         entries
             .get(uid)
-            .filter(|e| selectable(e, &tried, now, reserve))
+            .filter(|e| selectable_for_model(e, &tried, now, reserve, free_tier))
             .filter(|e| want_global.map_or(true, |w| e.global_region == w))
             .map(|e| PickedAccount {
                 uid: e.uid.clone(),
@@ -1021,10 +1031,33 @@ impl ApiPool {
         dedicated: Option<&str>,
         want_global: Option<bool>,
     ) -> Option<(PickedAccount, Option<String>)> {
+        self.pick_excluding_constrained_ev_region_free_tier(
+            tried,
+            allowed,
+            dedicated,
+            want_global,
+            false,
+        )
+    }
+
+    /// 同 [pick_excluding_constrained_ev_region]，`free_tier` = 本次请求命中免费档模型。
+    ///
+    /// `free_tier=true` 时零积分账号**仍参与选号**（见 `selectable_for_model` 的
+    /// 豁免说明）。其余维度（区域 / 白名单 / 冷却 / 并发 / 策略）完全一致。
+    /// Qoder 路由在请求入口用 `qoder_upstream::is_free_tier_model(model)` 判一次，
+    /// 循环内复用同一布尔——目录查询不做热路径重复解析。
+    pub fn pick_excluding_constrained_ev_region_free_tier(
+        &self,
+        tried: &HashSet<String>,
+        allowed: Option<&HashSet<String>>,
+        dedicated: Option<&str>,
+        want_global: Option<bool>,
+        free_tier: bool,
+    ) -> Option<(PickedAccount, Option<String>)> {
         // 专一模式：绑定账号 healthy 且未试错过 → 直接锁定（专一绑定不让位）
         if let Some(uid) = dedicated {
             if !tried.contains(uid) {
-                if let Some(p) = self.pick_by_uid_region(uid, want_global) {
+                if let Some(p) = self.pick_by_uid_region_free_tier(uid, want_global, free_tier) {
                     let mut entries = safe_lock(&self.entries);
                     if let Some(e) = entries.get_mut(uid) {
                         e.last_used = now_ts();
@@ -1039,7 +1072,7 @@ impl ApiPool {
         let reserve = self.reserve_credits();
         let all_cands: Vec<&PoolEntry> = entries
             .values()
-            .filter(|e| selectable(e, tried, now, reserve))
+            .filter(|e| selectable_for_model(e, tried, now, reserve, free_tier))
             .filter(|e| want_global.map_or(true, |w| e.global_region == w))
             .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
             .collect();
@@ -1300,7 +1333,19 @@ impl ApiPool {
         allowed: Option<&HashSet<String>>,
         want_global: Option<bool>,
     ) -> Option<(PickedAccount, Option<String>)> {
-        let sticky = self.pick_by_uid_region(sticky_uid, want_global)?;
+        self.pick_sticky_yield_region_free_tier(sticky_uid, allowed, want_global, false)
+    }
+
+    /// 同 [pick_sticky_yield_region]，`free_tier` = 免费档模型请求：
+    /// 粘性账号本身与让位候选都按免费档口径判可选（零积分豁免）。
+    pub fn pick_sticky_yield_region_free_tier(
+        &self,
+        sticky_uid: &str,
+        allowed: Option<&HashSet<String>>,
+        want_global: Option<bool>,
+        free_tier: bool,
+    ) -> Option<(PickedAccount, Option<String>)> {
+        let sticky = self.pick_by_uid_region_free_tier(sticky_uid, want_global, free_tier)?;
         let region_ok = |e: &PoolEntry| want_global.map_or(true, |w| e.global_region == w);
         let limit = self.concurrency_limit();
         let inflight = self.inflight_snapshot();
@@ -1320,7 +1365,10 @@ impl ApiPool {
             let tried = HashSet::new();
             entries
                 .values()
-                .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now, reserve))
+                .filter(|e| {
+                    e.uid != sticky_uid
+                        && selectable_for_model(e, &tried, now, reserve, free_tier)
+                })
                 .filter(|e| region_ok(e))
                 .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
                 .fold((false, false), |(any, idle), e| {
@@ -1346,7 +1394,9 @@ impl ApiPool {
         let tried = HashSet::new();
         let idle: Vec<&PoolEntry> = entries
             .values()
-            .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now, reserve))
+            .filter(|e| {
+                e.uid != sticky_uid && selectable_for_model(e, &tried, now, reserve, free_tier)
+            })
             .filter(|e| region_ok(e))
             .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
             .filter(|e| inflight_of(e, &inflight) < limit)
@@ -1527,6 +1577,61 @@ impl ApiPool {
                 );
             }
         }
+    }
+
+    /// note_error 的模型感知版。HardCredit 且号上积分仍 > 0 时（即「余额兜底
+    /// 降级」场景），整号罚站已被证明罚错范围：积分 > 0 说明不是整号没钱，
+    /// 被上游拒的只是某个模型/套餐的额度——整号 bench 会把其余可用模型一起
+    /// 按下，且每次期满都被下一个请求打回、循环罚站（2026-10-23 实测 30 分钟
+    /// 一循环持续整晚）。此时只按 (uid, model) 冷却被拒模型：上游文案解析出的
+    /// 恢复时刻（until_hint）优先，缺省 30 分钟。
+    ///
+    /// 返回 true = 已按模型降级处置（账号保持 healthy，调用方可据此跳过
+    /// unbinds_sticky——其他会话的粘性不该被一个模型的额度问题驱逐）；
+    /// false = 走 note_error 原路径（真·积分耗尽 / 无模型名 / 非 HardCredit）。
+    pub fn note_error_scoped(
+        &self,
+        uid: &str,
+        kind: ErrKind,
+        model: Option<&str>,
+        until_hint: Option<i64>,
+    ) -> bool {
+        if kind == ErrKind::HardCredit {
+            let credits_positive = {
+                let entries = safe_lock(&self.entries);
+                entries
+                    .get(uid)
+                    .is_some_and(|e| e.credits.is_some_and(|c| c > 0.0))
+            };
+            if credits_positive {
+                if let Some(m) = model {
+                    let now = now_ts();
+                    let until = until_hint.filter(|&t| t > now).unwrap_or(now + 30 * 60);
+                    self.per_model_cooldown_until(uid, m, until);
+                    // F-80 可观测：与 note_error 的 account cooldown 行同口径，
+                    // 带模型名——排查「哪个模型把号打罚站」可直接定位（原整号
+                    // 降级行不带模型，2026-10-23 排查时无法确认触发源）
+                    let ctx = safe_lock(&self.log_ctx).clone();
+                    if let Some((dir, label)) = ctx {
+                        let name = {
+                            let entries = safe_lock(&self.entries);
+                            entries.get(uid).map(|e| e.name.clone()).unwrap_or_default()
+                        };
+                        crate::fs_utils::app_log(
+                            &dir,
+                            &format!(
+                                "account cooldown: pool={label} acct={name} uid={uid} kind={} action=hard_credit_downgraded_model model={m} until={} (仅该模型，账号照常接单)",
+                                kind.as_str(),
+                                fmt_local_ts(until),
+                            ),
+                        );
+                    }
+                    return true;
+                }
+            }
+        }
+        self.note_error(uid, kind);
+        false
     }
 
     /// 把账号冷却精确延长到上游下发的恢复时刻（6004 日限额「将在 … UTC+8 重置」）。
@@ -1821,6 +1926,20 @@ impl ApiPool {
         self.selectable_stats_in_region(allowed, want_global).1 > 0
     }
 
+    /// 同 [has_selectable_in_region]，`free_tier` = 免费档模型请求口径
+    /// （零积分豁免）。dispatch 健康预检必须用它，否则会出现「池里明明有零积分号
+    /// 能打免费模型，预检却报 no healthy → 直接 503，执行路径的豁免根本没机会生效」。
+    pub fn has_selectable_in_region_free_tier(
+        &self,
+        allowed: Option<&HashSet<String>>,
+        want_global: Option<bool>,
+        free_tier: bool,
+    ) -> bool {
+        self.selectable_stats_in_region_excluding_free_tier(allowed, want_global, None, free_tier)
+            .1
+            > 0
+    }
+
     /// 可选账号统计（诊断用，issue #29）：返回 (池内可选总数, 白名单内可选数)。
     /// `allowed` 语义同 has_selectable_in（None = 不限）；供 NoHealthy 错误
     /// 消息携带「池健康数 / 白名单命中数」，帮助用户自查 Key 约束配置
@@ -1847,6 +1966,19 @@ impl ApiPool {
         want_global: Option<bool>,
         exclude_uid: Option<&str>,
     ) -> (usize, usize) {
+        self.selectable_stats_in_region_excluding_free_tier(allowed, want_global, exclude_uid, false)
+    }
+
+    /// 同 [selectable_stats_in_region_excluding]，`free_tier` = 免费档模型请求口径
+    /// （零积分豁免）。健康预检必须用同一口径，否则会出现「选号能取到、预检说
+    /// 无健康号」的自相矛盾（dispatch 在取号前先跑预检）。
+    pub fn selectable_stats_in_region_excluding_free_tier(
+        &self,
+        allowed: Option<&HashSet<String>>,
+        want_global: Option<bool>,
+        exclude_uid: Option<&str>,
+        free_tier: bool,
+    ) -> (usize, usize) {
         let entries = safe_lock(&self.entries);
         let now = now_ts();
         let tried = HashSet::new();
@@ -1857,7 +1989,7 @@ impl ApiPool {
             if Some(e.uid.as_str()) == exclude_uid {
                 continue;
             }
-            if selectable(e, &tried, now, reserve) {
+            if selectable_for_model(e, &tried, now, reserve, free_tier) {
                 total += 1;
                 if want_global.map_or(true, |w| e.global_region == w)
                     && allowed.map_or(true, |a| a.contains(&e.uid))
@@ -2014,6 +2146,27 @@ pub struct ZCodeSyncAccount {
 /// ZCode 套餐硬门闸在此处一并生效（模型无关的那一半）：画像已同步且模型集为空
 /// = 上游说这号没任何权益，任何模型都不该选它。模型/时段维度在 `pick_zcode` 里判。
 fn selectable(e: &PoolEntry, tried: &HashSet<String>, now: i64, reserve: f64) -> bool {
+    selectable_for_model(e, tried, now, reserve, false)
+}
+
+/// 模型感知版 [`selectable`]：`free_tier` = 本次请求命中的是**免费档模型**
+/// （上游目录 credits 倍率 = 0）。
+///
+/// 为什么要有这个参数（2026-10-23 用户裁决 B）：免费模型本身**不消耗通用积分**，
+/// 额度由上游按账号每日单独计。旧口径是「选号第一道闸门无条件查
+/// `credits <= 0`」，导致零积分账号连免费额度都打不了 —— 免费额度本来就是
+/// 「没钱的时候还能用」的那部分，被零积分过滤整号排除属于语义矛盾。
+/// 用户实况：8 个 Qoder 号里 4 个零积分，全部闲置，而免费模型额度照常每日重置。
+///
+/// 豁免范围**只有积分闸门**：healthy / 冷却 / 积分已过期 / 套餐权益 / 白名单
+/// 一律照旧生效——零积分不等于「这个号现在健康」。
+fn selectable_for_model(
+    e: &PoolEntry,
+    tried: &HashSet<String>,
+    now: i64,
+    reserve: f64,
+    free_tier: bool,
+) -> bool {
     if tried.contains(&e.uid) || !e.healthy(now) {
         return false;
     }
@@ -2033,9 +2186,14 @@ fn selectable(e: &PoolEntry, tried: &HashSet<String>, now: i64, reserve: f64) ->
     // 快照新鲜。陈旧快照 fail-open（缓存问题）：陈旧「高积分」照样会调度
     // 秃号，fail-closed 只会额外误杀；保鲜由启动刷新与 update_credits 拨新
     // （reserve=0 时等价原零积分过滤）
-    if let Some(c) = e.credits {
-        if c <= 0.0 || (c <= reserve && e.reserve_filter_active(now)) {
-            return false;
+    //
+    // 免费档豁免（2026-10-23 裁决 B）：请求打的是免费模型（目录倍率 0）时
+    // 不查积分——免费额度不消耗通用积分，零积分号照样能服务。
+    if !free_tier {
+        if let Some(c) = e.credits {
+            if c <= 0.0 || (c <= reserve && e.reserve_filter_active(now)) {
+                return false;
+            }
         }
     }
     true
@@ -2670,6 +2828,94 @@ mod tests {
         assert_eq!(pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap().uid, "uid_b");
     }
 
+    /// 免费档豁免（2026-10-23 裁决 B）：请求命中免费模型时，零积分账号仍可被选中。
+    ///
+    /// 语义边界必须锁住三条：
+    /// 1. 免费档 → 零积分可选（否则「积分用完了连免费额度也不能用」）
+    /// 2. 付费档 → 零积分仍出局（原行为不变，不放宽到付费模型）
+    /// 3. 健康/冷却闸门不受豁免影响（零积分 ≠ 这个号健康）
+    #[test]
+    fn free_tier_exempts_zero_credits_but_keeps_health_gates() {
+        // 场景一：池内只有零积分号 → 付费档取不到，免费档能取到
+        let pool = build_pool(&[("uid_zero", 0.0, 0)]);
+        assert!(
+            pool.pick_excluding_constrained(&HashSet::new(), None, None).is_none(),
+            "付费档：零积分号必须出局（原行为）"
+        );
+        let picked = pool
+            .pick_excluding_constrained_ev_region_free_tier(
+                &HashSet::new(),
+                None,
+                None,
+                None,
+                true,
+            )
+            .expect("免费档：零积分号应可选")
+            .0;
+        assert_eq!(picked.uid, "uid_zero");
+
+        // 场景二：零积分 + 有积分各一个 → 两种口径都能取到「有积分」那个优先可用，
+        // 但免费档两个都在候选集里（策略随机，故只断言能取到、且是池内某个号）
+        let pool = build_pool(&[("uid_zero", 0.0, 0), ("uid_paid", 10.0, 0)]);
+        assert_eq!(
+            pool.pick_excluding_constrained(&HashSet::new(), None, None).unwrap().uid,
+            "uid_paid"
+        );
+        let (free_pick, _) = pool
+            .pick_excluding_constrained_ev_region_free_tier(&HashSet::new(), None, None, None, true)
+            .expect("免费档至少能取到号");
+        assert!(
+            free_pick.uid == "uid_zero" || free_pick.uid == "uid_paid",
+            "免费档候选应含零积分号，实际 {}",
+            free_pick.uid
+        );
+
+        // 场景三：积分已过期的号即便免费档也不选（过期是凭证类问题，不是额度问题）
+        let pool = build_pool(&[("uid_exp", 10.0, 1)]);
+        assert!(
+            pool.pick_excluding_constrained_ev_region_free_tier(
+                &HashSet::new(),
+                None,
+                None,
+                None,
+                true,
+            )
+            .is_none(),
+            "积分已过期不得因免费档豁免而可选"
+        );
+    }
+
+    /// 健康预检的免费档口径（2026-10-23 关键修复）：
+    /// dispatch 预检若用普通口径，会在「池里只有零积分号 + 请求免费模型」时
+    /// 直接判 no healthy → 503，执行路径的免费豁免根本没机会生效。
+    /// 实测证据：19:42:32 `model=qoder/Qwen3.8-Flash@cn` 报
+    /// `healthy=3 ... 503`，而 19:42:39 同一模型的裸名请求 200 成功。
+    #[test]
+    fn free_tier_preselect_counts_zero_credit_accounts() {
+        // 池内全是零积分号
+        let pool = build_pool(&[("uid_zero", 0.0, 0)]);
+        // 普通口径：预检判不健康（旧行为，正是导致 503 的那条）
+        assert!(
+            !pool.has_selectable_in_region_free_tier(None, None, false),
+            "普通口径：零积分号不算健康"
+        );
+        // 免费档口径：预检必须放行，否则执行路径的豁免永远走不到
+        assert!(
+            pool.has_selectable_in_region_free_tier(None, None, true),
+            "免费档：零积分号应被预检视为可用"
+        );
+
+        // 有积分时两种口径都应放行（豁免不能反过来把正常号排除）
+        let pool2 = build_pool(&[("uid_paid", 10.0, 0)]);
+        assert!(pool2.has_selectable_in_region_free_tier(None, None, false));
+        assert!(pool2.has_selectable_in_region_free_tier(None, None, true));
+
+        // 空池两种口径都必须判不健康（不能因为豁免变成永远健康）
+        let empty = build_pool(&[]);
+        assert!(!empty.has_selectable_in_region_free_tier(None, None, false));
+        assert!(!empty.has_selectable_in_region_free_tier(None, None, true));
+    }
+
     #[test]
     fn group_filter_excludes_unselected_groups() {
         let pool = ApiPool::new();
@@ -2987,6 +3233,66 @@ mod tests {
         assert!(pool.pick_by_uid("uid_a").is_none(), "被冻账号不可取号");
         assert!(pool.pick_by_uid("uid_b").is_some(), "另一账号应顶上");
         assert!(pool.has_selectable());
+    }
+
+    // ============ HardCredit 余额兜底降级：整号罚站 → 按模型罚（2026-10-23） ============
+
+    /// 积分 > 0 时 HardCredit 降级应只按 (uid, model) 冷却，账号保持 healthy。
+    /// 整号罚站会把其余可用模型一起按下，且每次期满都被下一个请求打回、
+    /// 30 分钟循环整晚（2026-10-23 实测 qd-c0c65a0d4561 五轮）。
+    #[test]
+    fn hard_credit_downgrade_scopes_to_model_when_credits_positive() {
+        let pool = build_pool(&[("uid_a", 903.0, 0)]);
+        let handled =
+            pool.note_error_scoped("uid_a", ErrKind::HardCredit, Some("qwen3.8-max"), None);
+        assert!(handled, "积分>0 的 HardCredit 应按模型降级");
+        {
+            let entries = safe_lock(&pool.entries);
+            let e = entries.get("uid_a").unwrap();
+            assert_eq!(e.until, 0, "账号级 until 不应被设置");
+            assert_eq!(e.hard_until, 0, "整号硬冻结不应触发");
+            assert!(e.reason.is_empty(), "账号行不应再挂降级原因");
+            assert!(
+                e.per_model_cooldowns.contains_key("qwen3.8-max"),
+                "被拒模型应进按模型冷却"
+            );
+        }
+        // 被拒模型进冷却，账号对其他模型照常可选
+        assert!(pool.is_model_cooling("uid_a", "qwen3.8-max"));
+        assert!(!pool.is_model_cooling("uid_a", "deepseek-v4.1-flash"));
+        assert!(pool.has_selectable(), "账号不应被整号冻结波及");
+    }
+
+    /// 上游文案带恢复时刻时直接冻到该时刻（消灭 30 分钟循环重探）
+    #[test]
+    fn hard_credit_downgrade_prefers_upstream_reset_hint() {
+        let pool = build_pool(&[("uid_a", 903.0, 0)]);
+        let reset = now_ts() + 5 * 3600;
+        pool.note_error_scoped("uid_a", ErrKind::HardCredit, Some("m1"), Some(reset));
+        let entries = safe_lock(&pool.entries);
+        assert_eq!(
+            entries
+                .get("uid_a")
+                .unwrap()
+                .per_model_cooldowns
+                .get("m1")
+                .copied(),
+            Some(reset),
+            "恢复时刻应原样采信"
+        );
+    }
+
+    /// 真积分耗尽（credits<=0）仍整号硬冻结到 04:00——按模型降级只属于
+    /// 「积分还在」场景，不许把真耗尽稀释成单模型冷却
+    #[test]
+    fn hard_credit_true_exhaustion_still_freezes_whole_account() {
+        let pool = build_pool(&[("uid_a", 0.0, 0)]);
+        let handled = pool.note_error_scoped("uid_a", ErrKind::HardCredit, Some("m1"), None);
+        assert!(!handled, "积分耗尽应走原整号路径");
+        let entries = safe_lock(&pool.entries);
+        let e = entries.get("uid_a").unwrap();
+        assert!(e.hard_until > now_ts(), "整号硬冻结应触发");
+        assert!(e.per_model_cooldowns.is_empty());
     }
 
     /// 回归（2026-10-18 海外池实测）：模型级冷却表按裸模型名记账、不区分账号，

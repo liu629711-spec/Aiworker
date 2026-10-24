@@ -295,7 +295,16 @@ fn pool_has_other_selectable(
 /// 只在免费档模型上记录：付费模型额度不足属常规冷却（HardCredit 已有 04:00
 /// 恢复机制），标成「免费额度用完」会误导。目录查询失败（无免费档信息）时
 /// 静默跳过——不写比写错好。
-fn note_free_quota_exhausted(data_dir: &std::path::Path, uid: &str, model: &str) {
+/// `want_global` = 本次请求实际走的区域（None/未知时按「两区都标」的旧语义兜底）。
+/// 必须带上它（2026-10-23 修复）：两区**额度独立**，只按模型名标会把
+/// 国内区的耗尽记录串到海外条目上——界面表现为「两个 Qwen3.8-Flash 都已用完」，
+/// 而实际可能只有一区用完，另一区还能用。
+fn note_free_quota_exhausted(
+    data_dir: &std::path::Path,
+    uid: &str,
+    model: &str,
+    want_global: Option<bool>,
+) {
     // 匹配口径：账号现有 free_models 快照为主（该账号实际区域已由回写固化），
     // 目录现查为辅（快照尚未生成的首轮场景）。两侧任一命中即认定为免费档——
     // 倍率由上游按区下发，按账号自己的快照判定比按全局清单更贴合
@@ -352,15 +361,32 @@ fn note_free_quota_exhausted(data_dir: &std::path::Path, uid: &str, model: &str)
     // 直接死掉 → 客户端收到零字节 SSE → 报 empty_model_response /
     // 未返回任何内容；非流式则变成 500 internal_error。这就是「国内 Qoder
     // 完全不能用」的直接原因。
+    // 区域匹配：两区额度独立，只给「本次实际走的那个区」打标。
+    // 快照去重后 region="" 表示「两区同名同倍率合并成一条」，此时按 id 命中即可
+    // （那条记录就是两区的共同视图，标它是对的）。
+    let region_hit = |m: &Value| -> bool {
+        let same_id = m
+            .get("id")
+            .and_then(Value::as_str)
+            .map(|id| id.eq_ignore_ascii_case(model))
+            .unwrap_or(false);
+        if !same_id {
+            return false;
+        }
+        match (want_global, m.get("region").and_then(Value::as_str)) {
+            // 未知区域 → 按旧语义（命中任意区）
+            (None, _) => true,
+            // 合并条目（region=""）→ 命中
+            (_, Some("")) | (_, None) => true,
+            (Some(true), Some("global")) => true,
+            (Some(false), Some("cn")) => true,
+            _ => false,
+        }
+    };
     let mut updated = false;
     if let Some(models) = a.get_mut("free_models").and_then(Value::as_array_mut) {
         for m in models.iter_mut() {
-            let hit = m
-                .get("id")
-                .and_then(Value::as_str)
-                .map(|id| id.eq_ignore_ascii_case(model))
-                .unwrap_or(false);
-            if hit {
+            if region_hit(m) {
                 if let Some(obj) = m.as_object_mut() {
                     obj.insert("exhausted_at".to_string(), json!(now));
                 }
@@ -375,12 +401,7 @@ fn note_free_quota_exhausted(data_dir: &std::path::Path, uid: &str, model: &str)
         let reset_str = super::pool::fmt_local_ts(super::pool::next_0000(now_ts()));
         if let Some(models) = a.get_mut("free_models").and_then(Value::as_array_mut) {
             for m in models.iter_mut() {
-                let hit = m
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(|id| id.eq_ignore_ascii_case(model))
-                    .unwrap_or(false);
-                if hit {
+                if region_hit(m) {
                     // 同上：insert 而非 IndexMut（键缺失会 panic）
                     if let Some(obj) = m.as_object_mut() {
                         obj.insert("reset_at".to_string(), json!(reset_str));
@@ -707,6 +728,8 @@ fn race_qoder_first_byte(
     dedicated: Option<&str>,
     primary_session_ids: &Option<(String, String, String)>,
     want_global: bool,
+    // 免费档模型请求（零积分账号参与选号，见 pool::selectable_for_model）
+    free_tier: bool,
 ) -> Result<QoderRaceWin, ()> {
     let hedge_ms = state
         .qoder_hedge_threshold_ms
@@ -733,7 +756,7 @@ fn race_qoder_first_byte(
     let spawn_backup = move || -> Option<(Box<dyn std::io::Read + Send>, QoderHedgeLease)> {
         let (picked2, ev) = state2
             .qoder_pool
-            .pick_excluding_constrained_ev_region(&tried2, allowed2.as_ref(), dedicated2.as_deref(), Some(want_global))?;
+            .pick_excluding_constrained_ev_region_free_tier(&tried2, allowed2.as_ref(), dedicated2.as_deref(), Some(want_global), free_tier)?;
         // F-77⑤ 可观测：对冲取号同样记录 busy 让位/降级事件
         if let Some(ev) = ev {
             state2.logger.log_sched_event(&ev);
@@ -975,6 +998,10 @@ fn run_qoder_stream(
         },
     };
 
+    // 免费档判定（2026-10-23 裁决 B）：免费模型不消耗通用积分，选号时对零积分
+    // 账号豁免。入口算一次，循环内复用（目录查询不做热路径重复解析）。
+    let free_tier = qoder_upstream::is_free_tier_model(model);
+
     // F-80-余 v2 会话粘性（开关关闭时恒 None，v1 轮换行为零变化）：粘性命中且
     // 账号在池 → 首选粘住账号（busy 且有空闲候选时让位，F-77④ 同构）；子 Key
     // 限定上游不含粘性账号时忽略粘性。同账号 + 同种子派生同一上游 session_id
@@ -991,7 +1018,9 @@ fn run_qoder_stream(
                         if allowed_set.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
                             return None;
                         }
-                        state.qoder_pool.pick_by_uid_region(&b.uid, Some(want_global)).map(|_| b.uid)
+                        state.qoder_pool
+                            .pick_by_uid_region_free_tier(&b.uid, Some(want_global), free_tier)
+                            .map(|_| b.uid)
                     })
             } else {
                 None
@@ -1012,7 +1041,12 @@ fn run_qoder_stream(
     let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
         state
             .qoder_pool
-            .pick_sticky_yield_region(u, allowed_set.as_ref(), Some(want_global))
+            .pick_sticky_yield_region_free_tier(
+                u,
+                allowed_set.as_ref(),
+                Some(want_global),
+                free_tier,
+            )
             .map(|(p, ev)| {
                 if let Some(ev) = ev {
                     state.logger.log_sched_event(&ev);
@@ -1046,7 +1080,7 @@ fn run_qoder_stream(
             Some(p) => p,
             None => match state
                 .qoder_pool
-                .pick_excluding_constrained_ev_region(&tried, allowed_set.as_ref(), dedicated.as_deref(), Some(want_global))
+                .pick_excluding_constrained_ev_region_free_tier(&tried, allowed_set.as_ref(), dedicated.as_deref(), Some(want_global), free_tier)
             {
                 Some((p, ev)) => {
                     if let Some(ev) = ev {
@@ -1072,7 +1106,7 @@ fn run_qoder_stream(
                         // 空完成主导 → 明示渠道指纹拦截语义（账号/模型无关，提示更新
                         // wb_template_map.json），否则维持无健康账号文案；
                         // code 保持 no_healthy_account（客户端兼容）
-                        let (healthy_total, _) = state.qoder_pool.selectable_stats_in_region(None, Some(want_global));
+                        let (healthy_total, _) = state.qoder_pool.selectable_stats_in_region_excluding_free_tier(None, Some(want_global), None, free_tier);
                         super::routes::exhaust_message(empty_hits, tried.len(), healthy_total)
                     };
                     state.logger.log_request(
@@ -1277,6 +1311,7 @@ fn run_qoder_stream(
                         dedicated.as_deref(),
                         &envelope_ids,
                         want_global,
+                        free_tier,
                     ) {
                         Ok(w) => w,
                         Err(()) => {
@@ -1299,7 +1334,7 @@ fn run_qoder_stream(
                     let win_session_ids = race.session_ids.clone().or_else(|| envelope_ids.clone());
                     // 竞速胜者行源（原始上游行）统一翻译后喂 stream_forward_ex
                     let ilines = translate_race_lines(race, err_slot.clone(), chat_id, model);
-                    let (error_info, sent_any, failed_inline, usage) =
+                    let (error_info, sent_any, failed_inline, _eof_truncated, usage) =
                         // Qoder 无 namespace 展平编码（Responses 分支为防御性兜底，
                         // 实际仅 OpenAi/Anthropic 可达）→ 空集合禁用编码名拆分（审查 F4）
                         wb_sse::stream_forward_ex(ilines, tx, proto, chat_id, model, &std::collections::HashSet::new());
@@ -1409,9 +1444,26 @@ fn run_qoder_stream(
                                             .unwrap_or(false)
                                             || super::wb_route::soft_rate_model_only(raw_msg));
                                     if ek != ErrKind::None && !model_level_quota {
-                                        state.qoder_pool.note_error(&win_uid, ek);
-                                        // issue #67：硬冷却/禁用类错误解绑该账号粘性
-                                        if ek.unbinds_sticky() {
+                                        // HardCredit 余额兜底降级改按模型（2026-10-23）：
+                                        // 积分>0 时整号罚站会误伤其余可用模型，且每次期满
+                                        // 都被下一个请求打回、30 分钟循环整晚。上游文案带
+                                        // 恢复时刻则直接冻到该时刻，否则 30 分钟
+                                        let reset_hint = if ek == ErrKind::HardCredit {
+                                            super::wb_route::parse_quota_reset_at(raw_msg)
+                                        } else {
+                                            None
+                                        };
+                                        let scoped = state.qoder_pool.note_error_scoped(
+                                            &win_uid,
+                                            ek,
+                                            Some(model),
+                                            reset_hint,
+                                        );
+                                        // issue #67：硬冷却/禁用类错误解绑该账号粘性。
+                                        // 按模型降级时账号仍健康，不解绑——该会话下轮由
+                                        // is_model_cooling 跳过被冷模型，模型恢复后粘性
+                                        // 会话回到原号命中上游缓存
+                                        if !scoped && ek.unbinds_sticky() {
                                             state.qoder_sticky.unbind_uid(&win_uid);
                                         }
                                     }
@@ -1428,7 +1480,7 @@ fn run_qoder_stream(
                                     // 2026-10-22 收紧：Quota 不写 free_models 耗尽标注
                                     // （付费模型被 Quota 误标成「免费额度用完」；见 HTTP 分支说明）
                                     if kind == UpstreamKind::FreeQuota || model_level_quota {
-                                        note_free_quota_exhausted(&state.data_dir, &win_uid, model);
+                                        note_free_quota_exhausted(&state.data_dir, &win_uid, model, Some(want_global));
                                     }
                                     if kind == UpstreamKind::FreeQuota || model_level_quota {
                                         // 优先采信上游给的精确恢复时刻；解析不到才退回
@@ -1668,9 +1720,22 @@ fn run_qoder_stream(
                                 && (super::wb_route::soft_rate_model_only(&classified.message)
                                     || super::wb_route::soft_rate_model_only(&resp_body));
                             if kind != ErrKind::None && !model_level_quota {
-                                state.qoder_pool.note_error(&picked.uid, kind);
+                                // HardCredit 余额兜底降级改按模型（同流式分支 2026-10-23）：
+                                // 积分>0 时只罚被拒模型，恢复时刻优先采信上游文案
+                                let reset_hint = if kind == ErrKind::HardCredit {
+                                    super::wb_route::parse_quota_reset_at(&resp_body)
+                                } else {
+                                    None
+                                };
+                                let scoped = state.qoder_pool.note_error_scoped(
+                                    &picked.uid,
+                                    kind,
+                                    Some(model),
+                                    reset_hint,
+                                );
                                 // issue #67：硬冷却/禁用类错误解绑该账号粘性
-                                if kind.unbinds_sticky() {
+                                // （按模型降级时账号仍健康，保留粘性同流式分支）
+                                if !scoped && kind.unbinds_sticky() {
                                     state.qoder_sticky.unbind_uid(&picked.uid);
                                 }
                             }
@@ -1689,7 +1754,7 @@ fn run_qoder_stream(
                             if classified.kind == UpstreamKind::FreeQuota
                                 || model_level_quota
                             {
-                                note_free_quota_exhausted(&state.data_dir, &picked.uid, model);
+                                note_free_quota_exhausted(&state.data_dir, &picked.uid, model, Some(want_global));
                             }
                             if classified.kind == UpstreamKind::FreeQuota || model_level_quota {
                                 let (reset_ts, inferred) = free_quota_reset_ts(&resp_body);
@@ -1839,6 +1904,9 @@ pub async fn qoder_aggregate_chat(
             },
         };
 
+        // 免费档判定（2026-10-23 裁决 B）：同 run_qoder_stream
+        let free_tier = qoder_upstream::is_free_tier_model(&model);
+
         // F-80-余 v2 会话粘性（同 run_qoder_stream；开关关闭恒 None 保持 v1 行为）
         let sticky_key = SessionKey::from_body(&peek);
         let sticky0: Option<String> = if state
@@ -1852,7 +1920,7 @@ pub async fn qoder_aggregate_chat(
                 if allowed_set.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
                     return None;
                 }
-                state.qoder_pool.pick_by_uid_region(&b.uid, Some(want_global)).map(|_| b.uid)
+                state.qoder_pool.pick_by_uid_region_free_tier(&b.uid, Some(want_global), free_tier).map(|_| b.uid)
             })
     } else {
         None
@@ -1867,7 +1935,12 @@ pub async fn qoder_aggregate_chat(
         let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
             state
                 .qoder_pool
-                .pick_sticky_yield_region(u, allowed_set.as_ref(), Some(want_global))
+                .pick_sticky_yield_region_free_tier(
+                    u,
+                    allowed_set.as_ref(),
+                    Some(want_global),
+                    free_tier,
+                )
                 .map(|(p, ev)| {
                     if let Some(ev) = ev {
                         state.logger.log_sched_event(&ev);
@@ -1923,7 +1996,7 @@ pub async fn qoder_aggregate_chat(
                             )
                         } else {
                             // 审查 P2：轮换耗尽收尾对齐 routes.rs——空完成主导 → 指纹拦截语义
-                            let (healthy_total, _) = state.qoder_pool.selectable_stats_in_region(None, Some(want_global));
+                            let (healthy_total, _) = state.qoder_pool.selectable_stats_in_region_excluding_free_tier(None, Some(want_global), None, free_tier);
                             super::routes::exhaust_message(empty_hits, tried.len(), healthy_total)
                         };
                         // issue #99 ①：影子风控收尾落原始指纹样本（非流式路径无收尾
@@ -2042,6 +2115,7 @@ pub async fn qoder_aggregate_chat(
                             dedicated.as_deref(),
                             &envelope_ids,
                             want_global,
+                            free_tier,
                         ) {
                             Ok(w) => w,
                             Err(()) => {
@@ -2183,16 +2257,29 @@ pub async fn qoder_aggregate_chat(
                                                 .unwrap_or(false)
                                                 || super::wb_route::soft_rate_model_only(raw_msg));
                                         if ek != ErrKind::None && !model_level_quota {
-                                            state.qoder_pool.note_error(&win_uid, ek);
-                                            // issue #67 审查修复：账号级长冷却解绑粘性（与流式分支口径对齐）
-                                            if ek.unbinds_sticky() {
+                                            // HardCredit 余额兜底降级改按模型（同流式分支
+                                            // 2026-10-23）：积分>0 时只罚被拒模型
+                                            let reset_hint = if ek == ErrKind::HardCredit {
+                                                super::wb_route::parse_quota_reset_at(raw_msg)
+                                            } else {
+                                                None
+                                            };
+                                            let scoped = state.qoder_pool.note_error_scoped(
+                                                &win_uid,
+                                                ek,
+                                                Some(model.as_str()),
+                                                reset_hint,
+                                            );
+                                            // issue #67 审查修复：账号级长冷却解绑粘性（与流式分支口径对齐）。
+                                            // 按模型降级时账号仍健康，保留粘性同流式分支
+                                            if !scoped && ek.unbinds_sticky() {
                                                 state.qoder_sticky.unbind_uid(&win_uid);
                                             }
                                         }
                                         // 免费额度耗尽：同流式分支（(uid,model) 冷却，
                                         // 不整号冻结）
                                         if kind == UpstreamKind::FreeQuota || model_level_quota {
-                                            note_free_quota_exhausted(&state.data_dir, &win_uid, &model);
+                                            note_free_quota_exhausted(&state.data_dir, &win_uid, &model, Some(want_global));
                                         }
                                         if kind == UpstreamKind::FreeQuota || model_level_quota {
                                             let raw = meta.as_ref().map(|m| m.raw.as_str()).unwrap_or("");
@@ -2332,7 +2419,7 @@ pub async fn qoder_aggregate_chat(
                                 // 免费档模型额度耗尽记录（免费额度可见性）：同流式
                                 // 分支，Quota 与 FreeQuota 都记标注
                                 if classified.kind == UpstreamKind::FreeQuota || model_level_quota {
-                                    note_free_quota_exhausted(&state.data_dir, &picked.uid, &model);
+                                    note_free_quota_exhausted(&state.data_dir, &picked.uid, &model, Some(want_global));
                                 }
                                 if classified.kind == UpstreamKind::FreeQuota || model_level_quota {
                                     let (reset_ts, inferred) = free_quota_reset_ts(&resp_body);

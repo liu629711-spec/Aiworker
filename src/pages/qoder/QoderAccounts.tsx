@@ -35,6 +35,7 @@ import PageHeader from '../../components/PageHeader';
 import SwitchProgressPanel from '../../components/SwitchProgressPanel';
 import { Badge, EmptyState, Modal } from '../../components/ui';
 import { api, type ProfileDoneEvent } from '../../lib/tauri';
+import { freeQuotaState, isQuotaStillExhausted } from '../../lib/freeQuota';
 import { GroupSelect } from '../accounts/GroupSelect';
 import { GroupsModal, computePoolBadges } from '../accounts/GroupsModal';
 import { TagChips } from '../accounts/TagSelect';
@@ -138,10 +139,14 @@ function FreeModelsCell({ a }: { a: QoderAccountView }) {
       </span>
     );
   }
-  const exhausted = models.filter((m) => m.exhausted_at);
+  const exhausted = models.filter((m) => isQuotaStillExhausted(m));
   const title = [
     ...models.map((m) => {
       if (!m.exhausted_at) return `${m.name}（${m.region || '—'}）：可用`;
+      // 已过恢复时刻 → 说「已恢复」，不能说「已用完」（见 lib/freeQuota 说明）
+      if (!isQuotaStillExhausted(m)) {
+        return `${m.name}（${m.region || '—'}）：已恢复（${m.exhausted_at} 曾用完，${m.reset_at ?? ''} 重置）`;
+      }
       const reset = m.reset_at ? `，${m.reset_at} 恢复` : '';
       return `${m.name}（${m.region || '—'}）：已用完 ${m.exhausted_at}${reset}`;
     }),
@@ -159,13 +164,17 @@ function FreeModelsCell({ a }: { a: QoderAccountView }) {
   // 区分状态在暗色主题/色弱场景下不可靠，文字才是无歧义信号
   return (
     <div className="flex flex-col items-start gap-0.5" title={title}>
-      {models.map((m) => (
-        <Badge key={`${m.region || 'cn'}:${m.id}`} tone={m.exhausted_at ? 'amber' : 'green'}>
-          <Sparkles size={10} className="mr-1" />
-          {m.name}
-          {m.exhausted_at && <span className="ml-0.5 opacity-70">·已用完</span>}
-        </Badge>
-      ))}
+      {models.map((m) => {
+        const { used, recovered } = freeQuotaState(m);
+        return (
+          <Badge key={`${m.region || 'cn'}:${m.id}`} tone={used ? 'amber' : 'green'}>
+            <Sparkles size={10} className="mr-1" />
+            {m.name}
+            {used && <span className="ml-0.5 opacity-70">·已用完</span>}
+            {recovered && <span className="ml-0.5 opacity-70">·已恢复</span>}
+          </Badge>
+        );
+      })}
       {resetHint && (
         <span className="text-[10px] text-slate-400">{resetHint}</span>
       )}

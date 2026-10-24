@@ -764,18 +764,42 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
             // 与余额同链路刷新（同源目录，账号间无差异）。刷新时刻 = 订阅周期
             // 重置（nextResetAt）——上游按周期发放免费额度，无该字段时沿用
             // credits_expire_at（最早积分包到期）。
+            // 免费档模型清单 + 刷新时间（免费额度可见性）：目录 rate=0 的模型快照。
+            //
+            // **按账号自己所属区域过滤**（2026-10-23 修复「两个 Qwen3.8-Flash」）：
+            // 两区目录各有一条同名免费模型，账号只能用本区的免费额度。
+            // 原实现直接把两区并集写给每个账号 → 每行都显示两条一模一样的
+            // Qwen3.8-Flash，用户看到的是「重复」，不是「两区各有额度」。
+            // 口径与 qoder_catalog.rs 的目录同步路径一致（region 缺失按国内处理）。
             let free_models = crate::tasks::qoder_upstream::free_tier_models();
             if !free_models.is_empty() {
-                // 保留既有 exhausted_at 标注（额度错误码驱动记录，见 qoder_route），
-                // 目录刷新只换 id/name/rate/region——避免刷新即抹掉耗尽历史
-                let prev: Vec<Value> = a
-                    .get("free_models")
-                    .and_then(Value::as_array)
+                let account_global = a.get("region").and_then(Value::as_str) == Some("global");
+                let region_free: Vec<Value> = free_models
+                    .iter()
+                    .filter(|m| {
+                        let r = m.get("region").and_then(Value::as_str);
+                        // 合并条目（region=""）两区通用；单区条目只给同区账号
+                        match r {
+                            Some("") | None => true,
+                            Some("global") => account_global,
+                            Some("cn") => !account_global,
+                            _ => false,
+                        }
+                    })
                     .cloned()
-                    .unwrap_or_default();
-                let merged = crate::tasks::qoder_upstream::merge_free_models(&prev, &free_models);
-                a["free_models"] = json!(merged);
-                a["free_models_fetched_at"] = json!(fs_utils::now_iso());
+                    .collect();
+                if !region_free.is_empty() {
+                    // 保留既有 exhausted_at 标注（额度错误码驱动记录，见 qoder_route），
+                    // 目录刷新只换 id/name/rate/region——避免刷新即抹掉耗尽历史
+                    let prev: Vec<Value> = a
+                        .get("free_models")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let merged = crate::tasks::qoder_upstream::merge_free_models(&prev, &region_free);
+                    a["free_models"] = json!(merged);
+                    a["free_models_fetched_at"] = json!(fs_utils::now_iso());
+                }
             }
             // 套餐档位回填（v3.7.x）：行内 plan_tier 非空且与池内不同才更新（幂等，
             // 顺带把存量账号空套餐补齐、旧值如 "Pro Trial" 归一为展示名）

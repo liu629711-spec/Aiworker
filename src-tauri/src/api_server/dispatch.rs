@@ -617,6 +617,20 @@ pub fn resolve_target(
             .and_then(|c| c.want_global)
     };
 
+    // 免费档判定（与执行路径 qoder_route 同口径）：只对 Qoder 池有意义——
+    // Qoder 免费模型不消耗通用积分，零积分号也能服务。预检必须同样豁免，
+    // 否则「池里有零积分号能打免费模型」会被预检判成 no healthy 直接 503。
+    let free_tier_for = |pool: TargetPool| -> bool {
+        match pool {
+            TargetPool::Qoder => sources
+                .qoder
+                .as_deref()
+                .map(super::super::tasks::qoder_upstream::is_free_tier_model)
+                .unwrap_or(false),
+            _ => false,
+        }
+    };
+
     // 会话池粘性（§4.4 软粘，TTL 60s，内存态不落盘）：命中且池仍可用 → 直接沿用。
     // Key 绑定池优先于粘性：粘性池 ≠ 绑定池时不沿用（重新按候选序选池）
     let sticky_key = pool_session_key(body);
@@ -630,7 +644,7 @@ pub fn resolve_target(
         if let Some(pool) = sticky_pool {
             if bind.map_or(true, |b| pool.as_str() == b)
                 && sources.available(pool, trae_enabled, wb_enabled, qoder_enabled, zcode_enabled)
-                && pool_healthy(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref(), key_region_for(pool))
+                && pool_healthy(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref(), key_region_for(pool), free_tier_for(pool))
             {
                 record_sticky(state, sk, pool);
                 return Ok(Resolved {
@@ -705,7 +719,7 @@ pub fn resolve_target(
         if !sources.available(pool, trae_enabled, wb_enabled, qoder_enabled, zcode_enabled) {
             continue;
         }
-        match pool_health(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref(), key_region_for(pool)) {
+        match pool_health(state, pool, &sources, wb_enabled, key_allowed_for(pool).as_ref(), key_region_for(pool), free_tier_for(pool)) {
             Ok(()) => {
                 // 首个可用池胜出；此前有可用池失败 → 跨池回退 warn 日志（§4.5）。
                 // 源剔除（如 wb_enabled=false）不算回退，不记日志
@@ -880,6 +894,11 @@ fn pool_health(
     _wb_enabled: bool,
     allowed: Option<&HashSet<String>>,
     want_global: Option<bool>,
+    // 本次请求命中免费档模型（目录倍率 0）→ 零积分账号仍可服务。
+    // 必须与执行路径 qoder_route 的 free_tier 同口径：预检若用普通口径，
+    // 会出现「预检说无健康号 → 直接 503，执行路径的免费豁免根本没机会生效」
+    // ——实测 2026-10-23 19:42 `healthy=3` 却 503 就是这个。
+    free_tier: bool,
 ) -> Result<(), FallbackReason> {
     match pool {
         TargetPool::Buddy => {
@@ -912,16 +931,19 @@ fn pool_health(
                 want_global,
             )
             .is_some()
-                && !state
+                && state
                     .qoder_pool
-                    .has_selectable_in_region(allowed, want_global)
+                    .selectable_stats_in_region_excluding_free_tier(allowed, want_global, None, free_tier)
+                    .1
+                    == 0
             {
                 return Err(FallbackReason::ModelCooldown);
             }
             // 账号级健康预检（区域作用域：海外 Key 只数海外号）
+            // 免费档豁免：request 命中免费模型时零积分号也算可用（口径同执行路径）
             if !state
                 .qoder_pool
-                .has_selectable_in_region(allowed, want_global)
+                .has_selectable_in_region_free_tier(allowed, want_global, free_tier)
             {
                 return Err(FallbackReason::NoHealthyAccount);
             }
@@ -948,8 +970,9 @@ fn pool_healthy(
     wb_enabled: bool,
     allowed: Option<&HashSet<String>>,
     want_global: Option<bool>,
+    free_tier: bool,
 ) -> bool {
-    pool_health(state, pool, sources, wb_enabled, allowed, want_global).is_ok()
+    pool_health(state, pool, sources, wb_enabled, allowed, want_global, free_tier).is_ok()
 }
 
 fn final_buddy_model(sources: &ModelSources) -> String {

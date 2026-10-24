@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { RefreshCw, Save, Coins, ToggleLeft, Activity, Layers } from 'lucide-react';
+import { RefreshCw, Save, Coins, ToggleLeft, Activity, Layers, Sparkles } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge, Spinner, StatCard } from '../../components/ui';
 import { PoolHealthBadges } from '../../components/api/PoolHealthBadges';
@@ -7,6 +7,7 @@ import { ModelCooldownBanner } from '../../components/api/ModelCooldownBanner';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { withMinDelay } from '../../lib/delay';
+import { freeQuotaState, isQuotaStillExhausted } from '../../lib/freeQuota';
 import type {
   ApiServiceStatus,
   ApiPoolFile,
@@ -18,6 +19,77 @@ import type {
   UsageDayView,
   QoderAccountView,
 } from '../../types';
+
+/**
+ * 每模型免费档额度徽标（Qoder 资源调度页专用）。
+ *
+ * 与 `PoolHealthBadges` 的分工：那个回答「这个号现在能不能打」（禁用/冷却/零积分），
+ * 这个回答「这个号哪些**免费模型**今天还有额度、什么时候恢复」。
+ *
+ * 为什么放在这个页面也要有（2026-10-23 用户反馈）：账号页早有 `FreeModelsCell`，
+ * 但用户是在这里做池配置、看着这排账号决定「要不要把它留在池里、该打哪个模型」，
+ * 缺这一列就只能看到「零积分」然后以为这个号废了——而零积分号恰恰是免费档的主要
+ * 使用者（免费模型不消耗通用积分，选号已对零积分豁免）。
+ *
+ * 展示口径与账号页一致：可用绿 / 已用完琥珀 + 恢复时刻；未采集显式写「—」，
+ * 区别于「无免费模型」。
+ */
+function FreeTierBadges({ a }: { a: QoderAccountView }) {
+  const models = a.free_models ?? null;
+  if (models == null) {
+    return (
+      <span
+        className="text-[10px] text-slate-300 dark:text-zinc-600"
+        title="尚未采集免费档目录（首次积分刷新后回写）"
+      >
+        免费档 —
+      </span>
+    );
+  }
+  if (models.length === 0) {
+    return (
+      <span className="text-[10px] text-slate-300 dark:text-zinc-600" title="当前目录无 0 倍率（免费档）模型">
+        无免费档
+      </span>
+    );
+  }
+  const title = models
+    .map((m) => {
+      const region = m.region || '—';
+      if (!m.exhausted_at) return `${m.name}（${region}）：可用`;
+      // 耗尽记录已是历史、且已过恢复时刻 → 表述成「已恢复」，不再说「已用完」
+      if (!isQuotaStillExhausted(m)) {
+        return `${m.name}（${region}）：已恢复（${m.exhausted_at} 曾用完，${m.reset_at ?? ''} 重置）`;
+      }
+      const reset = m.reset_at ? `，${m.reset_at} 恢复` : '';
+      return `${m.name}（${region}）：已用完 ${m.exhausted_at}${reset}`;
+    })
+    .concat(a.free_models_fetched_at ? [`刷新于 ${a.free_models_fetched_at}`] : [])
+    .join('\n');
+  return (
+    <div className="flex flex-wrap items-center gap-1" title={title}>
+      {models.map((m) => {
+        // 关键：exhausted_at 是历史事实，reset_at 过了就已经恢复（见 lib/freeQuota）
+        const { used, recovered } = freeQuotaState(m);
+        return (
+          <Badge key={`${m.region || 'cn'}:${m.id}`} tone={used ? 'amber' : 'green'}>
+            <Sparkles size={10} className="mr-1" />
+            {m.name}
+            {used ? (
+              <span className="ml-0.5 opacity-80">
+                ·已用完{m.reset_at ? ` ${m.reset_at.slice(5, 16)} 恢复` : ''}
+              </span>
+            ) : recovered ? (
+              <span className="ml-0.5 opacity-70">·已恢复</span>
+            ) : (
+              <span className="ml-0.5 opacity-70">·可用</span>
+            )}
+          </Badge>
+        );
+      })}
+    </div>
+  );
+}
 
 /**
  * Qoder · 资源调度（对齐方案 P1 + 账号池配置对齐 Buddy）
@@ -354,10 +426,12 @@ export default function QoderApiService() {
         />
       </div>
 
-      {/* 左列：账号池选择 + 资源开关与调度参数（合并面板）｜右列：模型目录（Qoder），同行两列各占 1/2（Buddy 同构） */}
-      <div className="mt-4 grid grid-cols-12 items-start gap-4">
+      {/* 左列：账号池选择 + 资源开关与调度参数（合并面板）｜右列：模型目录（Qoder）
+          xl 以上两列各半（对齐 Buddy）；以下单列堆叠——账号行里同时有
+          计划/免费额度/健康/积分四组徽标，宽度不足时半列会把内容挤成竖排。 */}
+      <div className="mt-4 grid grid-cols-1 items-start gap-4 xl:grid-cols-2">
         {/* 左列：账号池选择（上）+ 资源开关与调度参数（下）合并面板，共用右上角「保存」 */}
-        <div className="col-span-6">
+        <div className="min-w-0">
           <div className="card p-4">
             {/* 面板头＝账号池选择；「保存」位于面板整体右上角，一次保存账号池选择/资源开关/调度参数 */}
             <div className="mb-3 flex items-center justify-between gap-2">
@@ -523,26 +597,42 @@ export default function QoderApiService() {
                   return (
                     <div
                       key={a.id}
-                      className={`flex items-center gap-3 rounded-lg border border-slate-100 px-3 py-2 text-sm dark:border-zinc-800 ${
+                      className={`flex flex-wrap items-center gap-x-2 gap-y-1.5 rounded-lg border border-slate-100 px-3 py-2 text-sm dark:border-zinc-800 ${
                         filteredOut ? 'opacity-50' : ''
                       }`}
                     >
                       <input
                         type="checkbox"
+                        className="shrink-0"
                         checked={qoderSelected.includes(a.id)}
                         onChange={() => toggleQoderUid(a.id)}
                       />
-                      <div className="min-w-0 flex-1 break-all font-medium">{a.nickname || a.id}</div>
-                      {filteredOut && <Badge tone="slate">筛选外</Badge>}
-                      <Badge tone="slate">{a.plan || a.credential_source || '—'}</Badge>
+                      {/* 账号名：给最小宽度 + truncate（不用 break-all）。
+                          原来 `flex-1 break-all` 在徽标多时被压到 <1 字宽，
+                          名字竖排成「0 1 a 1 4 …」一列单字符——就是这个布局 bug。 */}
+                      <div
+                        className="min-w-[5.5rem] max-w-[13rem] shrink truncate font-medium"
+                        title={a.nickname || a.id}
+                      >
+                        {a.nickname || a.id}
+                      </div>
+                      <Badge tone="slate" className="shrink-0">
+                        {a.plan || a.credential_source || '—'}
+                      </Badge>
                       {a.needs_relogin && <Badge tone="amber">需重新登录</Badge>}
+                      {/* 免费档模型额度（逐模型名称）：可用绿 / 已用完琥珀 + 恢复时刻。
+                          与账号级 PoolHealthBadges 是两个维度——那个答「这个号现在能不能打」，
+                          这个答「这个号哪些免费模型今天还有额度」。
+                          零积分账号只能打免费档（2026-10-23 裁决 B：免费模型不消耗通用
+                          积分，选号时对零积分豁免），所以这列是零积分号唯一可用的入口。 */}
+                      <FreeTierBadges a={a} />
                       {/* 运行时健康徽标：禁用/积分耗尽/冷却原因/零积分/在途·就绪（三池共用） */}
                       <PoolHealthBadges
                         s={poolItem}
                         running={running}
                         tokenInvalid={a.needs_relogin}
                       />
-                      <span className="shrink-0 text-right tabular-nums text-xs text-slate-500">
+                      <span className="ml-auto shrink-0 text-right tabular-nums text-xs text-slate-500">
                         {a.credits_balance != null ? `${a.credits_balance.toFixed(2)} credits` : '余额未知'}
                       </span>
                     </div>
@@ -710,7 +800,7 @@ export default function QoderApiService() {
         </div>
 
         {/* 右列：模型目录（Qoder 源，统一目录聚合实时派生） */}
-        <div className="col-span-6">
+        <div className="min-w-0">
           <div className="card p-4">
             <div className="mb-3 flex items-center justify-between">
               <div className="flex items-center gap-2">

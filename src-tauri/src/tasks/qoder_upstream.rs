@@ -281,7 +281,44 @@ fn credits_of_text(plain: &str) -> String {
 ///
 /// `factor = 0` 是**合法值**（免费/限时免费），不能当缺失去掉；返回**字符串**
 /// 而非数字，避免下游真值判定把数字 0 当假值丢键（「免费」变「未知」）。
+///
+/// **`is_free` 优先于倍率**（2026-10-23 修复）：上游除了倍率还会下发布尔
+/// `is_free`（实测 Qwen3.8-Flash `is_free:true`、GLM-5.3 `is_free:false`）。
+/// 这是**权威的免费声明**，比倍率更可靠：
+/// - 限免活动期间 `price_factor` 可能仍是原价而 `is_free` 已为 true；
+/// - 反向，倍率缺失（字段改版）时 `is_free` 仍能兜住。
+/// 判定序：`is_free == true` → 免费（0 倍率）；`is_free == false` → 视为付费，
+/// **忽略倍率**（防上游把免费模型标 false 但倍率写 0 的矛盾态）；无该字段 →
+/// 回落倍率解析（老目录形态）。
 fn credits_of(item: &Value) -> String {
+    // ① 权威布尔：is_free
+    if let Some(free) = item
+        .get("is_free")
+        .or_else(|| item.get("isFree"))
+        .and_then(Value::as_bool)
+    {
+        return if free {
+            credits_of_text("0")
+        } else {
+            // 显式付费：倍率为 0 或缺失时给非零占位。
+            // 上游矛盾态（is_free=false + price_factor=0）在限免结束瞬间出现过；
+            // 若仍按倍率 0 处理，付费模型会被误判成免费档并参与零积分豁免。
+            // is_free 是权威，倍率只用于展示真实价格。
+            match credits_of_factor(item) {
+                Some(s) if s != "x0 credits" => s,
+                _ => "x1 credits".to_string(),
+            }
+        };
+    }
+    // ② 回落倍率
+    match credits_of_factor(item) {
+        Some(s) => s,
+        None => String::new(),
+    }
+}
+
+/// 纯倍率提取（无 is_free 语义），`None` = 字段缺失/非法。
+fn credits_of_factor(item: &Value) -> Option<String> {
     let raw = item
         .get("price_factor")
         .or_else(|| item.get("priceFactor"));
@@ -289,14 +326,11 @@ fn credits_of(item: &Value) -> String {
         Some(Value::Number(number)) => number.as_f64(),
         Some(Value::String(text)) => text.trim().parse::<f64>().ok(),
         _ => None,
-    };
-    let Some(factor) = factor else {
-        return String::new();
-    };
+    }?;
     if !factor.is_finite() || factor < 0.0 {
-        return String::new();
+        return None;
     }
-    credits_of_text(&format_factor(factor))
+    Some(credits_of_text(&format_factor(factor)))
 }
 
 /// 倍率数字 → 紧凑文本（整数不带小数点，其余最多两位小数、裁掉尾零）
@@ -461,6 +495,20 @@ fn catalog_for(state: &CatalogState, region: QoderRegion) -> Vec<Value> {
 /// 网络请求由接线层的刷新器发起（带 COSY 签名的 GET），本函数只做
 /// 「信封校验 + 解析 + 原子替换」。返回采纳的条目数。
 pub fn adopt_remote(region: QoderRegion, payload: &Value) -> Result<usize, String> {
+    adopt_remote_in(region, payload, None)
+}
+
+/// `data_dir = Some` 时把采纳结果落盘（进程重启后仍能读回最新目录）。
+///
+/// 为什么必须落盘（2026-10-23 修复「明明限免却显示 0.1」）：目录原先是**纯内存**，
+/// 而同步任务每天只跑一次（默认 05:50）。进程一重启，目录就回到空态 →
+/// `catalog_for` 回落静态兜底表（真实倍率早漂移了）→ 限时免费的模型被当成付费、
+/// 免费额度列直接看不到它。落盘后重启读回上一次真实目录，倍率不再依赖「今天跑没跑过」。
+pub fn adopt_remote_in(
+    region: QoderRegion,
+    payload: &Value,
+    data_dir: Option<&std::path::Path>,
+) -> Result<usize, String> {
     fn apply(state: &mut CatalogState, region: QoderRegion, models: Vec<Value>) {
         match region {
             QoderRegion::Global => state.global = models,
@@ -478,10 +526,90 @@ pub fn adopt_remote(region: QoderRegion, payload: &Value) -> Result<usize, Strin
     // 读-改-写全程持写锁（P2 原子性）：原实现 read_state 克隆 → 修改 → write_state
     // 整体替换，双区并发采纳（Global/CN 同时刷新完成）会互相覆盖丢一区数据
     match catalog().write() {
-        Ok(mut guard) => apply(&mut guard, region, models),
-        Err(poisoned) => apply(&mut poisoned.into_inner(), region, models),
+        Ok(mut guard) => apply(&mut guard, region, models.clone()),
+        Err(poisoned) => apply(&mut poisoned.into_inner(), region, models.clone()),
+    }
+    // 落盘（尽力而为：失败不影响内存态生效，只记日志）
+    if let Some(dir) = data_dir {
+        let store = crate::store::db(dir);
+        if let Err(e) = store.kv_set(
+            catalog_kv_key(region),
+            &json!({ "models": models, "fetched_at": crate::fs_utils::now_iso() }),
+        ) {
+            let _ = crate::fs_utils::app_log(
+                dir,
+                &format!("Qoder 目录落盘失败（内存态已生效）: {e}"),
+            );
+        }
     }
     Ok(count)
+}
+
+/// 目录持久化的 kv 键（按区）
+fn catalog_kv_key(region: QoderRegion) -> &'static str {
+    match region {
+        QoderRegion::Global => "qoder_catalog_global",
+        QoderRegion::Cn => "qoder_catalog_cn",
+    }
+}
+
+/// 启动时把落盘目录读回内存（进程重启 → 目录不丢）。返回 (cn, global) 条数。
+///
+/// 只在内存为空时填充（不覆盖已由本次启动同步采到的新数据）。
+pub fn hydrate_catalog_from_store(data_dir: &std::path::Path) -> (usize, usize) {
+    let store = crate::store::db(data_dir);
+    let mut counts = (0usize, 0usize);
+    for region in [QoderRegion::Cn, QoderRegion::Global] {
+        let Some(text) = store.kv_get_raw(catalog_kv_key(region)) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let models: Vec<Value> = v
+            .get("models")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if models.is_empty() {
+            continue;
+        }
+        let n = models.len();
+        match catalog().write() {
+            Ok(mut g) => match region {
+                QoderRegion::Cn => {
+                    if g.cn.is_empty() {
+                        g.cn = models;
+                    }
+                }
+                QoderRegion::Global => {
+                    if g.global.is_empty() {
+                        g.global = models;
+                    }
+                }
+            },
+            Err(p) => {
+                let mut g = p.into_inner();
+                match region {
+                    QoderRegion::Cn => {
+                        if g.cn.is_empty() {
+                            g.cn = models;
+                        }
+                    }
+                    QoderRegion::Global => {
+                        if g.global.is_empty() {
+                            g.global = models;
+                        }
+                    }
+                }
+            }
+        }
+        match region {
+            QoderRegion::Cn => counts.0 = n,
+            QoderRegion::Global => counts.1 = n,
+        }
+    }
+    counts
 }
 
 /// 当前清单（两个地区的**并集**，按 id 去重、global 优先，附 region 键）。
@@ -525,10 +653,24 @@ pub fn merge_free_models(prev: &[Value], fresh: &[Value]) -> Vec<Value> {
         .iter()
         .map(|m| {
             let mut m = m.clone();
-            let id = m.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+            let id = m.get("id").and_then(Value::as_str).unwrap_or("");
+            let region = m.get("region").and_then(Value::as_str).unwrap_or("");
+            // 匹配键必须是 **(id, region)**，不能只用 id（2026-10-23 修复）。
+            // 国内/海外两区常下发同名模型（Qwen3.8-Flash 两区皆免费），
+            // 只按 id 匹配会让后一条（global）命中前一条（cn）的历史记录：
+            //   · 耗尽标注串到另一区 → 界面出现「两个 Qwen3.8-Flash 都已用完」
+            //     而实际只有一区耗尽；
+            //   · 反向也会把已清空的区又灌回旧标注。
+            // 两区额度是**各自独立**计量的，历史必须分区保存。
+            // 比较 region 时必须把「字段缺失」和「空串」视为同一语义（不限区域）：
+            // 直接用 `Some(region)` 比较会让双方都缺 region 的存量条目匹配失败
+            // （None != Some("")），表现为历史标注整体丢失。
+            let same_region = |p: &Value| {
+                p.get("region").and_then(Value::as_str).unwrap_or("") == region
+            };
             if let Some(old) = prev
                 .iter()
-                .find(|p| p.get("id").and_then(Value::as_str) == Some(id.as_str()))
+                .find(|p| p.get("id").and_then(Value::as_str) == Some(id) && same_region(p))
             {
                 // 耗尽标注与恢复时刻：均由错误码驱动记录，刷新时保留；
                 // reset_at 已过 = 上游额度已重置 → 两个字段一并清除（自愈）
@@ -546,6 +688,44 @@ pub fn merge_free_models(prev: &[Value], fresh: &[Value]) -> Vec<Value> {
             m
         })
         .collect()
+}
+
+/// 免费档清单**跨区去重**（2026-10-23 修复「两个 Qwen3.8-Flash」）。
+///
+/// 上游 CN / Global 两份目录经常包含**完全同名同倍率**的免费模型
+/// （实测 Qwen3.8-Flash 两区都是 x0.0 credits）。原实现按 (id, region) 双向保留，
+/// 于是每个账号都显示两个一模一样的条目——用户看到的不是「两区各有额度」，
+/// 而是「重复了」。
+///
+/// 去重规则：
+/// 1. **同名且两区倍率一致**（都免费）→ 只留一条，region 记为 `""`（不限区域），
+///    表示「这个模型哪个区的免费额度都能用」。
+/// 2. 仅在单区存在，或两区倍率不同 → 保留原 region 条目（此时区域是有效信息）。
+///
+/// 关键在于**不能在采集层丢弃 region**：`is_free_tier_model` 依赖它做两区并集匹配，
+/// 所以去重只发生在「给账号写快照」这一步（见 [`dedupe_free_models_by_id`]）。
+pub fn dedupe_free_models_by_id(list: &[Value]) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    for m in list {
+        let Some(id) = m.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let rate = m.get("rate").and_then(Value::as_f64).unwrap_or(0.0);
+        if let Some(slot) = out
+            .iter_mut()
+            .find(|e| e.get("id").and_then(Value::as_str) == Some(id))
+        {
+            // 已有一条同名条目：倍率相同 → 合并成「不限区域」（region=""）；
+            // 倍率不同说明确实分档，保留先到的（不丢信息，也避免抖动）
+            let prev_rate = slot.get("rate").and_then(Value::as_f64).unwrap_or(0.0);
+            if (prev_rate - rate).abs() < f64::EPSILON {
+                slot["region"] = json!("");
+            }
+            continue;
+        }
+        out.push(m.clone());
+    }
+    out
 }
 
 /// 把客户端的模型名解析成目录条目（含 upstreamKey/config/region）。
@@ -606,6 +786,31 @@ pub fn free_tier_models() -> Vec<Value> {
         }
     }
     out
+}
+
+/// 该模型是否属于免费档（上游目录 credits 倍率 = 0）。
+///
+/// 用途（2026-10-23 裁决 B）：Qoder 免费模型**不消耗通用积分**，额度由上游按
+/// 账号每日单独计；网关选号的零积分闸门必须对这类模型豁免，否则「积分用完了
+/// 连免费额度也打不了」——与免费额度的存在意义相反。
+///
+/// 判定按**模型 id 大小写不敏感**匹配两区并集：同一个 id 在两区目录里倍率可能
+/// 不同（某区限免），这里取「任一区免费即视为免费档」——保守方向正确：
+/// 宁可让零积分号去试一个可能不免费的模型（上游会明确拒绝且只影响这一个请求），
+/// 也不要因为区域判定偏差把免费额度整片锁死。
+///
+/// 目录未加载/无该模型 → false（回落原有零积分过滤，不放大豁免面）。
+pub fn is_free_tier_model(model: &str) -> bool {
+    let want = model.trim();
+    if want.is_empty() {
+        return false;
+    }
+    free_tier_models().iter().any(|m| {
+        m.get("id")
+            .and_then(Value::as_str)
+            .map(|id| id.eq_ignore_ascii_case(want))
+            .unwrap_or(false)
+    })
 }
 
 /// 跨池命名差异别名表（issue #90 修复③b）：三家池对同一模型命名不一
@@ -875,11 +1080,16 @@ fn free_exhaustion_expired(entry: &Value) -> bool {
     (now_ts() as i64) >= until
 }
 
-/// 解析 "YYYY-MM-DD HH:MM:SS"（按 UTC+8 解释）为 Unix 秒；形态不符返回 None。
-/// 手写切片解析，避免为此引入 chrono 解析格式依赖（项目内零正则同源约定）
+/// 解析 "YYYY-MM-DD HH:MM[:SS]"（按 UTC+8 解释）为 Unix 秒；形态不符返回 None。
+///
+/// 两种形态都要支持（2026-10-23 修复）：上游/本地写入的 `reset_at` 常是
+/// **不含秒**的 `"2026-10-23 00:00"`（16 字符），而旧实现硬要求 19 字符，
+/// 解析失败 → `free_exhaustion_expired` 恒 false → 已过期的耗尽标注**永不自动清除**，
+/// 界面上就表现为「昨天用完的模型，今天还标着已用完」。
+/// 秒缺失时按 :00 处理（重置时刻本来就是整点语义）。
 fn parse_cn_datetime(s: &str) -> Option<i64> {
     let b = s.as_bytes();
-    if b.len() < 19 {
+    if b.len() < 16 {
         return None;
     }
     let digits = |i: usize, j: usize| -> Option<i64> {
@@ -891,11 +1101,21 @@ fn parse_cn_datetime(s: &str) -> Option<i64> {
     if !matches!(&b[4], b'-') || !matches!(&b[7], b'-') || !matches!(&b[10], b' ' | b'T') {
         return None;
     }
-    if !matches!(&b[13], b':') || !matches!(&b[16], b':') {
+    if !matches!(&b[13], b':') {
         return None;
     }
     let (y, mo, d) = (digits(0, 4)?, digits(5, 7)?, digits(8, 10)?);
-    let (h, mi, sec) = (digits(11, 13)?, digits(14, 16)?, digits(17, 19)?);
+    let (h, mi) = (digits(11, 13)?, digits(14, 16)?);
+    // 秒可选：上游给的 reset_at 常是 "2026-10-23 00:00"（无秒），
+    // 缺秒按 :00 处理——重置时刻是整点语义，不影响正确性。
+    let sec = if b.len() >= 19 {
+        if !matches!(&b[16], b':') {
+            return None;
+        }
+        digits(17, 19)?
+    } else {
+        0
+    };
     if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
         return None;
     }
@@ -2763,11 +2983,71 @@ mod tests {
         assert_eq!(parse_cn_datetime("2026-10-21 00:00:00"), Some(1792512000));
         assert_eq!(parse_cn_datetime("1970-01-01 08:00:00"), Some(0), "UTC+8 零点对齐 Unix 0");
         assert_eq!(parse_cn_datetime("2026-10-21T12:30:45"), Some(1792512000 + 12 * 3600 + 30 * 60 + 45));
+        // 无秒形态（上游 reset_at 实际形态）：按 :00 解释，不能返回 None
+        assert_eq!(
+            parse_cn_datetime("2026-10-23 00:00"),
+            Some(1792512000 + 2 * 86400),
+            "无秒形态必须能解析（否则已过期的耗尽标注永不自动清除）"
+        );
         assert_eq!(parse_cn_datetime("2026-10-21"), None, "长度不足");
         assert_eq!(parse_cn_datetime("2026/10/21 00:00:00"), None, "分隔符不符");
         assert_eq!(parse_cn_datetime("2026-13-21 00:00:00"), None, "月份越界");
         assert_eq!(parse_cn_datetime("2026-10-32 00:00:00"), None, "日期越界");
         assert_eq!(parse_cn_datetime("2026-10-21 25:00:00"), None, "小时越界");
+    }
+
+    /// 免费档快照按 **(id, region)** 合并历史（2026-10-23 修复「两个都已用完」）。
+    ///
+    /// 两区同名模型是常态（Qwen3.8-Flash 两区皆免费）。旧实现只按 id 匹配，
+    /// 会让 global 条目命中 cn 条目的 exhausted_at，表现为「两条都标已用完」，
+    /// 而实际可能只有一区耗尽。
+    #[test]
+    fn merge_free_models_matches_by_id_and_region() {
+        // 历史：只有 cn 区耗尽
+        let prev = vec![
+            json!({"id": "Qwen3.8-Flash", "region": "cn", "rate": 0.0,
+                   "exhausted_at": "2026-10-22 22:04:05", "reset_at": "2026-10-23 00:00"}),
+        ];
+        // 刷新：两区都下发（reset_at 已过 → cn 应自愈清空）
+        let fresh = vec![
+            json!({"id": "Qwen3.8-Flash", "region": "cn", "rate": 0.0}),
+            json!({"id": "Qwen3.8-Flash", "region": "global", "rate": 0.0}),
+        ];
+        let merged = merge_free_models(&prev, &fresh);
+        let cn = merged
+            .iter()
+            .find(|m| m["region"] == json!("cn"))
+            .expect("cn 条目必须保留");
+        let gl = merged
+            .iter()
+            .find(|m| m["region"] == json!("global"))
+            .expect("global 条目必须保留");
+        // reset_at 是过去时间 → cn 的历史已过期，应被清空（自愈）
+        assert!(
+            cn.get("exhausted_at").is_none() || cn["exhausted_at"].is_null(),
+            "已过恢复时刻的耗尽标注必须自愈清空，实际 {cn:?}"
+        );
+        // global 从未耗尽 → 不得被 cn 的历史污染（这正是旧 bug）
+        assert!(
+            gl.get("exhausted_at").is_none() || gl["exhausted_at"].is_null(),
+            "另一区不得继承同 id 的耗尽标注，实际 {gl:?}"
+        );
+    }
+
+    /// 同名同倍率的两区条目 → 去重成一条且 region=""（不限区域）
+    #[test]
+    fn dedupe_merges_same_id_same_rate_across_regions() {
+        let list = vec![
+            json!({"id": "Qwen3.8-Flash", "region": "cn", "rate": 0.0}),
+            json!({"id": "Qwen3.8-Flash", "region": "global", "rate": 0.0}),
+            json!({"id": "DeepSeek-Flash", "region": "cn", "rate": 0.0}),
+        ];
+        let out = dedupe_free_models_by_id(&list);
+        assert_eq!(out.len(), 2, "两个同名 Qwen 应合并成一条，实际 {out:?}");
+        let q = out.iter().find(|m| m["id"] == json!("Qwen3.8-Flash")).unwrap();
+        assert_eq!(q["region"], json!(""), "合并后 region 置空 = 两区通用");
+        let d = out.iter().find(|m| m["id"] == json!("DeepSeek-Flash")).unwrap();
+        assert_eq!(d["region"], json!("cn"), "仅单区存在的保留区域信息");
     }
 
     /// 倍率解析容错（复用 credits_rate_of）：带 x 前缀 / 单位尾巴 / 空白均可；
@@ -2955,7 +3235,7 @@ mod tests {
         let t = QoderTranslate::new(lines.into_iter(), slot.clone(), "chat-1", "M");
         let ilines = InterruptibleLines::from_iterator(Box::new(t));
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
-        let (err, sent_any, _fi, _u) =
+        let (err, sent_any, _fi, _eof, _u) =
             wb_sse::stream_forward_ex(ilines, &tx, proto, "chat-1", "M", &std::collections::HashSet::new());
         drop(tx);
         let mut sent = Vec::new();
@@ -3015,7 +3295,7 @@ mod tests {
     /// 防重复流）——保证上面的换号语义只作用于「首内容帧前」窗口
     #[test]
     fn error_after_content_is_inline_not_rotation() {
-        let (err, sent_any, failed_inline, _u) = {
+        let (err, sent_any, failed_inline, _eof, _u) = {
             let slot: Arc<Mutex<Option<ErrMeta>>> = Arc::new(Mutex::new(None));
             let t = QoderTranslate::new(
                 vec![
@@ -3487,6 +3767,51 @@ mod tests {
         assert!(
             !cn_free.iter().any(|id| id == "GLM-5.3"),
             "0.8 倍率的 GLM-5.3 不得混入免费档；实得 {cn_free:?}"
+        );
+    }
+
+    /// `is_free` 是权威免费声明，优先级高于倍率（2026-10-23 用户反馈修复）。
+    ///
+    /// 用户实况：上游对 Qwen3.8-Flash 下发 `is_free:true`（且 price_factor=0），
+    /// 对 GLM-5.3 下发 `is_free:false`。此前代码只读倍率、完全忽略 is_free，
+    /// 一旦上游在限免期把倍率仍写成原价，免费模型就会被判成付费而掉出清单。
+    #[test]
+    fn is_free_flag_overrides_price_factor() {
+        let _g = catalog_test_guard();
+        adopt_remote(
+            QoderRegion::Cn,
+            &json!({"statusCodeValue": 200, "chat": [
+                // is_free=true 但倍率仍是原价 0.1（限免期上游矛盾态）→ 必须算免费
+                {"modelId": "dfmodel", "displayName": "DeepSeek-Flash",
+                 "is_free": true, "price_factor": 0.1, "original_price_factor": 0.1,
+                 "maxInputTokens": 1000000},
+                // is_free=false 但倍率 0 → 必须算付费（防矛盾态被当免费）
+                {"modelId": "gm51model", "displayName": "GLM-5.2-FakeFree",
+                 "is_free": false, "price_factor": 0.0, "maxInputTokens": 200000},
+                // 无 is_free 字段 → 回落倍率（老目录形态）
+                {"modelId": "qfmodel", "displayName": "Qwen3.8-Flash",
+                 "price_factor": 0.0, "maxInputTokens": 1000000}
+            ]}),
+        )
+        .expect("目录应被采纳");
+
+        let cn_free: Vec<String> = free_tier_models()
+            .iter()
+            .filter(|m| m.get("region").and_then(Value::as_str) == Some("cn"))
+            .filter_map(|m| m.get("id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        assert!(
+            cn_free.iter().any(|id| id == "DeepSeek-Flash"),
+            "is_free=true 必须算免费（即使倍率是原价）；实得 {cn_free:?}"
+        );
+        assert!(
+            cn_free.iter().any(|id| id == "Qwen3.8-Flash"),
+            "无 is_free 时回落倍率=0 仍算免费；实得 {cn_free:?}"
+        );
+        assert!(
+            !cn_free.iter().any(|id| id == "GLM-5.2-FakeFree"),
+            "is_free=false 不得因倍率 0 混进免费档；实得 {cn_free:?}"
         );
     }
 

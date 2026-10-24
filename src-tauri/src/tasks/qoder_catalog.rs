@@ -80,7 +80,7 @@ fn write_back_free_models(state: &AppState) {
             .cloned()
             .unwrap_or_default();
         let merged: Vec<Value> = qoder_upstream::merge_free_models(&prev, &region_free);
-        a["free_models"] = json!(merged);
+        a["free_models"] = json!(qoder_upstream::dedupe_free_models_by_id(&merged));
         a["free_models_fetched_at"] = json!(now);
         changed = true;
     }
@@ -192,7 +192,7 @@ fn sync_region(
                             .map_err(|e| format!("model/list 响应非 JSON: {e}"))
                     })
                     .and_then(|payload| {
-                        qoder_upstream::adopt_remote(region, &payload)
+                        qoder_upstream::adopt_remote_in(region, &payload, Some(&state.data_dir))
                             .map_err(|e| format!("model/list 目录采纳失败: {e}"))
                     })
                 {
