@@ -255,6 +255,22 @@ pub async fn do_start(
         ),
     );
 
+    // Qoder 模型目录从库读回（2026-10-23）：目录原为纯内存，进程重启即回落静态
+    // 兜底表——而同步任务每日只跑一次，重启后整天用的都是过期的倍率
+    // （实测：限时免费模型被当付费、免费额度列看不到）。启动先读回上次真实目录，
+    // 后续定时/手动同步会覆盖为更新值。
+    let (hydrated_cn, hydrated_global) =
+        crate::tasks::qoder_upstream::hydrate_catalog_from_store(&state.data_dir);
+    if hydrated_cn > 0 || hydrated_global > 0 {
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!(
+                "API服务启动-Qoder 目录读回: cn={} global={}（避免回落静态兜底倍率）",
+                hydrated_cn, hydrated_global
+            ),
+        );
+    }
+
     // ZCode 池启动概况（z.ai GLM 池）：开关默认开，账号来自 zcode.sqlite
     // （zcode 域管理，网关只读）；无策略概念（无积分排序），固定先到先服务
     fs_utils::app_log(

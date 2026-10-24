@@ -107,11 +107,16 @@ fn main() {
                 },
             };
             let line = format!(
-                "[{}] PANIC at {}\n  message: {}\n  thread: {:?}\n\n",
+                "[{}] PANIC at {}\n  message: {}\n  thread: {:?}\n{}\n",
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
                 loc,
                 msg,
-                std::thread::current().name().unwrap_or("<unnamed>")
+                std::thread::current().name().unwrap_or("<unnamed>"),
+                // 调用栈：location 对「panic 点在依赖内部」的情形（如 tokio 嵌套
+                // block_on 的 location 恒指 tokio 自身）无法定位肇事者，必须靠
+                // backtrace 找调用方。force_capture 不看 RUST_BACKTRACE 开关——
+                // panic 本身低频，落盘成本可忽略
+                std::backtrace::Backtrace::force_capture(),
             );
             let _ = std::fs::OpenOptions::new()
                 .create(true)
@@ -272,6 +277,11 @@ fn main() {
             commands::agent_integration::agent_integration_scan,
             commands::agent_integration::agent_integration_apply,
             commands::agent_integration::agent_integration_clear,
+            // Agent 接入中心「导入模型」弹框（2026-10-23）：按池可用性置灰 +
+            // 逐模型选择写入
+            commands::agent_integration::agent_integration_pool_availability,
+            commands::agent_integration::agent_integration_pool_catalog,
+            commands::agent_integration::agent_integration_apply_models,
             commands::api_server::free_usage_snapshot,
             commands::api_server::api_logs_list,
             commands::api_server::api_logs_detail,
@@ -438,6 +448,16 @@ fn main() {
             commands::qoder::qoder_env_reset,
             tasks::scheduler::scheduler_status,
             // ===== zcode 域命令(移植自 zai-claim)=====
+            // ===== ZCode 夜间/周末批处理 =====
+            zcode::modules::batch_cmds::zcode_batch_enqueue,
+            zcode::modules::batch_cmds::zcode_batch_list,
+            zcode::modules::batch_cmds::zcode_batch_status,
+            zcode::modules::batch_cmds::zcode_batch_cancel,
+            zcode::modules::batch_cmds::zcode_batch_requeue,
+            zcode::modules::batch_cmds::zcode_batch_clear,
+            zcode::modules::batch_cmds::zcode_batch_run_now,
+            zcode::modules::batch_cmds::zcode_batch_start,
+            zcode::modules::batch_cmds::zcode_batch_stop,
             zcode::modules::accounts::commands::zcode_accounts_list,
             zcode::modules::accounts::commands::zcode_accounts_add_oauth,
             zcode::modules::accounts::commands::zcode_accounts_cancel_oauth,
@@ -500,6 +520,13 @@ fn main() {
                 use zcode::state::ZcodeState;
                 let monitor = app.state::<ZcodeState>().monitor.clone();
                 monitor.start(app.handle());
+            }
+            // ZCode 夜间/周末批处理调度（2026-10-23）：只在夜间窗口内消费队列，
+            // 窗口外只睡。启动即挂上，用户入队后无需再手动开启。
+            {
+                use zcode::state::ZcodeState;
+                let zs = app.state::<ZcodeState>();
+                zcode::batch::start_loop(zs.db.clone(), zs.batch_rt.clone());
             }
 
             let state = app.state::<AppState>();

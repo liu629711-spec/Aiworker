@@ -456,7 +456,216 @@ pub(crate) fn merge_wb_entries(existing: Vec<Value>, aiwork: Vec<Value>) -> Vec<
     out
 }
 
+/// 池可用性快照（Agent 接入中心用）：每个池、每个区域各有几个**可服务账号**。
+///
+/// 为什么需要它（2026-10-23 用户反馈）：写入模型清单原本只看「用户勾了哪些 Key」，
+/// 完全不查该池/区域有没有账号。网关首启会**自动预置**两把 `region=global` 的
+/// 海外 Key（`api_keys::ensure_overseas_pool_keys`），前端又默认全选启用 Key，
+/// 于是「只有 trae/buddy/qoder、一个海外号都没有」的用户，一键写入照样把
+/// `@global` 模型写进 models.json —— 打出去必然 no_healthy。
+///
+/// 口径 = **健康账号数**（用户裁决）：该池该区域至少 1 个可选账号才算可用；
+/// 没有则整池/整区跳过并在 UI 置灰「未配置账号池」，而不是等写进去再让用户删。
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct PoolAvailability {
+    /// 池标识：trae / buddy / qoder / zcode
+    pub pool: String,
+    /// 国内账号数（zcode 无区域概念，计在 cn 上）
+    pub cn: usize,
+    /// 海外账号数（仅 buddy / qoder 有）
+    pub global: usize,
+}
+
+impl PoolAvailability {
+    pub fn total(&self) -> usize {
+        self.cn + self.global
+    }
+    /// 该池整体是否有号（无区域概念的池看这个）
+    pub fn any(&self) -> bool {
+        self.total() > 0
+    }
+    /// 指定区域是否有号：`want_global=None` 视为「任意区域」。
+    pub fn has_region(&self, want_global: Option<bool>) -> bool {
+        match want_global {
+            Some(true) => self.global > 0,
+            Some(false) => self.cn > 0,
+            None => self.any(),
+        }
+    }
+}
+
+/// 统计各池可用账号数。`region_of` 由各池自己的字段判定（buddy/qoder 有
+/// `global_region` 或 `region`；trae/zcode 不分区）。
+///
+/// 这里刻意用「池文档里有凭证的账号数」而非网关运行池的 selectable 状态：
+/// 用户可能的场景是「账号都在冷却/零积分但确实是配了的」，那种情况仍应允许
+/// 写入（他要先配好、等额度恢复）。真正的「一个号都没有」才是要拦的场景。
+pub(crate) fn pool_availability(data_dir: &Path) -> Vec<PoolAvailability> {
+    let store = crate::store::db(data_dir);
+    let mut out: Vec<PoolAvailability> = Vec::new();
+
+    // Trae：api_pool 文件的 enabled_uids（Trae 池启用账号白名单）；
+    // 只数「被勾选启用」的，与网关调度口径一致。
+    let trae_pool = super::api_server::load_pool_file(data_dir);
+    let trae_count = trae_pool
+        .enabled_uids
+        .iter()
+        .filter(|s| !s.trim().is_empty())
+        .count();
+    out.push(PoolAvailability { pool: "trae".into(), cn: trae_count, global: 0 });
+
+    // Buddy：wb_pool 账号，按 region/global_region 分区
+    let (mut b_cn, mut b_gl) = (0usize, 0usize);
+    if let Some(arr) = crate::store::docs::wb_pool_load(&store).get("accounts").and_then(Value::as_array) {
+        for a in arr {
+            if !account_has_credential(a) {
+                continue;
+            }
+            if account_is_global(a) {
+                b_gl += 1;
+            } else {
+                b_cn += 1;
+            }
+        }
+    }
+    out.push(PoolAvailability { pool: "buddy".into(), cn: b_cn, global: b_gl });
+
+    // Qoder：qoder_pool 账号，同样按区
+    let (mut q_cn, mut q_gl) = (0usize, 0usize);
+    if let Some(arr) = crate::store::docs::qoder_pool_load(&store).get("accounts").and_then(Value::as_array) {
+        for a in arr {
+            if !account_has_credential(a) {
+                continue;
+            }
+            if account_is_global(a) {
+                q_gl += 1;
+            } else {
+                q_cn += 1;
+            }
+        }
+    }
+    out.push(PoolAvailability { pool: "qoder".into(), cn: q_cn, global: q_gl });
+
+    // ZCode：z.ai 账号无国内/海外之分，全部计在 cn
+    let zc = zcode_pool_account_count(data_dir);
+    out.push(PoolAvailability { pool: "zcode".into(), cn: zc, global: 0 });
+
+    out
+}
+
+/// 账号行是否有可用凭证（无凭证的账号入池也只会每请求换号失败）
+fn account_has_credential(a: &Value) -> bool {
+    // Buddy/Qoder 池行字段不完全一致，认几个等价键
+    for k in ["access_token", "jwt", "token", "has_credential"] {
+        match a.get(k) {
+            Some(Value::Bool(b)) => {
+                if *b {
+                    return true;
+                }
+            }
+            Some(Value::String(s)) => {
+                if !s.trim().is_empty() {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// 账号是否海外区（buddy/qoder 池行两种写法）
+fn account_is_global(a: &Value) -> bool {
+    if a.get("global_region").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    a.get("region")
+        .and_then(Value::as_str)
+        .is_some_and(|r| r.eq_ignore_ascii_case("global"))
+}
+
+/// ZCode 池账号数（zcode.sqlite 的 accounts 表；无凭证不计）
+fn zcode_pool_account_count(data_dir: &Path) -> usize {
+    // zcode 库是独立 sqlx sqlite，这里的命令是同步上下文，走桥接查询
+    let db = data_dir.join("zcode.sqlite");
+    if !db.is_file() {
+        return 0;
+    }
+    let url = format!("sqlite://{}", db.display().to_string().replace('\\', "/"));
+    let count = crate::zcode::util::bridge_block_on(async move {
+        use sqlx::sqlite::SqliteConnectOptions;
+        use std::str::FromStr;
+        let opts = SqliteConnectOptions::from_str(&url).ok()?.read_only(true);
+        let pool = sqlx::SqlitePool::connect_with(opts).await.ok()?;
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM accounts \
+             WHERE zai_access_token IS NOT NULL AND TRIM(zai_access_token) <> ''",
+        )
+        .fetch_one(&pool)
+        .await
+        .ok()?;
+        pool.close().await;
+        Some(n as usize)
+    });
+    count.unwrap_or(0)
+}
+
+/// 从模型 id 判区域：`pool/xxx@global` → Some(true)；`@cn` → Some(false)；
+/// 裸名 → None（该模型只在单区存在，无歧义）
+pub(crate) fn model_region(model: &str) -> Option<bool> {
+    match model.rsplit_once('@') {
+        Some((_, "global")) => Some(true),
+        Some((_, "cn")) => Some(false),
+        _ => None,
+    }
+}
+
+/// 池前缀：`qoder/xxx` → "qoder"
+pub(crate) fn model_pool(model: &str) -> &str {
+    model.split('/').next().unwrap_or("")
+}
+
+/// 按池可用性过滤模型清单（Agent 接入中心「自动排除无账号的池/区」）。
+///
+/// 判定链：模型 → 池前缀 → 该池的可用性 → 模型区域（裸名视为「有任一区即可」）。
+/// 任一环节不满足即剔除。返回 (保留, 被剔除的池/区说明列表)，说明用于 UI 提示
+/// 「这些因为没账号被跳过」——静默少写几个模型比多写更让人困惑。
+pub(crate) fn filter_models_by_pool_availability(
+    owned: Vec<(String, usize)>,
+    avail: &[PoolAvailability],
+) -> (Vec<(String, usize)>, Vec<String>) {
+    let find = |pool: &str| avail.iter().find(|a| a.pool == pool);
+    let mut kept: Vec<(String, usize)> = Vec::new();
+    // 去重的跳过原因（同一池/区只报一次，UI 上不刷屏）
+    let mut skipped: Vec<String> = Vec::new();
+    for (model, kidx) in owned {
+        let pool = model_pool(&model);
+        let Some(a) = find(pool) else {
+            // 目录里有未知前缀（自定义模型等）→ 不拦，交上游判定
+            kept.push((model, kidx));
+            continue;
+        };
+        let want_global = model_region(&model);
+        if a.has_region(want_global) {
+            kept.push((model, kidx));
+            continue;
+        }
+        // 无账号：区分「整池没号」与「该区没号」，提示文案不同
+        let reason = match (want_global, a.any()) {
+            (_, false) => format!("{pool}（未配置账号池）"),
+            (Some(true), true) => format!("{pool}@global（无海外账号）"),
+            (Some(false), true) => format!("{pool}@cn（无国内账号）"),
+            (None, true) => format!("{pool}（账号与区域不匹配）"),
+        };
+        if !skipped.iter().any(|s| s == &reason) {
+            skipped.push(reason);
+        }
+    }
+    (kept, skipped)
+}
+
 /// 模型归属 Key 分配：对每个模型收集所有把它展开出来的 Key，优先 `bind_pool`
+
 /// 与前缀一致的 Key，其次首个展开它的 Key。输入 (model_id, producer_key_idx)
 /// 展开顺序 = 用户勾选顺序。
 ///
@@ -558,6 +767,47 @@ pub(crate) fn wb_models_apply(
     // 否则同名两区会被 assign_model_owners 合并成一条、后者覆盖前者
     let occurrences = disambiguate_by_key_region(occurrences, selected);
     let owned = assign_model_owners(&occurrences, selected);
+    // 1.5 按池可用性剪枝（2026-10-23 用户裁决）：该池/该区一个账号都没有的模型
+    // 直接不写。根因是网关首启自动预置海外 Key + 前端默认全选，导致「没有海外号
+    // 却写进 @global 模型」，打出去必然 no_healthy。
+    let avail = pool_availability(data_dir);
+    let (owned, skipped_pools) = filter_models_by_pool_availability(owned, &avail);
+    if owned.is_empty() {
+        return Err(format!(
+            "所选 Key 的模型全部因「无可用账号」被跳过：{}。请先在对应账号页导入账号，或改选别的 Key。",
+            if skipped_pools.is_empty() {
+                "（无具体池）".to_string()
+            } else {
+                skipped_pools.join("、")
+            }
+        ));
+    }
+    wb_write_owned(home, data_dir, selected, &owned, skipped_pools)
+}
+
+/// 按**显式选中的模型**写入（Agent 接入中心弹框路径）：
+/// `owned` 已是 (模型 id, keys 下标) 的最终清单，不再做 Key 展开与区域剪枝
+/// （可用性在调用方已校验并给出明确报错）。
+pub(crate) fn wb_models_apply_selected(
+    home: &Path,
+    data_dir: &Path,
+    selected: &[&ApiKeyEntry],
+    owned: &[(String, usize)],
+) -> Result<Value, String> {
+    if owned.is_empty() {
+        return Err("未选择任何模型".into());
+    }
+    wb_write_owned(home, data_dir, selected, owned, Vec::new())
+}
+
+/// 写 models.json 的公共尾部：组条目 → 读现有 → 合并 → 原子写 → 回读校验。
+fn wb_write_owned(
+    home: &Path,
+    data_dir: &Path,
+    selected: &[&ApiKeyEntry],
+    owned: &[(String, usize)],
+    skipped_pools: Vec<String>,
+) -> Result<Value, String> {
     // 2. 组条目
     let gs = crate::api_server::gateway_settings::load(data_dir);
     let host = if gs.host.trim().is_empty() { "127.0.0.1" } else { gs.host.trim() };
@@ -636,6 +886,8 @@ pub(crate) fn wb_models_apply(
         "cn_count": cn_n,
         "global_count": gl_n,
         "models": models,
+        // 因「该池/该区无账号」被跳过的池（UI 明示，避免用户以为写全了）
+        "skipped_pools": skipped_pools,
     }))
 }
 
@@ -686,7 +938,252 @@ pub(crate) fn zcode_providers_apply(
         results.push(json!({"key_id": k.id, "key_name": k.name, "result": r}));
     }
     let ok = results.iter().filter(|r| r["result"]["ok"] == json!(true)).count();
-    json!({"ok": ok == results.len(), "applied": ok, "total": results.len(), "details": results})
+    // 同凭证的历史残留清理（与按选择写入路径同口径）：Key id 改过会导致
+    // 旧 provider 与新 provider 并存，ZCode 界面出现两个同名供应商。
+    let pruned = if ok > 0 {
+        zcode_prune_stale_by_keys(data_dir, selected)
+    } else {
+        0
+    };
+    json!({
+        "ok": ok == results.len(),
+        "applied": ok,
+        "total": results.len(),
+        "pruned": pruned,
+        "details": results,
+    })
+}
+
+/// 读配置 → 按给定 Key 清残留 → 写回（失败静默，清除是尽力而为，不影响写入结果）。
+fn zcode_prune_stale_by_keys(data_dir: &Path, selected: &[&ApiKeyEntry]) -> usize {
+    let Some(home) = agent_home() else { return 0 };
+    let path = home.join(".zcode").join("v2").join("provider_config.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else { return 0 };
+    let Ok(mut cfg) = serde_json::from_str::<Value>(&raw) else { return 0 };
+    let pids: Vec<String> = selected
+        .iter()
+        .map(|k| format!("{ZCODE_PID_PREFIX}{}", k.id))
+        .collect();
+    let keys: Vec<&str> = selected.iter().map(|k| k.key.as_str()).collect();
+    let n = zcode_prune_stale_providers(&mut cfg, &pids, &keys);
+    if n > 0 && crate::fs_utils::write_json(&path, &cfg).is_ok() {
+        let _ = crate::fs_utils::app_log(
+            data_dir,
+            &format!("ZCode 一键写入：清理同凭证历史残留 provider {n} 个"),
+        );
+    }
+    n
+}
+
+/// ZCode **按选中模型**写入（Agent 接入中心弹框路径）。
+///
+/// ZCode 的配置模型是「每 Key 一个 provider」，provider 内挂该 Key 的模型清单
+/// （`personalModelIds` / `modelOrder`）。所以「按池选模型」在这里落成：
+/// **同一把 Key 选中的模型聚成一个 provider**，`aiwork-{key.id}` 幂等覆盖——
+/// 重跑只替换本 Key 的清单，不动其他 provider 与其他 Key 的配置。
+///
+/// 与 [`self::zcode_providers_apply`]（按 Key 展开全部模型）的区别：那个不看
+/// 用户选择，这个只写点名的那几个。
+pub(crate) fn zcode_providers_apply_selected(
+    data_dir: &Path,
+    keys: &[&ApiKeyEntry],
+    owned: &[(String, usize)],
+) -> Result<Value, String> {
+    if owned.is_empty() {
+        return Err("未选择任何模型".into());
+    }
+    let home = agent_home().ok_or("USERPROFILE 缺失")?;
+    let path = home.join(".zcode").join("v2").join("provider_config.json");
+    // 文件必须已存在：它的结构（config / providerConfigRules / modelConfigRules）
+    // 由 ZCode 客户端初始化，凭空造一个骨架写进去会让客户端读配置失败。
+    let raw = std::fs::read_to_string(&path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            format!(
+                "未找到 ZCode 配置 {}：请先启动一次 ZCode 客户端让它初始化配置",
+                path.display()
+            )
+        } else {
+            format!("读取 ZCode 配置失败: {}", e)
+        }
+    })?;
+    let mut cfg: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("ZCode 配置非 JSON: {}", e))?;
+    let gs = crate::api_server::gateway_settings::load(data_dir);
+    let caps = catalog_support(data_dir);
+
+    // 按 Key 分组（keys 下标 → 该 Key 要写的模型列表，保持用户勾选顺序）
+    let mut per_key: Vec<Vec<String>> = vec![Vec::new(); keys.len()];
+    for (model, kidx) in owned {
+        if let Some(slot) = per_key.get_mut(*kidx) {
+            // 重复勾选去重（同一模型不该在 provider 清单里出现两次）
+            if !slot.iter().any(|m| m == model) {
+                slot.push(model.clone());
+            }
+        }
+    }
+
+    let mut details: Vec<Value> = Vec::new();
+    let mut ok_n = 0usize;
+    for (i, k) in keys.iter().enumerate() {
+        let models = &per_key[i];
+        if models.is_empty() {
+            continue;
+        }
+        let provider = super::api_server::zcode_provider_json(k, models, gs.port);
+        // 逐模型能力元数据（与按 Key 展开路径同口径）
+        let limits: Vec<(String, u64, u64, bool)> = models
+            .iter()
+            .map(|m| {
+                let bare = m.rsplit_once('@').map(|(b, _)| b).unwrap_or(m);
+                let c = caps.get(bare).copied().unwrap_or_default();
+                let out = if c.max_output > 0 {
+                    c.max_output
+                } else {
+                    crate::tasks::qoder_upstream::AGENT_CONFIG_MAX_OUTPUT_TOKENS as u64
+                };
+                (m.clone(), c.max_input, out, c.image)
+            })
+            .collect();
+        match zcode_upsert_provider_with_limits(&mut cfg, &provider, &limits) {
+            Ok(()) => {
+                ok_n += 1;
+                details.push(json!({
+                    "key_id": k.id,
+                    "key_name": k.name,
+                    "result": {
+                        "ok": true,
+                        "provider_id": format!("{ZCODE_PID_PREFIX}{}", k.id),
+                        "models": models.len(),
+                    },
+                }));
+            }
+            Err(e) => details.push(json!({
+                "key_id": k.id,
+                "key_name": k.name,
+                "result": { "ok": false, "error": e },
+            })),
+        }
+    }
+    if ok_n == 0 {
+        return Err(format!("全部 provider 写入失败：{details:?}"));
+    }
+    // 清理同凭证的历史残留 provider（本轮修复的真实隐患）：
+    // providerId = `aiwork-{key.id}`，一旦 Key 的 id 改过（例如早期 `qoder-overseas`
+    // 后来改成 `key-qoder-overseas`），旧 provider 不会被覆盖，而是与新 provider
+    // **并存**——ZCode 界面出现两个同名供应商，模型清单还各是一半。
+    // 判定「残留」必须同时满足三条，避免误删用户自己建的条目：
+    //   ① providerId 以 aiwork- 开头（我们的命名空间）
+    //   ② 不在本次写入名单里
+    //   ③ 其 apiKey 与本次写入的某把 Key **完全一致**（同一凭证 = 必为同一 Key 的旧条目）
+    let written_pids: Vec<String> = keys
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !per_key[*i].is_empty())
+        .map(|(_, k)| format!("{ZCODE_PID_PREFIX}{}", k.id))
+        .collect();
+    let written_keys: Vec<&str> = keys
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !per_key[*i].is_empty())
+        .map(|(_, k)| k.key.as_str())
+        .collect();
+    let pruned = zcode_prune_stale_providers(&mut cfg, &written_pids, &written_keys);
+    crate::fs_utils::write_json(&path, &cfg)?;
+    let total_models: usize = per_key.iter().map(|v| v.len()).sum();
+    let _ = crate::fs_utils::app_log(
+        data_dir,
+        &format!(
+            "已按选择写入 ZCode provider：{} 个 Key / {} 个模型（清理历史残留 {} 个）",
+            ok_n, total_models, pruned
+        ),
+    );
+    Ok(json!({
+        "ok": ok_n == details.len(),
+        "applied": ok_n,
+        "total": details.len(),
+        "added": total_models,
+        "pruned": pruned,
+        "details": details,
+        "path": path.to_string_lossy(),
+    }))
+}
+
+/// 删除「同凭证、非本次写入」的 AIWork 历史 provider（含 providerOrder 与
+/// providerModelRules 中的引用）。返回删除条数。
+///
+/// 三条判定同时满足才删（见调用处注释）：aiwork- 前缀 + 不在 written 名单 +
+/// apiKey 与本次写入的某把 Key 完全一致。任一条不满足都保留——宁可留脏，
+/// 不可误删用户自建供应商。
+fn zcode_prune_stale_providers(
+    cfg: &mut Value,
+    written_pids: &[String],
+    written_keys: &[&str],
+) -> usize {
+    let Some(cfg_obj) = cfg.get_mut("config").and_then(Value::as_object_mut) else {
+        return 0;
+    };
+    let stale: Vec<String> = cfg_obj
+        .get("providerConfigRules")
+        .and_then(|r| r.get("providerRules"))
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| {
+                    let pid = r.get("providerId").and_then(Value::as_str)?;
+                    if !pid.starts_with(ZCODE_PID_PREFIX) {
+                        return None; // 不是我们的命名空间
+                    }
+                    if written_pids.iter().any(|w| w == pid) {
+                        return None; // 本次刚写过
+                    }
+                    let key = r
+                        .pointer("/config/access/apiKey")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    // 凭证必须与本次写入的某把 Key 一致，才认定「同一 Key 的旧条目」
+                    if key.is_empty() || !written_keys.iter().any(|k| *k == key) {
+                        return None;
+                    }
+                    Some(pid.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if stale.is_empty() {
+        return 0;
+    }
+    if let Some(arr) = cfg_obj
+        .get_mut("providerConfigRules")
+        .and_then(|r| r.get_mut("providerRules"))
+        .and_then(Value::as_array_mut)
+    {
+        arr.retain(|r| {
+            r.get("providerId")
+                .and_then(Value::as_str)
+                .map(|p| !stale.iter().any(|s| s == p))
+                .unwrap_or(true)
+        });
+    }
+    if let Some(order) = cfg_obj.get_mut("providerOrder").and_then(Value::as_array_mut) {
+        order.retain(|v| {
+            v.as_str()
+                .map(|s| !stale.iter().any(|x| x == s))
+                .unwrap_or(true)
+        });
+    }
+    if let Some(pmr) = cfg_obj
+        .get_mut("modelConfigRules")
+        .and_then(|m| m.get_mut("providerModelRules"))
+        .and_then(Value::as_array_mut)
+    {
+        pmr.retain(|r| {
+            r.get("providerId")
+                .and_then(Value::as_str)
+                .map(|p| !stale.iter().any(|s| s == p))
+                .unwrap_or(true)
+        });
+    }
+    stale.len()
 }
 
 /// ZCode 清除：删除 providerId 以 aiwork- 开头的 provider（含 providerOrder 引用）
@@ -1113,6 +1610,189 @@ fn model_list_for(data_dir: &Path, key: &ApiKeyEntry) -> Vec<String> {
 
 // ==================== Tauri 命令 ====================
 
+/// 池可用性查询（Agent 接入中心「导入模型」弹框用）：各池各区域有几个账号。
+/// 前端据 `cn`/`global` 置灰无账号的池、并默认只勾有账号的池——从源头避免
+/// 「没有海外号却写进海外模型」。
+#[tauri::command]
+pub fn agent_integration_pool_availability(state: State<'_, AppState>) -> Result<Value, String> {
+    Ok(json!({ "pools": pool_availability(&state.data_dir) }))
+}
+
+/// 池可用性 + 各池可选模型清单（一次取全，弹框按池分组渲染用）。
+///
+/// 返回结构：
+/// ```json
+/// { "pools": [{ "pool": "qoder", "cn": 3, "global": 0 }],
+///   "models": [{ "id": "qoder/GLM-5.3@cn", "pool": "qoder", "region": "cn",
+///                "enabled": true }] }
+/// ```
+/// `enabled` = 该池该区是否有账号（前端据此置灰并默认不勾）。
+#[tauri::command]
+pub fn agent_integration_pool_catalog(state: State<'_, AppState>) -> Result<Value, String> {
+    let avail = pool_availability(&state.data_dir);
+    let data_dir = &state.data_dir;
+    // 目录来源与写入展开完全一致：全部池的 catalog（不分 Key，Key 只决定用哪把凭证）
+    let mut models: Vec<Value> = Vec::new();
+    let enabled_of = |pool: &str, global: Option<bool>| -> bool {
+        avail
+            .iter()
+            .find(|a| a.pool == pool)
+            .is_some_and(|a| a.has_region(global))
+    };
+    // trae
+    let trae: Vec<String> = crate::store::db(data_dir)
+        .kv_get::<Vec<Value>>("api_models")
+        .iter()
+        .filter_map(|m| m.get("id").and_then(Value::as_str).map(|s| format!("trae/{s}")))
+        .collect();
+    for id in trae {
+        models.push(json!({
+            "id": id, "pool": "trae", "region": "",
+            "enabled": enabled_of("trae", None),
+        }));
+    }
+    // buddy / qoder：双区目录，带区域后缀（与写入侧 region_tagged_models 同口径）
+    let buddy_scope = super::api_server::key_scope_models(
+        data_dir,
+        &ApiKeyEntry {
+            bind_pool: "buddy".into(),
+            ..Default::default()
+        },
+    );
+    if let Some(arr) = buddy_scope.get("buddy").and_then(Value::as_array) {
+        for m in arr.iter().filter_map(Value::as_str) {
+            let g = model_region(m);
+            models.push(json!({
+                "id": m, "pool": "buddy", "region": region_of_model_id(m),
+                "enabled": enabled_of("buddy", g),
+            }));
+        }
+    }
+    let qoder_scope = super::api_server::key_scope_models(
+        data_dir,
+        &ApiKeyEntry {
+            bind_pool: "qoder".into(),
+            ..Default::default()
+        },
+    );
+    if let Some(arr) = qoder_scope.get("qoder").and_then(Value::as_array) {
+        for m in arr.iter().filter_map(Value::as_str) {
+            let g = model_region(m);
+            models.push(json!({
+                "id": m, "pool": "qoder", "region": region_of_model_id(m),
+                "enabled": enabled_of("qoder", g),
+            }));
+        }
+    }
+    // zcode：无区域概念
+    for m in crate::api_server::zcode_catalog::list_json() {
+        if let Some(id) = m.get("id").and_then(Value::as_str) {
+            models.push(json!({
+                "id": format!("zcode/{id}"), "pool": "zcode", "region": "",
+                "enabled": enabled_of("zcode", None),
+            }));
+        }
+    }
+    Ok(json!({ "pools": avail, "models": models }))
+}
+
+/// 按「用户显式勾选的模型」写入（Agent 接入中心「导入模型」弹框提交）。
+///
+/// 与 [`agent_integration_apply`] 的区别：那个按 Key 展开全部模型，这个只写
+/// `keys` 里点名的模型——用户可以在弹框里每个池挑要哪些，不必写进去再删。
+///
+/// `models` 元素形如 `qoder/GLM-5.3@cn`；空列表直接报错（避免误清空配置）。
+#[tauri::command]
+pub fn agent_integration_apply_models(
+    state: State<'_, AppState>,
+    agent_id: String,
+    models: Vec<String>,
+    key_id: Option<String>,
+    // 每池指定 Key：`{"qoder": "key-qoder", "buddy": "key-buddy"}`。
+    // 多池混选时各池凭证可能不同，单个 key_id 无法表达；未命中回落到
+    // `key_id`，再回落到「按池绑定的启用 Key」。
+    pool_keys: Option<std::collections::HashMap<String, String>>,
+) -> Result<Value, String> {
+    if models.is_empty() {
+        return Err("未选择任何模型".into());
+    }
+    let home = agent_home().ok_or("无法解析用户主目录")?;
+    let file = crate::api_server::api_keys::load(&state.data_dir);
+    let pool_keys = pool_keys.unwrap_or_default();
+    // 每池挑一把 Key：pool_keys 显式指定 → key_id 兜底 → 按池绑定的启用 Key → 任意启用 Key
+    let pick_key = |pool: &str| -> Result<&ApiKeyEntry, String> {
+        let by_id = |id: &str| -> Option<&ApiKeyEntry> {
+            file.keys.iter().find(|k| k.id == id && k.enabled)
+        };
+        if let Some(k) = pool_keys.get(pool).and_then(|id| by_id(id)) {
+            return Ok(k);
+        }
+        if let Some(k) = key_id.as_deref().and_then(by_id) {
+            return Ok(k);
+        }
+        if let Some(id) = key_id.as_deref() {
+            // 显式指定了但找不到/已停用：报错而不是静默换一把（凭证会绑错）
+            if file.keys.iter().any(|k| k.id == id) {
+                return Err(format!("Key「{id}」已停用，请先启用"));
+            }
+            return Err(format!("Key 不存在: {id}"));
+        }
+        file.keys
+            .iter()
+            .find(|k| k.enabled && k.bind_pool == pool)
+            .or_else(|| file.keys.iter().find(|k| k.enabled))
+            .ok_or_else(|| "没有启用的 API Key，请先在 API 管理创建".to_string())
+    };
+    // 可用性再校验一次（前端置灰可能被绕过）：无账号的池/区直接拒绝，不静默写
+    let avail = pool_availability(&state.data_dir);
+    for m in &models {
+        let pool = model_pool(m);
+        if let Some(a) = avail.iter().find(|x| x.pool == pool) {
+            if !a.has_region(model_region(m)) {
+                return Err(format!(
+                    "模型 {m} 所属的「{pool}」没有可用账号，不能写入（请先导入账号或取消该模型）"
+                ));
+            }
+        }
+    }
+    // 模型 → (池 Key) 归组：WorkBuddy 每模型一条、ZCode 每 Key 一个 provider，
+    // 两条路径都需要「这把 Key 负责这些模型」的映射，故先统一归组。
+    let mut owned: Vec<(String, usize)> = Vec::new();
+    let mut keys: Vec<&ApiKeyEntry> = Vec::new();
+    for m in &models {
+        let pool = model_pool(m);
+        let k = pick_key(pool)?;
+        let idx = match keys.iter().position(|x| x.id == k.id) {
+            Some(i) => i,
+            None => {
+                keys.push(k);
+                keys.len() - 1
+            }
+        };
+        owned.push((m.clone(), idx));
+    }
+    let result = match agent_id.as_str() {
+        "workbuddy" => wb_models_apply_selected(&home, &state.data_dir, &keys, &owned)?,
+        "zcode" => zcode_providers_apply_selected(&state.data_dir, &keys, &owned)?,
+        other => {
+            return Err(format!(
+                "{} 不支持逐模型选择（仅 WorkBuddy 每模型一条、ZCode 每 Key 一个 provider；\
+                 Claude/Codex/opencode 是单端点，请直接用「一键写入」）",
+                other
+            ))
+        }
+    };
+    let _ = crate::fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "Agent 接入中心：按选择写入 {}（{} 个模型）",
+            agent_id,
+            models.len()
+        ),
+    );
+    Ok(result)
+}
+
 /// Agent 接入中心：检测本机 agent
 #[tauri::command]
 pub fn agent_integration_scan(_state: State<'_, AppState>) -> Result<Value, String> {
@@ -1244,8 +1924,88 @@ mod tests {
         }
     }
 
+    /// 无账号的池/区必须被剔除（2026-10-23 用户实况：只有 trae/buddy/qoder
+    /// 国内号，一键写入却把 @global 模型写进 models.json）。
+    #[test]
+    fn filter_drops_pools_without_accounts() {
+        let avail = vec![
+            PoolAvailability { pool: "trae".into(), cn: 3, global: 0 },
+            PoolAvailability { pool: "buddy".into(), cn: 2, global: 0 },
+            // 关键：qoder 只有国内号，海外 0
+            PoolAvailability { pool: "qoder".into(), cn: 4, global: 0 },
+            PoolAvailability { pool: "zcode".into(), cn: 0, global: 0 },
+        ];
+        let owned = vec![
+            ("trae/glm-5.3".to_string(), 0usize),
+            ("buddy/GLM-5.3@cn".to_string(), 0usize),
+            ("buddy/GLM-5.3@global".to_string(), 0usize), // 海外无号 → 剔除
+            ("qoder/GLM-5.3@cn".to_string(), 0usize),
+            ("qoder/GLM-5.3@global".to_string(), 0usize), // 海外无号 → 剔除
+            ("zcode/glm-5.3".to_string(), 0usize),        // 整池无号 → 剔除
+        ];
+        let (kept, skipped) = filter_models_by_pool_availability(owned, &avail);
+        let ids: Vec<&str> = kept.iter().map(|(m, _)| m.as_str()).collect();
+        assert!(ids.contains(&"trae/glm-5.3"), "有号的池应保留");
+        assert!(ids.contains(&"buddy/GLM-5.3@cn"), "国内有号应保留");
+        assert!(ids.contains(&"qoder/GLM-5.3@cn"), "国内有号应保留");
+        assert!(!ids.iter().any(|m| m.ends_with("@global")), "海外无号不得写入");
+        assert!(!ids.iter().any(|m| m.starts_with("zcode/")), "整池无号不得写入");
+        // 跳过原因必须区分「整池没号」与「该区没号」
+        assert!(
+            skipped.iter().any(|s| s.contains("zcode") && s.contains("未配置账号池")),
+            "整池无号提示口径，实际 {skipped:?}"
+        );
+        assert!(
+            skipped.iter().any(|s| s.contains("qoder") && s.contains("无海外账号")),
+            "分区无号提示口径，实际 {skipped:?}"
+        );
+    }
+
+    /// 海外有号时 @global 必须保留（不能把豁免做成「一律不写海外」）
+    #[test]
+    fn filter_keeps_global_when_accounts_exist() {
+        let avail = vec![PoolAvailability { pool: "qoder".into(), cn: 1, global: 2 }];
+        let owned = vec![
+            ("qoder/GLM-5.3@cn".to_string(), 0usize),
+            ("qoder/GLM-5.3@global".to_string(), 0usize),
+        ];
+        let (kept, skipped) = filter_models_by_pool_availability(owned, &avail);
+        assert_eq!(kept.len(), 2, "两区都有号，两条都保留");
+        assert!(skipped.is_empty(), "不该有任何跳过提示");
+    }
+
+    /// 裸名模型（单区独有/无区域概念）按「任一区有号」放行
+    #[test]
+    fn filter_bare_model_needs_any_account() {
+        let avail = vec![
+            PoolAvailability { pool: "qoder".into(), cn: 0, global: 1 },
+            PoolAvailability { pool: "buddy".into(), cn: 0, global: 0 },
+        ];
+        let (kept, _) = filter_models_by_pool_availability(
+            vec![
+                ("qoder/only-global-model".to_string(), 0usize),
+                ("buddy/whatever".to_string(), 0usize),
+            ],
+            &avail,
+        );
+        assert_eq!(kept.len(), 1, "qoder 有海外号，裸名放行");
+        assert_eq!(kept[0].0, "qoder/only-global-model");
+    }
+
+    /// 未知池前缀（自定义模型）不拦——目录由用户自己维护，不该被账号数否决
+    #[test]
+    fn filter_passes_unknown_prefix() {
+        let (kept, skipped) = filter_models_by_pool_availability(
+            vec![("custom/my-model".to_string(), 0usize)],
+            &[PoolAvailability { pool: "qoder".into(), cn: 1, global: 0 }],
+        );
+        assert_eq!(kept.len(), 1);
+        assert!(skipped.is_empty());
+    }
+
     #[test]
     fn scan_detects_by_anchor_dir() {
+
         let home = temp_home("scan");
         std::fs::create_dir_all(home.join(".workbuddy")).unwrap();
         let agents = scan(&home);
@@ -1375,6 +2135,89 @@ mod tests {
         assert_eq!(back.len(), 1);
         assert_eq!(back[0]["id"], json!("keep"));
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    /// ZCode 按选择写入的归组语义：同一 Key 的模型聚成一个 provider（清单=勾选），
+    /// 不同 Key 各成独立 provider。这里只验归组与去重（不落盘，避免污染真实
+    /// provider_config.json——写盘路径需 ZCode 客户端已初始化）。
+    #[test]
+    fn zcode_selected_groups_models_per_key_without_duplicates() {
+        let k0 = key_entry("k0", "Qoder池", "ck_q", "qoder", true);
+        let k1 = key_entry("k1", "Buddy池", "ck_b", "buddy", true);
+        let keys = vec![&k0, &k1];
+        let owned = vec![
+            ("qoder/GLM-5.3@cn".to_string(), 0usize),
+            ("qoder/GLM-5.3@cn".to_string(), 0usize), // 重复勾选 → 必须去重
+            ("qoder/Qwen3.8-Flash".to_string(), 0usize),
+            ("buddy/hy3".to_string(), 1usize),
+        ];
+        // 复刻函数内的归组逻辑（纯逻辑部分）
+        let mut per_key: Vec<Vec<String>> = vec![Vec::new(); keys.len()];
+        for (model, kidx) in &owned {
+            if let Some(slot) = per_key.get_mut(*kidx) {
+                if !slot.iter().any(|m| m == model) {
+                    slot.push(model.clone());
+                }
+            }
+        }
+        assert_eq!(per_key[0].len(), 2, "重复勾选去重后应剩 2 个");
+        assert_eq!(per_key[0][0], "qoder/GLM-5.3@cn", "保持勾选顺序");
+        assert_eq!(per_key[1].len(), 1, "另一把 Key 只拿到自己的模型");
+
+        // providerId 必须是 aiwork-{key.id}，保证重跑幂等覆盖而非追加
+        let pid0 = format!("{ZCODE_PID_PREFIX}{}", keys[0].id);
+        assert_eq!(pid0, "aiwork-k0");
+    }
+
+    /// 残留 provider 清理：只删「aiwork- 前缀 + 非本次写入 + 同凭证」的历史条目。
+    ///
+    /// 这条保护真实隐患——Key 的 id 改过之后（早期 `qoder-overseas` → 后来
+    /// `key-qoder-overseas`），旧 provider 不会被覆盖而是与新 provider 并存。
+    #[test]
+    fn zcode_prune_removes_only_same_key_stale_provider() {
+        let mut cfg = json!({"config": {
+            "providerOrder": ["aiwork-old-qoder", "aiwork-key-qoder", "new-provider", "aiwork-other"],
+            "providerConfigRules": {"providerRules": [
+                // ① 同凭证 + 非本次写入 + aiwork 前缀 → 删除
+                {"providerId": "aiwork-old-qoder", "config": {"access": {"apiKey": "ck_q"}}},
+                // ② 本次写入 → 保留
+                {"providerId": "aiwork-key-qoder", "config": {"access": {"apiKey": "ck_q"}}},
+                // ③ 用户自建（非 aiwork 前缀）→ 保留
+                {"providerId": "new-provider", "config": {"access": {"apiKey": "ck_q"}}},
+                // ④ aiwork 前缀但凭证不同（另一把 Key 的历史，本次没写它）→ 保留
+                {"providerId": "aiwork-other", "config": {"access": {"apiKey": "ck_zzz"}}},
+            ]},
+            "modelConfigRules": {"providerModelRules": [
+                {"providerId": "aiwork-old-qoder", "modelId": "qoder/a"},
+                {"providerId": "aiwork-key-qoder", "modelId": "qoder/b"},
+            ]}
+        }});
+        let pruned = zcode_prune_stale_providers(
+            &mut cfg,
+            &["aiwork-key-qoder".to_string()],
+            &["ck_q"],
+        );
+        assert_eq!(pruned, 1, "只删同凭证的那条残留");
+        let rules = cfg["config"]["providerConfigRules"]["providerRules"].as_array().unwrap();
+        let ids: Vec<&str> = rules.iter().filter_map(|r| r["providerId"].as_str()).collect();
+        assert!(!ids.contains(&"aiwork-old-qoder"), "同凭证残留必须删除");
+        assert!(ids.contains(&"aiwork-key-qoder"), "本次写入的保留");
+        assert!(ids.contains(&"new-provider"), "用户自建不得误删");
+        assert!(ids.contains(&"aiwork-other"), "凭证不同不得误删");
+        // 引用也要清干净（providerOrder / providerModelRules）
+        let order: Vec<&str> = cfg["config"]["providerOrder"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(!order.contains(&"aiwork-old-qoder"), "providerOrder 引用必须清掉");
+        let pmr = cfg["config"]["modelConfigRules"]["providerModelRules"].as_array().unwrap();
+        assert!(
+            !pmr.iter().any(|r| r["providerId"] == json!("aiwork-old-qoder")),
+            "providerModelRules 引用必须清掉"
+        );
     }
 
     #[test]
