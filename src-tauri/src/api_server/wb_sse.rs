@@ -846,7 +846,7 @@ pub fn stream_forward(
 pub fn aggregate<L: Iterator<Item = String>>(
     lines: L,
     chat_id: &str,
-) -> (Option<Value>, Option<(i64, String)>) {
+) -> (Option<Value>, bool, Option<(i64, String)>) {
     let mut parser = WbSseParser::new(lines);
     let mut content = String::new();
     let mut reasoning = String::new();
@@ -854,12 +854,20 @@ pub fn aggregate<L: Iterator<Item = String>>(
     let mut usage: Option<Value> = None;
     // index → (id, name, args)
     let mut tools: BTreeMap<i64, (String, String, String)> = BTreeMap::new();
+    // EOF 断流标记（与 stream_forward_ex 同语义）：上游未发 Done/Error 即断流
+    // 且已有内容——聚合路径同样会把半截回复伪装成 finish_reason="stop" 的完整
+    // 响应，调用方据此解绑粘性漂移。finish 已携带也置位（软掐口径一致）
+    let mut eof_truncated = false;
 
     loop {
         match parser.next_event() {
-            None => break,
+            None => {
+                eof_truncated =
+                    !content.is_empty() || !reasoning.is_empty() || !tools.is_empty();
+                break;
+            }
             Some(WbEvent::Done) => break,
-            Some(WbEvent::Error { code, msg }) => return (None, Some((code, msg))),
+            Some(WbEvent::Error { code, msg }) => return (None, false, Some((code, msg))),
             Some(WbEvent::Chunk { delta, finish: f, usage: u, .. }) => {
                 if let Some(x) = u {
                     usage = Some(x);
@@ -935,7 +943,7 @@ pub fn aggregate<L: Iterator<Item = String>>(
     if let Some(u) = usage {
         resp["usage"] = u;
     }
-    (Some(resp), None)
+    (Some(resp), eof_truncated, None)
 }
 
 /// OpenAI finish_reason → Anthropic stop_reason 映射（P1 修复）
@@ -1335,8 +1343,9 @@ mod tests {
             ]),
             "chat-1",
         );
-        let (resp, err) = out;
+        let (resp, eof_truncated, err) = out;
         assert!(err.is_none());
+        assert!(!eof_truncated, "带 [DONE] 的正常聚合不得置断流标记");
         let r = resp.unwrap();
         let msg = &r["choices"][0]["message"];
         assert_eq!(msg["content"], json!("done"));
@@ -1348,7 +1357,7 @@ mod tests {
 
     #[test]
     fn aggregate_reports_error_before_any_content() {
-        let (resp, err) = aggregate(
+        let (resp, _eof, err) = aggregate(
             lines(&["data: {\"error\":{\"message\":\"boom\",\"code\":9}}", ""]),
             "c",
         );
@@ -1358,7 +1367,7 @@ mod tests {
 
     #[test]
     fn converters_roundtrip() {
-        let (resp, _) = aggregate(lines(&["data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}", "data: [DONE]", ""]), "c1");
+        let (resp, _eof, _) = aggregate(lines(&["data: {\"choices\":[{\"delta\":{\"content\":\"你好\"}}]}", "data: [DONE]", ""]), "c1");
         let v = resp.unwrap();
         let anth = completion_to_anthropic(&v, "msg_1", "glm-5.3");
         assert_eq!(anth["type"], json!("message"));

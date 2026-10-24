@@ -79,7 +79,7 @@ pub fn probe(cm: &CustomModel) -> Result<String, String> {
     })?;
     let lines = wb_upstream::lines_with_first_byte_timeout(reader)
         .map_err(|_| "10 秒内未收到上游响应（首字超时）".to_string())?;
-    let (resp, error_info) = wb_sse::aggregate(lines, &format!("probe-{}", now_ts()));
+    let (resp, _eof_truncated, error_info) = wb_sse::aggregate(lines, &format!("probe-{}", now_ts()));
     match (resp, error_info) {
         (Some(r), None) => {
             let content = r
@@ -301,7 +301,7 @@ pub async fn custom_aggregate_chat(
                 return Err("自定义上游 10 秒内未响应（首字超时）".into());
             }
         };
-        let (resp, error_info) = wb_sse::aggregate(lines, &format!("chatcmpl-{}", now_ts()));
+        let (resp, eof_truncated, error_info) = wb_sse::aggregate(lines, &format!("chatcmpl-{}", now_ts()));
         let duration_ms = start_ts.elapsed().as_millis() as u64;
         match (resp, error_info) {
             (Some(mut r), None) => {
@@ -316,7 +316,9 @@ pub async fn custom_aggregate_chat(
                 state.record_usage_custom(&model, &key_id, true, stream, duration_ms, pt, ct);
                 state.logger.log_request(
                     "custom", "POST", proto.log_path(), &model, stream, 200, "custom", duration_ms,
-                    &key_name, &acct_name, None,
+                    &key_name, &acct_name,
+                    // EOF 断流（聚合路径观测）：半截回复已按完整响应交付，留痕
+                    if eof_truncated { Some("EOF 断流 → 补帧收尾") } else { None },
                 );
                 Ok(r)
             }

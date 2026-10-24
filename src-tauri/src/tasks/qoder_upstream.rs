@@ -2268,14 +2268,14 @@ pub fn open_qoder_stream(
 
 /// 聚合入口：reader → 首字超时 → 翻译 → `wb_sse::aggregate`
 ///（tool_calls 按 index 合并、usage/finish 收集）。
-/// 返回 (completion, error)；Err(()) = 首字超时（调用方按 Server 换号）。
+/// 返回 (completion, eof_truncated, error)；Err(()) = 首字超时（调用方按 Server 换号）。
 #[allow(dead_code)] // p3-3-wire（dispatch/payload）消费
 pub fn aggregate_qoder(
     reader: Box<dyn Read + Send>,
     err_slot: Arc<Mutex<Option<ErrMeta>>>,
     chat_id: &str,
     model: &str,
-) -> Result<(Option<Value>, Option<(i64, String)>), ()> {
+) -> Result<(Option<Value>, bool, Option<(i64, String)>), ()> {
     let lines = lines_with_first_byte_timeout(reader)?;
     let translated = QoderTranslate::new(lines, err_slot, chat_id, model);
     Ok(wb_sse::aggregate(translated, chat_id))
@@ -3441,7 +3441,7 @@ mod tests {
         let reader = std::io::Cursor::new(text.into_bytes());
         let ilines = open_qoder_stream(Box::new(reader), slot, "chat-1", "M")
             .expect("首字正常应成功");
-        let (completion, err) = wb_sse::aggregate(ilines, "chat-1");
+        let (completion, _eof, err) = wb_sse::aggregate(ilines, "chat-1");
         assert!(err.is_none(), "无流内错误");
         let completion = completion.expect("必须聚合出 completion");
         assert_eq!(completion["choices"][0]["message"]["content"], "你好");

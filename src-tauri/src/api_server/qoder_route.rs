@@ -1018,6 +1018,21 @@ fn run_qoder_stream(
                         if allowed_set.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
                             return None;
                         }
+                        // TTFB 逃生阀（C，2026-10-23）：绑定号持续劣化且有其他
+                        // 健康号时放弃粘性（一次冷缓存换可用性）
+                        if state.qoder_pool.ttfb_demoted(&b.uid)
+                            && state.qoder_pool.has_other_selectable_for_model(
+                                &b.uid,
+                                allowed_set.as_ref(),
+                                Some(want_global),
+                            )
+                        {
+                            state.logger.log_sched_event(&format!(
+                                "sticky_ttfb_drift uid={} (首字 EWMA 劣化，放弃粘性漂移换号)",
+                                b.uid
+                            ));
+                            return None;
+                        }
                         state.qoder_pool
                             .pick_by_uid_region_free_tier(&b.uid, Some(want_global), free_tier)
                             .map(|_| b.uid)
@@ -1935,6 +1950,20 @@ pub async fn qoder_aggregate_chat(
                 if allowed_set.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
                     return None;
                 }
+                // TTFB 逃生阀（同流式路径 C）：劣化且有备选 → 放弃粘性
+                if state.qoder_pool.ttfb_demoted(&b.uid)
+                    && state.qoder_pool.has_other_selectable_for_model(
+                        &b.uid,
+                        allowed_set.as_ref(),
+                        Some(want_global),
+                    )
+                {
+                    state.logger.log_sched_event(&format!(
+                        "sticky_ttfb_drift uid={} (首字 EWMA 劣化，放弃粘性漂移换号)",
+                        b.uid
+                    ));
+                    return None;
+                }
                 state.qoder_pool.pick_by_uid_region_free_tier(&b.uid, Some(want_global), free_tier).map(|_| b.uid)
             })
     } else {
@@ -2157,7 +2186,7 @@ pub async fn qoder_aggregate_chat(
                         let agg_chat_id = format!("chatcmpl-{}", now_ts());
                         let translated =
                             qoder_upstream::QoderTranslate::new(race.lines, err_slot.clone(), &agg_chat_id, &model);
-                        let (resp, error) = wb_sse::aggregate(translated, &agg_chat_id);
+                        let (resp, eof_truncated, error) = wb_sse::aggregate(translated, &agg_chat_id);
                         let duration_ms = start_ts.elapsed().as_millis() as u64;
                         match (resp, error) {
                             (Some(mut r), None) => {
@@ -2180,6 +2209,25 @@ pub async fn qoder_aggregate_chat(
                                     &session_ctx_from_ids(&peek, win_session_ids.as_ref()),
                                 );
                                 clear_model_cooldown(&model, want_global); // 审查修复：成功即清模型级冷却
+                                if eof_truncated {
+                                    // EOF 断流（聚合路径，同流式漂移语义 2026-10-23）：
+                                    // 半截回复已按完整响应交付，不记成功、解绑粘性
+                                    // 让会话下轮漂移，日志留痕
+                                    if state
+                                        .qoder_sticky_enabled
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    {
+                                        state.qoder_sticky.unbind_key(&sticky_key);
+                                        state.qoder_sticky.save(&state.data_dir);
+                                    }
+                                    state.logger.log_request_ttfb(
+                                        "qoder", "POST", "/v1/chat/completions", &model, stream, 200,
+                                        &win_uid, duration_ms, Some(ttfb_ms), &key_name,
+                                        &state.qoder_pool.name_of(&win_uid),
+                                        Some("EOF 断流 → 补帧收尾，解绑粘性（下轮漂移换号）"),
+                                    );
+                                    return Ok(r);
+                                }
                                 state.qoder_pool.note_success(&win_uid);
                                 // F-80-余 v2：绑定粘性会话（开关开启时；同流式路径）
                                 if state

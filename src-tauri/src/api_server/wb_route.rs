@@ -763,6 +763,20 @@ fn run_wb_stream(
             if allowed_set.as_ref().map_or(false, |a| !a.contains(&b.uid)) {
                 return None;
             }
+            // TTFB 逃生阀（C，2026-10-23）：绑定号持续劣化（EWMA 跨阈）且池内
+            // 确有其他健康号时放弃粘性——一次冷缓存换回可用性；未劣化/无备选
+            // 保持粘性（慢首字单次出现不漂移，EWMA 平滑过才触发）
+            if state.wb_pool.ttfb_demoted(&b.uid)
+                && state
+                    .wb_pool
+                    .has_other_selectable_for_model(&b.uid, allowed_set.as_ref(), want_global)
+            {
+                state.logger.log_sched_event(&format!(
+                    "sticky_ttfb_drift uid={} (首字 EWMA 劣化，放弃粘性漂移换号)",
+                    b.uid
+                ));
+                return None;
+            }
             state
                 .wb_pool
                 .pick_by_uid_region(&b.uid, want_global)
@@ -1335,6 +1349,18 @@ pub async fn wb_aggregate_chat(
                 if allowed_set.as_ref().map_or(false, |a| !a.contains(&b.uid)) {
                     return None;
                 }
+                // TTFB 逃生阀（同流式路径 C）：劣化且有备选 → 放弃粘性
+                if state.wb_pool.ttfb_demoted(&b.uid)
+                    && state
+                        .wb_pool
+                        .has_other_selectable_for_model(&b.uid, allowed_set.as_ref(), want_global)
+                {
+                    state.logger.log_sched_event(&format!(
+                        "sticky_ttfb_drift uid={} (首字 EWMA 劣化，放弃粘性漂移换号)",
+                        b.uid
+                    ));
+                    return None;
+                }
                 state
                     .wb_pool
                     .pick_by_uid_region(&b.uid, want_global)
@@ -1507,7 +1533,7 @@ pub async fn wb_aggregate_chat(
                         let win_uid = win.uid.as_str();
                         // TTFB 劣化观测（同流式路径 #3）
                         state.wb_pool.note_ttfb(win_uid, ttfb_ms);
-                        let (resp, error_info) =
+                        let (resp, eof_truncated, error_info) =
                             wb_sse::aggregate(win.lines, &format!("chatcmpl-{}", now_ts()));
                         let duration_ms = start_ts.elapsed().as_millis() as u64;
                         match (resp, error_info) {
@@ -1537,6 +1563,21 @@ pub async fn wb_aggregate_chat(
                                 );
                                 // F-76① TTFT 入账
                                 state.record_usage_ttfb(true, &model, win_uid, &key_id, true, stream, duration_ms, pt, ct, Some(ttfb_ms));
+                                if eof_truncated {
+                                    // EOF 断流（聚合路径，同流式漂移语义 2026-10-23）：
+                                    // 半截回复已按完整响应交付（补帧 finish），无法重发；
+                                    // 不记成功、解绑粘性让会话下轮漂移，日志留痕——
+                                    // 原先这里落一行无备注 200，三边全不可见
+                                    state.wb_sticky.unbind_key(&sticky_key);
+                                    state.wb_sticky.save(&state.data_dir);
+                                    state.logger.log_request_ttfb(
+                                        "buddy", "POST", "/v2/chat/completions", &model, stream, 200, win_uid,
+                                        duration_ms, Some(ttfb_ms), &key_name,
+                                        &state.wb_pool.name_of(win_uid),
+                                        Some("EOF 断流 → 补帧收尾，解绑粘性（下轮漂移换号）"),
+                                    );
+                                    return Ok(r);
+                                }
                                 state.wb_pool.note_success(win_uid);
                                 clear_model_failure(&state, &model);
                                 state.wb_sticky.bind(&sticky_key, win_uid, &conv_id, now_ts());
@@ -1948,7 +1989,7 @@ pub async fn wb_tool_exec_chat(
                             }
                         };
                         last_ttfb_ms = Some(ttfb_start.elapsed().as_millis() as u64);
-                        let (completion, error_info) =
+                        let (completion, eof_truncated, error_info) =
                             wb_sse::aggregate(lines, &format!("chatcmpl-{}", now_ts()));
                         if let Some((code, msg)) = error_info {
                             let kind = classify_wb_error(code, &msg);
@@ -1989,6 +2030,15 @@ pub async fn wb_tool_exec_chat(
                                 Some(&format!("空完成 → 换号重试{}", wb_payload::template_hit_note())),
                             );
                             break Err("空完成（影子风控/上游异常）".to_string());
+                        }
+                        if eof_truncated {
+                            // EOF 断流（tool-exec 多轮路径，观测性留痕）：本轮已补帧
+                            // 收尾交付，工具调用参数可能不完整——仅留痕不改行为
+                            // （重发本轮会重复计费）
+                            state.logger.log_sched_event(&format!(
+                                "wb-toolexec eof_truncated uid={} model={} (EOF 断流，本轮补帧收尾)",
+                                picked.uid, model
+                            ));
                         }
                         if let Some(u) = completion.get("usage") {
                             // 宽口径提取（别名 + 字符串数字形态，审查 P2）；

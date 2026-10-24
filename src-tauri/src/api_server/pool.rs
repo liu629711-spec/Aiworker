@@ -302,6 +302,11 @@ pub struct ApiPool {
     /// InflightGuard 取号后 bind，Drop（流结束/断连/panic 展开）时 -1。
     /// 计数器经 Arc 与 guard 共享，池重建（sync_*）不中断在途请求的配对释放
     inflight: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicU32>>>,
+    /// 近窗选中计数（负载感知 B，2026-10-23）：uid → 窗口内选中时刻（秒）。
+    /// inflight 只看并发——顺序 agent 循环（主力负载）的 inflight 恒 0，
+    /// 「某号正被单个会话独占」只有近窗选中次数能反映。Weighted/P2C 打分
+    /// 消费；独立于 entries 锁，可在任意取号点调用
+    pick_window: Mutex<HashMap<String, Vec<i64>>>,
     /// 账号并发上限（F-77，api_pool.json 热应用）：0 = 不限；默认 1。
     /// inflight ≥ 上限的账号视为 busy 不参与候选；全部 busy 时降级取
     /// inflight 最小者（不过载拒绝，保证请求不失败）
@@ -334,6 +339,7 @@ impl ApiPool {
             strategy: Mutex::new(PoolStrategy::ExpireFirst),
             recent_pick: Mutex::new((String::new(), 0)),
             inflight: Mutex::new(HashMap::new()),
+            pick_window: Mutex::new(HashMap::new()),
             concurrency_limit: std::sync::atomic::AtomicU32::new(1),
             reserve_credits: std::sync::atomic::AtomicU64::new(0.0f64.to_bits()),
             pool_label: Mutex::new(String::new()),
@@ -955,7 +961,7 @@ impl ApiPool {
         let now = now_ts();
         let tried = HashSet::new();
         let reserve = self.reserve_credits();
-        entries
+        let picked = entries
             .get(uid)
             .filter(|e| selectable_for_model(e, &tried, now, reserve, free_tier))
             .filter(|e| want_global.map_or(true, |w| e.global_region == w))
@@ -969,7 +975,12 @@ impl ApiPool {
                 global_region: e.global_region,
                 // 专一/粘性锁定：忽略 busy 过滤（语义即「锁定即用」），无条件绑定
                 over_limit: true,
-            })
+            });
+        if picked.is_some() {
+            // 粘性/专一命中同样计入近窗选中（热会话多为粘性，其流量必须可见）
+            self.note_pick(uid);
+        }
+        picked
     }
 
     /// 每区域各取一个含凭证账号（WB 模型目录刷新用，修复「海外账号模型目录」）：
@@ -1086,6 +1097,7 @@ impl ApiPool {
         let inflight = self.inflight_snapshot();
         let limit = self.concurrency_limit();
         let (cands, busy_fallback) = busy_filter(&all_cands, &inflight, limit);
+        let recent_counts = self.recent_snapshot();
         let rand_seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() ^ (d.subsec_nanos() as u64).wrapping_mul(0x9e3779b97f4a7c15))
@@ -1102,7 +1114,7 @@ impl ApiPool {
             // 不做粘性漂移依据（reasoning 模型慢首字是常态），会话漂移仍由
             // 断流驱动（wb_route eof_truncated）
             let (cands, _) = ttfb_demote_filter(&cands);
-            pick_by_strategy(&cands, strategy, rand_seed, now, &inflight)
+            pick_by_strategy(&cands, strategy, rand_seed, now, &inflight, &recent_counts)
         }?;
 
         // 防惊群：100ms 内重复选中同一 uid 且还有其他候选 → 让位（T2.2）；
@@ -1125,6 +1137,7 @@ impl ApiPool {
                     rand_seed.wrapping_add(1),
                     now,
                     &inflight,
+                    &recent_counts,
                 ) {
                     picked = alt;
                 }
@@ -1164,6 +1177,7 @@ impl ApiPool {
         if let Some(e) = entries.get_mut(&account.uid) {
             e.last_used = now;
         }
+        self.note_pick(&account.uid);
         Some((account, event))
     }
 
@@ -1216,6 +1230,7 @@ impl ApiPool {
                     if let Some(e) = entries.get_mut(uid) {
                         e.last_used = now;
                     }
+                    self.note_pick(uid);
                     return Some((p, None));
                 }
             }
@@ -1243,13 +1258,14 @@ impl ApiPool {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() ^ (d.subsec_nanos() as u64).wrapping_mul(0x9e3779b97f4a7c15))
             .unwrap_or(0);
+        let recent_counts = self.recent_snapshot();
         let mut picked = if busy_fallback {
             all_cands
                 .iter()
                 .copied()
                 .min_by_key(|e| inflight_of(e, &inflight))
         } else {
-            pick_plan_first(&cands, strategy, rand_seed, now, &inflight)
+            pick_plan_first(&cands, strategy, rand_seed, now, &inflight, &recent_counts)
         }?;
         // 防惊群：同 100ms 内重复选中且还有其他候选 → 让位（同档内重新挑）
         if !busy_fallback && cands.len() > 1 {
@@ -1264,9 +1280,14 @@ impl ApiPool {
                     .copied()
                     .filter(|e| e.uid != picked.uid)
                     .collect();
-                if let Some(alt) =
-                    pick_plan_first(&others, strategy, rand_seed.wrapping_add(1), now, &inflight)
-                {
+                if let Some(alt) = pick_plan_first(
+                    &others,
+                    strategy,
+                    rand_seed.wrapping_add(1),
+                    now,
+                    &inflight,
+                    &recent_counts,
+                ) {
                     picked = alt;
                 }
             }
@@ -1282,6 +1303,7 @@ impl ApiPool {
             global_region: picked.global_region,
             over_limit: busy_fallback,
         };
+        self.note_pick(&account.uid);
         // 可观测：套餐过滤/降级事件（无则 None，调用方只在 Some 时记日志）
         let event = if all_cands.is_empty() && plan_blocked > 0 {
             Some(format!(
@@ -1414,11 +1436,13 @@ impl ApiPool {
             .filter(|e| inflight_of(e, &inflight) < limit)
             .collect();
         let strategy = *safe_lock(&self.strategy);
+        let recent = self.recent_snapshot();
         let rand_seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() ^ (d.subsec_nanos() as u64).wrapping_mul(0x9e3779b97f4a7c15))
             .unwrap_or(0);
-        let Some(picked) = pick_by_strategy(&idle, strategy, rand_seed, now, &inflight) else {
+        let Some(picked) = pick_by_strategy(&idle, strategy, rand_seed, now, &inflight, &recent)
+        else {
             return Some((sticky, None));
         };
         let account = PickedAccount {
@@ -1439,6 +1463,7 @@ impl ApiPool {
         if let Some(e) = entries.get_mut(&account.uid) {
             e.last_used = now;
         }
+        self.note_pick(&account.uid);
         Some((account, event))
     }
 
@@ -1692,6 +1717,43 @@ impl ApiPool {
                 );
             }
         }
+    }
+
+    /// 近窗选中窗口（秒）：窗口内的选中次数进 Weighted/P2C 打分
+    pub const PICK_WINDOW_SECS: i64 = 60;
+
+    /// 记录一次取号命中（各取号 fn 选定账号后调用；粘性/专一/策略取号都算——
+    /// 热会话多为粘性，它的流量必须进近窗计数才能被后续新会话避开）
+    pub fn note_pick(&self, uid: &str) {
+        let now = now_ts();
+        let mut window = safe_lock(&self.pick_window);
+        let slots = window.entry(uid.to_string()).or_default();
+        slots.retain(|&t| now - t < Self::PICK_WINDOW_SECS);
+        slots.push(now);
+    }
+
+    /// 近窗选中次数快照（读侧顺带清理过期条目，防无界增长）
+    fn recent_snapshot(&self) -> HashMap<String, usize> {
+        let now = now_ts();
+        let mut window = safe_lock(&self.pick_window);
+        window.retain(|_, slots| {
+            slots.retain(|&t| now - t < Self::PICK_WINDOW_SECS);
+            !slots.is_empty()
+        });
+        window
+            .iter()
+            .map(|(uid, slots)| (uid.clone(), slots.len()))
+            .collect()
+    }
+
+    /// 该账号 TTFB EWMA 是否已跨降权阈值（粘性逃生阀判据，配合
+    /// has_other_selectable_for_model 使用：劣化 + 有备选才放弃粘性）
+    pub fn ttfb_demoted(&self, uid: &str) -> bool {
+        let entries = safe_lock(&self.entries);
+        entries
+            .get(uid)
+            .map(|e| e.ttfb_ewma_ms >= Self::TTFB_DEMOTE_MS)
+            .unwrap_or(false)
     }
 
     /// 把账号冷却精确延长到上游下发的恢复时刻（6004 日限额「将在 … UTC+8 重置」）。
@@ -2357,6 +2419,7 @@ fn pick_plan_first<'a>(
     rand_seed: u64,
     now: i64,
     inflight: &HashMap<String, u32>,
+    recent: &HashMap<String, usize>,
 ) -> Option<&'a PoolEntry> {
     if cands.is_empty() {
         return None;
@@ -2367,7 +2430,8 @@ fn pick_plan_first<'a>(
         .copied()
         .filter(|e| plan_order(e) == best_key)
         .collect();
-    pick_by_strategy(&tier, strategy, rand_seed, now, inflight).or_else(|| tier.first().copied())
+    pick_by_strategy(&tier, strategy, rand_seed, now, inflight, recent)
+        .or_else(|| tier.first().copied())
 }
 
 /// 按策略从候选集中挑选（纯函数，便于单测）；
@@ -2378,14 +2442,15 @@ fn pick_by_strategy<'a>(
     rand_seed: u64,
     now: i64,
     inflight: &HashMap<String, u32>,
+    recent: &HashMap<String, usize>,
 ) -> Option<&'a PoolEntry> {
     if cands.is_empty() {
         return None;
     }
     match strategy {
         PoolStrategy::Random => Some(cands[(rand_seed as usize) % cands.len()]),
-        PoolStrategy::Weighted => pick_weighted(cands, rand_seed, now, inflight),
-        PoolStrategy::P2C => pick_p2c(cands, rand_seed, now, inflight),
+        PoolStrategy::Weighted => pick_weighted(cands, rand_seed, now, inflight, recent),
+        PoolStrategy::P2C => pick_p2c(cands, rand_seed, now, inflight, recent),
         PoolStrategy::CreditFirst => cands.iter().copied().max_by(|a, b| {
             a.credits
                 .unwrap_or(0.0)
@@ -2420,13 +2485,18 @@ fn pick_weighted<'a>(
     rand_seed: u64,
     now: i64,
     inflight: &HashMap<String, u32>,
+    recent: &HashMap<String, usize>,
 ) -> Option<&'a PoolEntry> {
     let total_credits: f64 = cands.iter().filter_map(|e| e.credits).sum();
     let mut scored: Vec<(&'a PoolEntry, f64)> = cands
         .iter()
         .map(|e| {
             let load_penalty = inflight_of(e, inflight) as f64 * 4.0;
-            (*e, (e.weighted_score(total_credits, now) - load_penalty).max(0.1))
+            // 近窗选中惩罚（负载感知 B，2026-10-23）：顺序 agent 循环的 inflight
+            // 恒 0，近窗次数才反映「这个号正被独占」。每次 -2 封顶 -20，
+            // 与 inflight 惩罚同量级
+            let recent_penalty = recent.get(&e.uid).copied().unwrap_or(0).min(10) as f64 * 2.0;
+            (*e, (e.weighted_score(total_credits, now) - load_penalty - recent_penalty).max(0.1))
         })
         .collect();
     // 得分降序，取 Top5 短名单
@@ -2452,6 +2522,7 @@ fn pick_p2c<'a>(
     rand_seed: u64,
     now: i64,
     inflight: &HashMap<String, u32>,
+    recent: &HashMap<String, usize>,
 ) -> Option<&'a PoolEntry> {
     if cands.len() == 1 {
         return Some(cands[0]);
@@ -2467,6 +2538,13 @@ fn pick_p2c<'a>(
     let ib = inflight_of(b, inflight);
     if ia != ib {
         return Some(if ia < ib { a } else { b });
+    }
+    // 近窗选中次数第二比较键（负载感知 B）：inflight 相同（顺序循环常态）时，
+    // 近窗被独占更多的号让位
+    let na = recent.get(&a.uid).copied().unwrap_or(0);
+    let nb = recent.get(&b.uid).copied().unwrap_or(0);
+    if na != nb {
+        return Some(if na < nb { a } else { b });
     }
     let sa = a.weighted_score(total_credits, now);
     let sb = b.weighted_score(total_credits, now);
@@ -3154,16 +3232,16 @@ mod tests {
         let now = 2000;
         // 两候选不同时（奇数种子 → 索引 (1,0)），恒选得分更高的 b
         for seed in (1..200u64).step_by(2) {
-            assert_eq!(pick_p2c(&cands, seed, now, &HashMap::new()).unwrap().uid, "b");
+            assert_eq!(pick_p2c(&cands, seed, now, &HashMap::new(), &HashMap::new()).unwrap().uid, "b");
         }
         // 撞号（两索引相同）→ 不 panic，返回任一候选
         for seed in (0..200u64).step_by(2) {
-            let picked = pick_p2c(&cands, seed, now, &HashMap::new()).unwrap();
+            let picked = pick_p2c(&cands, seed, now, &HashMap::new(), &HashMap::new()).unwrap();
             assert!(picked.uid == "a" || picked.uid == "b");
         }
         // 单候选：直接返回
         let single = vec![&e_b];
-        assert_eq!(pick_p2c(&single, 7, now, &HashMap::new()).unwrap().uid, "b");
+        assert_eq!(pick_p2c(&single, 7, now, &HashMap::new(), &HashMap::new()).unwrap().uid, "b");
     }
 
     /// 测试用 QoderSyncAccount 快速构造
@@ -3397,6 +3475,36 @@ mod tests {
         );
         // 未知 uid：静默无副作用
         pool.note_ttfb("uid_ghost", 30_000);
+    }
+
+    // ==================== 近窗选中负载感知（负载感知 B） ====================
+
+    /// P2C 直调（固定 seed 保证两候选不撞号）：近窗被独占的号稳定让位；
+    /// 窗口过期后不再惩罚（读侧顺带清理，闲置号不背历史账）
+    #[test]
+    fn recent_picks_push_p2c_away_and_expire() {
+        let pool = build_pool(&[("uid_a", 10.0, 0), ("uid_b", 10.0, 0)]);
+        for _ in 0..5 {
+            pool.note_pick("uid_a");
+        }
+        let mut recent = HashMap::new();
+        recent.insert("uid_a".to_string(), 5usize);
+        let entries = safe_lock(&pool.entries);
+        let cands: Vec<&PoolEntry> = entries.values().collect();
+        // seed=1：a=cands[1%2], b=cands[(1>>32)%2]=cands[0]，不撞号
+        let picked = pick_p2c(&cands, 1, now_ts(), &HashMap::new(), &recent).unwrap();
+        assert_ne!(picked.uid, "uid_a", "近窗被独占的号应让位（P2C 第二比较键）");
+        drop(entries);
+        // 窗口过期：手动把时间戳拨到窗外 → 快照清空，惩罚消失
+        {
+            let mut window = safe_lock(&pool.pick_window);
+            for slots in window.values_mut() {
+                for t in slots.iter_mut() {
+                    *t -= ApiPool::PICK_WINDOW_SECS + 10;
+                }
+            }
+        }
+        assert!(pool.recent_snapshot().is_empty(), "窗外条目应被清理");
     }
 
     /// 劣化号在仍有其他候选时让位；仅剩劣化号时放行（防 fake-503，
@@ -4141,7 +4249,7 @@ mod tests {
         inflight.insert("a".to_string(), 2u32);
         inflight.insert("b".to_string(), 0u32);
         for seed in (1..50u64).step_by(2) {
-            assert_eq!(pick_p2c(&cands, seed, 2000, &inflight).unwrap().uid, "b");
+            assert_eq!(pick_p2c(&cands, seed, 2000, &inflight, &HashMap::new()).unwrap().uid, "b");
         }
     }
 

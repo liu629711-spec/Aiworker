@@ -527,7 +527,7 @@ pub async fn zcode_aggregate_chat(
                             continue 'pick;
                         }
                     };
-                    let (resp, error_info) = wb_sse::aggregate(ilines, &format!("chatcmpl-{}", now_ts()));
+                    let (resp, eof_truncated, error_info) = wb_sse::aggregate(ilines, &format!("chatcmpl-{}", now_ts()));
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     let ttfb_ms = ttfb_start.elapsed().as_millis() as u64;
                     match (resp, error_info) {
@@ -536,10 +536,15 @@ pub async fn zcode_aggregate_chat(
                             let (pt, ct) = r.get("usage").map(wb_sse::u64_pair).unwrap_or((0, 0));
                             state.record_usage(false, &model, &picked.uid, &key_id, true, stream,
                                 duration_ms, pt, ct);
-                            state.zcode_pool.note_success(&picked.uid);
+                            // EOF 断流（聚合路径观测，2026-10-23）：半截回复已按完整
+                            // 响应交付；不记成功（保留账号劣化记忆），zcode 池无粘性
+                            if !eof_truncated {
+                                state.zcode_pool.note_success(&picked.uid);
+                            }
                             state.logger.log_request(
                                 "zcode", "POST", "/v1/chat/completions", &model, stream, 200, &picked.uid,
-                                duration_ms, &key_name, &state.zcode_pool.name_of(&picked.uid), None,
+                                duration_ms, &key_name, &state.zcode_pool.name_of(&picked.uid),
+                                if eof_truncated { Some("EOF 断流 → 补帧收尾") } else { None },
                             );
                             let _ = ttfb_ms;
                             return Ok(r);
