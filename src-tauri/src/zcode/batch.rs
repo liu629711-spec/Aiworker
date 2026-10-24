@@ -333,25 +333,47 @@ fn run_task_blocking(entry: &Path, workspace: &Path, prompt: &str, model: &str) 
         format!("启动 CLI 失败（需要 node 在 PATH 里）: {e}")
     })?;
 
+    // 管道并发排空（审计 P1-2，2026-10-24）：stdout/stderr 若只在退出后读取，
+    // 输出超过管道缓冲（~64KB）时 child 阻塞在写、本线程阻塞在 try_wait，
+    // 双方互等到 TASK_TIMEOUT 误杀——大 response 必触发。两个 reader 线程
+    // 全程排空，主线程只管超时窗口；单流上限 8MB 防异常输出撑爆内存
+    fn drain_pipe<R: std::io::Read>(p: R) -> String {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let _ = p.take(8 * 1024 * 1024).read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).to_string()
+    }
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| "stdout 管道缺失".to_string())?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| "stderr 管道缺失".to_string())?;
+    let out_reader = std::thread::spawn(move || drain_pipe(stdout_pipe));
+    let err_reader = std::thread::spawn(move || drain_pipe(stderr_pipe));
+
     // 带超时的等待：不用 wait_timeout crate，自旋 + try_wait
     let deadline = Instant::now() + TASK_TIMEOUT;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(st)) => break st,
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
+                    // kill 后管道随之关闭；reader 有 8MB 读取上限，必然收尾
+                    let _ = out_reader.join();
+                    let _ = err_reader.join();
                     return Err(format!("CLI 执行超时（{}s）", TASK_TIMEOUT.as_secs()));
                 }
                 std::thread::sleep(Duration::from_millis(300));
             }
             Err(e) => return Err(format!("等待 CLI 失败: {e}")),
         }
-    }
-
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    };
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
 
     // CLI 的 `--json` 输出是"若干诊断行 + 一个完整 JSON 对象"（诊断行在前，
     // 例如 `ZCode Built-in missing`）。所以逐个 `{` 位置尝试整段解析，
@@ -362,7 +384,7 @@ fn run_task_blocking(entry: &Path, workspace: &Path, prompt: &str, model: &str) 
             "CLI 未返回可解析的 JSON（exit={:?}）
 stdout: {}
 stderr: {}",
-            out.status.code(),
+            status.code(),
             head(&stdout, 400),
             head(&stderr, 300)
         )
@@ -620,12 +642,37 @@ pub async fn status(db: &SqlitePool, running: bool) -> BatchStatus {
     }
 }
 
-/// 启动调度协程（幂等）。只在窗口内（或手动唤醒）取任务，串行执行。
-pub fn start_loop(db: SqlitePool, rt: Arc<BatchRuntime>) {
+    /// 启动调度协程（幂等）。只在窗口内（或手动唤醒）取任务，串行执行。
+    pub fn start_loop(db: SqlitePool, rt: Arc<BatchRuntime>) {
     if rt.running.swap(true, Ordering::SeqCst) {
         return;
     }
     tauri::async_runtime::spawn(async move {
+        // 孤儿回收（审计 P2-4，2026-10-24）：调度严格串行，进入循环前不可能
+        // 存在本进程的 running——任何 running 行都是上次进程强退的残骸。
+        // cancel 只认 pending、requeue 只认 failed/canceled、clear 不含 running，
+        // 不回收则该行永远卡在「运行中」且三条恢复路都够不着它
+        match sqlx::query(
+            "UPDATE batch_tasks SET status='failed', error=?1, finished_at=?2 WHERE status='running'",
+        )
+        .bind("应用中断，任务未完成")
+        .bind(now())
+        .execute(&db)
+        .await
+        {
+            Ok(r) if r.rows_affected() > 0 => {
+                crate::fs_utils::app_log_default(&format!(
+                    "[zcode/batch] 孤儿回收: {} 个中断任务标记为 failed（可重跑）",
+                    r.rows_affected()
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                crate::fs_utils::app_log_default(&format!(
+                    "[zcode/batch] 孤儿回收失败: {e}"
+                ));
+            }
+        }
         loop {
             if !rt.running.load(Ordering::SeqCst) {
                 break;
