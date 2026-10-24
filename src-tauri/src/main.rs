@@ -774,6 +774,10 @@ fn main() {
                 }
             }
 
+            // 日志保留治理（P3 卫生）：proxy_req 抓包日志无界增长（实测 60-100MB/日），
+            // 启动即清一轮过期分片（保留 14 天），此后每 6 小时巡检
+            commands::misc::start_log_retention_daemon(app.state::<AppState>().data_dir.clone());
+
             // 启动静默签到（T11）：延迟 60s 后对未签到账号自动执行一轮签到，
             // 复用托盘签到链路（含防重入锁，与手动/托盘签到天然互斥）；
             // skip_checked_in=true 保证幂等，重复开机不会重复签

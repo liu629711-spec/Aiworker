@@ -113,6 +113,11 @@ pub struct PoolEntry {
     /// model → until 映射；upstream 6004 等文案含 "可在其他模型继续" 时用，
     /// 冻结粒度为 (uid, model)，而非整账号。空字典表示无按模型冷却条目。
     pub per_model_cooldowns: std::collections::HashMap<String, i64>,
+    // ── TTFB 劣化观测（观测性 #3，2026-10-23）──
+    /// 首字时延 EWMA（毫秒，α=1/4 平滑；0 = 无数据）。运行态字段不落库：
+    /// 劣化是当前状态，重启后由上游重新观察。仅用于取号降权（仍有其他候选时
+    /// 让位），不冻结不禁用——reasoning 模型慢首字是常态，绝对阈值只拦病态
+    pub ttfb_ewma_ms: u64,
     // ── ZCode 套餐画像（仅 zcode 池有值；其余池恒 None）──
     /// 套餐门闸快照：None = 从未同步过画像（fail-open，保持历史行为）；
     /// Some 则按画像过滤（模型集合 / 夜间窗口 / 额度耗尽 / 燃烧顺序）
@@ -221,6 +226,7 @@ impl Default for PoolEntry {
             global_region: false,
             refresh_invalid: false,
             per_model_cooldowns: std::collections::HashMap::new(),
+            ttfb_ewma_ms: 0,
             plan: None,
         }
     }
@@ -1090,6 +1096,12 @@ impl ApiPool {
                 .copied()
                 .min_by_key(|e| inflight_of(e, &inflight))
         } else {
+            // TTFB 劣化降权（观测性 #3，2026-10-23）：EWMA 首字超阈值的号在
+            // 仍有其他候选时让位；全员超阈/无数据原样放行（防 fake-503，语义
+            // 对齐 busy_filter 全 busy 降级）。粘性/专一路径不过此滤——慢首字
+            // 不做粘性漂移依据（reasoning 模型慢首字是常态），会话漂移仍由
+            // 断流驱动（wb_route eof_truncated）
+            let (cands, _) = ttfb_demote_filter(&cands);
             pick_by_strategy(&cands, strategy, rand_seed, now, &inflight)
         }?;
 
@@ -1632,6 +1644,54 @@ impl ApiPool {
         }
         self.note_error(uid, kind);
         false
+    }
+
+    /// TTFB 劣化降权阈值（EWMA 首字毫秒）：实测 reasoning 模型正常首字 6-16s
+    /// （step-5-preview 长思考），病态劣化 25-33s（2026-10-23 22:26-22:34 实录
+    /// 且以 32.7s 收尾断流），20s 取分界。EWMA α=1/4 平滑单次毛刺——持续劣化
+    /// 数轮才过线，不会一慢就降权。
+    pub const TTFB_DEMOTE_MS: u64 = 20_000;
+
+    /// 记录一次首字时延观测（仅竞速胜者/正常转发路径调用），EWMA α=1/4 平滑。
+    /// EWMA 跨越降权阈值时落一条 app_log——每个劣化期恰一条，信噪比优先。
+    /// 只观测不惩罚：降权语义在 ttfb_demote_filter（仍有其他候选时让位），
+    /// 恢复（EWMA 回落）后自动回归，无需显式清除。
+    pub fn note_ttfb(&self, uid: &str, ms: u64) {
+        const ALPHA_NUM: u64 = 1; // α = 1/4
+        const ALPHA_DEN: u64 = 4;
+        let ms = ms.min(120_000); // 单次离群值封顶，防一轮超长排队拖歪 EWMA
+        let mut crossed: Option<u64> = None;
+        {
+            let mut entries = safe_lock(&self.entries);
+            if let Some(e) = entries.get_mut(uid) {
+                let prev = e.ttfb_ewma_ms;
+                let next = if prev == 0 {
+                    ms
+                } else {
+                    (prev * (ALPHA_DEN - ALPHA_NUM) + ms * ALPHA_NUM) / ALPHA_DEN
+                };
+                e.ttfb_ewma_ms = next;
+                if prev < Self::TTFB_DEMOTE_MS && next >= Self::TTFB_DEMOTE_MS {
+                    crossed = Some(next);
+                }
+            }
+        }
+        if let Some(next) = crossed {
+            let ctx = safe_lock(&self.log_ctx).clone();
+            if let Some((dir, label)) = ctx {
+                let name = {
+                    let entries = safe_lock(&self.entries);
+                    entries.get(uid).map(|e| e.name.clone()).unwrap_or_default()
+                };
+                crate::fs_utils::app_log(
+                    &dir,
+                    &format!(
+                        "account ttfb degrade: pool={label} acct={name} uid={uid} ewma≈{next}ms 超过 {}ms，取号降权（不冻结，回落自动回归）",
+                        Self::TTFB_DEMOTE_MS
+                    ),
+                );
+            }
+        }
     }
 
     /// 把账号冷却精确延长到上游下发的恢复时刻（6004 日限额「将在 … UTC+8 重置」）。
@@ -2197,6 +2257,22 @@ fn selectable_for_model(
         }
     }
     true
+}
+
+/// TTFB 劣化降权过滤（纯函数，防 fake-503 语义对齐 busy_filter）：EWMA 首字
+/// 超阈值的候选在**仍有其他候选**时排除——劣化号是最后手段，不是第一选择。
+/// 返回 (过滤后候选, 是否发生了降权)。
+fn ttfb_demote_filter<'a>(cands: &[&'a PoolEntry]) -> (Vec<&'a PoolEntry>, bool) {
+    let good: Vec<&'a PoolEntry> = cands
+        .iter()
+        .copied()
+        .filter(|e| e.ttfb_ewma_ms < ApiPool::TTFB_DEMOTE_MS)
+        .collect();
+    if good.is_empty() || good.len() == cands.len() {
+        (cands.to_vec(), false)
+    } else {
+        (good, true)
+    }
 }
 
 /// 账号在途数（F-77，快照查表；无记录 = 0）
@@ -3043,6 +3119,7 @@ mod tests {
             per_model_cooldowns: std::collections::HashMap::new(),
             domain: String::new(), enterprise_id: String::new(), global_region: false,
             refresh_invalid: false,
+            ttfb_ewma_ms: 0,
             plan: None,
         };
         let e_b = crate::api_server::pool::PoolEntry {
@@ -3058,6 +3135,7 @@ mod tests {
                 per_model_cooldowns: std::collections::HashMap::new(),
                 domain: String::new(), enterprise_id: String::new(), global_region: false,
                 refresh_invalid: false,
+                ttfb_ewma_ms: 0,
                 plan: None,
             }
         };
@@ -3129,6 +3207,7 @@ mod tests {
             enterprise_id: String::new(),
             global_region: false,
             refresh_invalid: false,
+            ttfb_ewma_ms: 0,
             plan: None,
         }
     }
@@ -3293,6 +3372,51 @@ mod tests {
         let e = entries.get("uid_a").unwrap();
         assert!(e.hard_until > now_ts(), "整号硬冻结应触发");
         assert!(e.per_model_cooldowns.is_empty());
+    }
+
+    // ==================== TTFB 劣化观测与取号降权（观测性 #3） ====================
+
+    /// EWMA α=1/4 平滑：首样本直取，后续逐轮逼近；持续劣化数轮后跨 20s 阈值
+    #[test]
+    fn ttfb_ewma_smooths_and_crosses_threshold() {
+        let pool = build_pool(&[("uid_a", 10.0, 0)]);
+        let ewma_of = |pool: &ApiPool| {
+            safe_lock(&pool.entries).get("uid_a").unwrap().ttfb_ewma_ms
+        };
+        pool.note_ttfb("uid_a", 10_000);
+        assert_eq!(ewma_of(&pool), 10_000, "首样本直取");
+        pool.note_ttfb("uid_a", 30_000);
+        assert_eq!(ewma_of(&pool), 15_000, "(10000*3+30000)/4");
+        pool.note_ttfb("uid_a", 30_000);
+        assert_eq!(ewma_of(&pool), 18_750);
+        pool.note_ttfb("uid_a", 30_000);
+        assert!(
+            ewma_of(&pool) >= ApiPool::TTFB_DEMOTE_MS,
+            "持续 30s 劣化四轮后应跨过降权阈值，实际 {}",
+            ewma_of(&pool)
+        );
+        // 未知 uid：静默无副作用
+        pool.note_ttfb("uid_ghost", 30_000);
+    }
+
+    /// 劣化号在仍有其他候选时让位；仅剩劣化号时放行（防 fake-503，
+    /// 语义对齐 busy_filter 全 busy 降级）
+    #[test]
+    fn ttfb_demote_skips_degraded_only_when_alternative_exists() {
+        let pool = build_pool(&[("uid_a", 10.0, 0), ("uid_b", 10.0, 0)]);
+        // 单次 25s 直接过阈（首样本直取）
+        pool.note_ttfb("uid_a", 25_000);
+        let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let (picked, _) = pool
+            .pick_excluding_constrained_ev_region(&tried, None, None, None)
+            .expect("仍有健康候选");
+        assert_ne!(picked.uid, "uid_a", "劣化号应让位");
+        // 唯一候选是劣化号：放行而非 503
+        tried.insert("uid_b".to_string());
+        let (picked, _) = pool
+            .pick_excluding_constrained_ev_region(&tried, None, None, None)
+            .expect("无备选必须放行");
+        assert_eq!(picked.uid, "uid_a", "仅剩劣化号时应放行");
     }
 
     /// 回归（2026-10-18 海外池实测）：模型级冷却表按裸模型名记账、不区分账号，

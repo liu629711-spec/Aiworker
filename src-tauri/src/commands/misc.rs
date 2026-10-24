@@ -276,6 +276,58 @@ fn is_log_shard_day(day: &str) -> bool {
         && chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").is_ok()
 }
 
+// ---------------- 日志保留治理（proxy_req 抓包日志无界增长） ----------------
+
+/// proxy_req_*.log 保留天数。唯一无界增长的日志（实测 60-100MB/日，
+/// 2026-10-23 logs 目录 534MB）；app/api/panic 日志按日分文件且量小，不治理。
+/// 压缩归档不做：抓包日志页按 `proxy_req_*.log` 文件名索引（proxy_log_files），
+/// 归档后旧日期会从 UI 消失——「到期删除」比「UI 里看不到旧日志」更可预期。
+pub const PROXY_REQ_RETENTION_DAYS: i64 = 14;
+
+/// 删除超过保留期的 proxy_req 日志分片，返回 (删除数, 释放字节)。
+/// 文件名解析复用 proxy_log_shard_key（与列表/详情白名单同源）：UI 能索引到的
+/// 形态才可能被删，畸形名天然不碰。
+pub fn prune_proxy_req_logs(log_dir: &Path) -> (usize, u64) {
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        return (0, 0);
+    };
+    let cutoff = chrono::Local::now().date_naive() - chrono::Duration::days(PROXY_REQ_RETENTION_DAYS);
+    let mut removed = 0usize;
+    let mut freed = 0u64;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some((day, _)) = proxy_log_shard_key(name) else { continue };
+        let Ok(day) = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d") else { continue };
+        if day >= cutoff {
+            continue;
+        }
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+            freed += size;
+        }
+    }
+    (removed, freed)
+}
+
+/// 保留治理守护：启动即清一轮过期分片，此后每 6 小时巡检；有删除才落 app.log。
+pub fn start_log_retention_daemon(data_dir: std::path::PathBuf) {
+    std::thread::spawn(move || loop {
+        let (n, freed) = prune_proxy_req_logs(&data_dir.join("logs"));
+        if n > 0 {
+            crate::fs_utils::app_log(
+                &data_dir,
+                &format!(
+                    "日志保留治理：删除 {n} 个过期 proxy_req 分片（保留 {PROXY_REQ_RETENTION_DAYS} 天），释放 {} MB",
+                    freed / 1024 / 1024
+                ),
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_secs(6 * 3600));
+    });
+}
+
 /// 目录内 `proxy_req_*.log` 及同日轮转分片 `.log.N`，排序 = 日期升序 + 分片序号升序
 /// （即写入时间升序；字典序会把 `.log.10` 排到 `.log.2` 前，须按序号数值排）
 fn proxy_log_files(log_dir: &Path) -> Vec<String> {
@@ -1317,6 +1369,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// 保留治理：只删过期的 proxy_req 分片——新分片、无关日志、畸形名全不动
+    #[test]
+    fn prune_proxy_req_logs_deletes_only_expired_shards() {
+        let logs = tmp_dir("prune_logs");
+        let day = |offset: i64| {
+            (chrono::Local::now().date_naive() + chrono::Duration::days(offset))
+                .format("%Y-%m-%d")
+                .to_string()
+        };
+        let mk = |name: &str, body: &str| {
+            std::fs::write(logs.join(name), body).unwrap();
+        };
+        mk(&format!("proxy_req_{}.log", day(-20)), "old");
+        mk(&format!("proxy_req_{}.log.2", day(-20)), "old-shard");
+        mk(&format!("proxy_req_{}.log", day(-14)), "boundary-kept"); // 恰在保留期边界：不删
+        mk(&format!("proxy_req_{}.log", day(0)), "today");
+        mk("app.log", "unrelated");
+        mk("proxy_req_not-a-date.log", "malformed-name"); // shard key None：不可删
+
+        let (removed, freed) = prune_proxy_req_logs(&logs);
+        assert_eq!(removed, 2, "应只删两个过期分片");
+        assert_eq!(freed, 12, "释放字节 = old(3) + old-shard(9)");
+        for kept in [
+            format!("proxy_req_{}.log", day(-14)),
+            format!("proxy_req_{}.log", day(0)),
+            "app.log".to_string(),
+            "proxy_req_not-a-date.log".to_string(),
+        ] {
+            assert!(logs.join(&kept).exists(), "{kept} 不应被删除");
+        }
+        let _ = std::fs::remove_dir_all(&logs);
     }
 
     /// 拒绝写入启动文件夹下的 .json（拦截的是位置而非扩展名）

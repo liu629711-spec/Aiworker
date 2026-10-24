@@ -1002,6 +1002,9 @@ fn run_wb_stream(
                     // 对冲计数落定 + guard 重绑（接管时生效账号 = 对冲账号）
                     guard = settle_hedge(state, &mut win, guard, &picked.uid);
                     let win_uid = win.uid.as_str();
+                    // TTFB 劣化观测（观测性 #3）：胜者首字 EWMA 入池画像，
+                    // 持续劣化（EWMA 跨 20s 阈值）后策略取号让位
+                    state.wb_pool.note_ttfb(win_uid, ttfb_ms);
                     // 竞速胜者行源（Box 迭代器）桥接为可中断行源：stream_forward_ex
                     // 停滞期间周期性检查断连（转发线程复用；语义与既有 ttfb 包装一致）
                     let win_lines = super::wb_upstream::InterruptibleLines::from_iterator(
@@ -1502,6 +1505,8 @@ pub async fn wb_aggregate_chat(
                         let ttfb_ms = ttfb_start.elapsed().as_millis() as u64;
                         guard = settle_hedge(&state, &mut win, guard, &picked.uid);
                         let win_uid = win.uid.as_str();
+                        // TTFB 劣化观测（同流式路径 #3）
+                        state.wb_pool.note_ttfb(win_uid, ttfb_ms);
                         let (resp, error_info) =
                             wb_sse::aggregate(win.lines, &format!("chatcmpl-{}", now_ts()));
                         let duration_ms = start_ts.elapsed().as_millis() as u64;

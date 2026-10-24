@@ -1330,6 +1330,9 @@ fn run_qoder_stream(
                     guard = settle_qoder_hedge(state, &mut race, guard, &picked.uid);
                     hedge_taken = race.takeover;
                     let win_uid = race.uid.clone();
+                    // TTFB 劣化观测（观测性 #3）：胜者首字 EWMA 入池画像，
+                    // 持续劣化（EWMA 跨 20s 阈值）后策略取号让位
+                    state.qoder_pool.note_ttfb(&win_uid, ttfb_ms);
                     // G4：记账会话 id 按胜者信封落定（race 在 translate 处被消费，先取快照）
                     let win_session_ids = race.session_ids.clone().or_else(|| envelope_ids.clone());
                     // 竞速胜者行源（原始上游行）统一翻译后喂 stream_forward_ex
@@ -1530,7 +1533,19 @@ fn run_qoder_stream(
                                 }
                             }
                             if !sent_any {
-                                // 流未开始：错误不下发，允许换号重试（换号中间态不记 usage）
+                                // 流未开始：错误不下发，允许换号重试（换号中间态不记 usage）。
+                                // 轮换落 sched 事件：终态单行口径下，被换掉的账号在此完全
+                                // 隐形——「号被什么打罚站/为何换号」只能猜（2026-10-23
+                                // HardCredit 触发源排查即卡在这；HTTP 层路径本就有
+                                // upstream status 行，仅此 SSE 流内路径是盲区）
+                                state.logger.log_sched_event(&format!(
+                                    "rotate uid={} model={} code={} msg={} tried={} (错误未流出，换号重试)",
+                                    win_uid,
+                                    model,
+                                    code,
+                                    safe_slice(&msg, 120),
+                                    tried.len(),
+                                ));
                                 break;
                             }
                             // 就地收尾终局：记 usage（部分成功按实际 usage 落账）
@@ -2133,6 +2148,8 @@ pub async fn qoder_aggregate_chat(
                         guard = settle_qoder_hedge(&state, &mut race, guard, &picked.uid);
                         hedge_taken = race.takeover;
                         let win_uid = race.uid.clone();
+                        // TTFB 劣化观测（同流式路径 #3）
+                        state.qoder_pool.note_ttfb(&win_uid, ttfb_ms);
                         // G4：记账会话 id 按胜者信封落定（race 在聚合处被部分消费，先取快照）
                         let win_session_ids = race.session_ids.clone().or_else(|| envelope_ids.clone());
                         // 竞速胜者原始行源 → 翻译 → 聚合（tool_calls 合并/usage 收集）；
