@@ -22,6 +22,7 @@ import {
   Mail,
   Layers,
   Plug,
+  Moon,
 } from 'lucide-react';
 import { useAppStore } from '../store';
 import { cn } from '../lib/cn';
@@ -87,6 +88,7 @@ const ZCODE_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'zcode-register', label: '自动注册', icon: MailPlus },
   { key: 'zcode-masks', label: '马甲邮箱', icon: Mail },
   { key: 'zcode-pool', label: '号池调度', icon: Layers },
+  { key: 'zcode-batch', label: '夜间批处理', icon: Moon },
   { key: 'zcode-secrets', label: '账密 · 批量登录', icon: KeyRound },
 ];
 

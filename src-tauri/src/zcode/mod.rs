@@ -2,6 +2,7 @@
 //! 使用独立 sqlx SQLite 池(zcode.sqlite),与主项目 rusqlite 存储互不干扰。
 
 pub mod api;
+pub mod batch;
 pub mod credentials;
 pub mod db;
 pub mod error;

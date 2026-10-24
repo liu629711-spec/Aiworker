@@ -128,8 +128,11 @@ fn read_cookies(path: &std::path::Path) -> AppResult<RelaySession> {
         .read_only(true)
         .create_if_missing(false);
 
-    // cookie 库读取是短平快的同步操作,用阻塞方式拿结果
-    let session = tauri::async_runtime::block_on(async {
+    // cookie 库读取是短平快的同步操作,用阻塞方式拿结果。
+    // ⚠️ 必须桥接:`zcode_relay_status` 等命令是 async 的,跑在 tokio worker 上,
+    // 直接 block_on 会 panic "Cannot start a runtime from within a runtime"
+    // (panic.log 2026-10-23 16:2x 有案底,表现为马甲页永久"检测中")。
+    let session = crate::zcode::util::bridge_block_on(async {
         let pool = sqlx::SqlitePool::connect_with(opts).await?;
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT name, value FROM moz_cookies WHERE host LIKE '%relay.firefox.com%'",

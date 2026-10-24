@@ -39,6 +39,7 @@ import ZCodePoolPanel from './pages/zcode/ZCodePoolPanel';
 import ApiManagerModal from './components/api/ApiManagerModal';
 import TraeWorkMigrationGuide from './components/TraeWorkMigrationGuide';
 import PageHeader from './components/PageHeader';
+import BatchPanel from './pages/zcode/BatchPanel';
 
 /**
  * ZCodePoolPanel 是他人未完成任务，本流程不改其源码；
@@ -114,6 +115,8 @@ function renderView(view: string) {
       return <ZCodeAccountsPage />;
     case 'zcode-pool':
       return <ZCodePoolPage />;
+    case 'zcode-batch':
+      return <BatchPanel />;
     case 'zcode-secrets':
       return <SecretsPanel />;
     case 'zcode-register':

@@ -46,10 +46,15 @@ function SecretRow({
   row,
   onChanged,
   batchState,
+  onLogin,
+  disabled,
 }: {
   row: SecretItem;
   onChanged: () => void;
   batchState?: BatchProgress;
+  /** 只登这一条（注册已完成的马甲补走 OAuth 入池，不必整队重跑） */
+  onLogin?: () => void;
+  disabled?: boolean;
 }) {
   const linked = row.account_id !== null;
   const [title, setTitle] = useState(row.title);
@@ -158,6 +163,16 @@ function SecretRow({
             <Trash2 size={14} />
           </button>
         )}
+        {!linked && onLogin && loginName.trim() && password && (
+          <button
+            className="inline-flex items-center gap-1 rounded-lg bg-sky-50 px-2 py-1.5 text-xs font-medium text-sky-600 transition hover:bg-sky-100 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-sky-500/10 dark:text-sky-400"
+            title="只导入这一条：打开授权窗口自动登录并入池（不影响队列里的其他条目）"
+            onClick={onLogin}
+            disabled={disabled}
+          >
+            <Zap size={12} /> 导入
+          </button>
+        )}
         {batchState && <StateBadge p={batchState} />}
       </div>
       {error && (
@@ -241,7 +256,27 @@ export default function SecretsPanel() {
     }
   };
 
+  /**
+   * 只导入一条：复用批量登录队列机制，但队列里只有这一个条目。
+   * 用途：注册流水线在第 4/5 步中断的马甲——账号在 z.ai 服务端已建好，
+   * 只需用同一账密走一次 OAuth 授权就能入池，不必重跑整批。
+   */
+  const loginOne = async (secretId: number) => {
+    setError(null);
+    setNotice(null);
+    try {
+      const n = await accountsApi.batchLogin([secretId]);
+      setBatchRunning(true);
+      setBatchTotal(n);
+      setBatchCurrent(0);
+      setNotice('已发起单条导入：授权窗口里自动登录并入池，遇到滑块请手动滑一下');
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   const stopBatch = async () => {
+
     try {
       await accountsApi.cancelBatchLogin();
     } catch (e) {
@@ -354,6 +389,8 @@ export default function SecretsPanel() {
               row={r}
               onChanged={reload}
               batchState={batchStates[r.id]}
+              onLogin={() => loginOne(r.id)}
+              disabled={batchRunning}
             />
           ))}
         </div>

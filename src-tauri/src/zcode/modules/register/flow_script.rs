@@ -53,8 +53,10 @@ pub fn signup_script(email: &str, password: &str, username: &Option<String>) -> 
     ticks++;
     if (ticks > 3600) {{ clearInterval(timer); return; }}   // 30 分钟兜底
     var now = Date.now();
-    // 已进入验证页/授权页:本段使命结束
-    if (location.pathname.indexOf("/auth/verify") === 0 || location.pathname.indexOf("/auth/oauth") === 0) {{
+    // 已进入验证页/授权页/登录页:本段使命结束(登录页交给 login_script)
+    if (location.pathname.indexOf("/auth/verify") === 0 ||
+        location.pathname.indexOf("/auth/oauth") === 0 ||
+        location.pathname.indexOf("/auth/login") === 0) {{
       if (window.__zflowReport) window.__zflowReport("__zaiSignupSubmitted", true);
       clearInterval(timer);
       return;
@@ -171,7 +173,119 @@ pub fn verify_script(token: &str) -> String {
     )
 }
 
+/// 注册已完成但会话未建立时的「登录 + 授权确认」段脚本。
+///
+/// 为什么需要它(实测 2026-10-23 16:25):
+/// 邮件验证链接只负责把邮箱标成已验证,验证完官方会**要求重新登录**;
+/// 而后续 OAuth 授权页在未登录时会被踢回 `/auth/login`。
+/// 旧实现只在授权页 eval 一次 authorize_script,既不会登录也拿不到授权按钮,
+/// 表现就是第 4 步超时、账号永远进不了池。
+///
+/// 本脚本随窗口 initialization_script 注入,**每个 document 都会重跑**,
+/// 所以跨多次跳转(登录页 → 授权页)都能各自生效:
+/// - 已在登录态(不在 /auth 下)→ 上报 `__zaiSessionReady`
+/// - 授权确认页 → 勾协议 + 点继续
+/// - 登录页 → 填账密 → 过验证 → 点登录
+/// - 验证页 → 让位给 verify_script,不插手
+pub fn login_script(email: &str, password: &str) -> String {
+    let email_json = json_str(email).unwrap_or_else(|_| "\"\"".into());
+    let password_json = json_str(password).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        r#"(function () {{
+  if (!/(^|\.)z\.ai$/i.test(location.hostname)) return;
+  var EMAIL = {email_json};
+  var PASSWORD = {password_json};
+  function setValue(el, v) {{
+    var proto = el instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    var setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+    setter.call(el, v);
+    el.dispatchEvent(new Event("input", {{ bubbles: true }}));
+    el.dispatchEvent(new Event("change", {{ bubbles: true }}));
+  }}
+  var filled = false, lastCapClick = 0, lastLoginClick = 0, loginTries = 0;
+  var agreed = false, lastAgreeClick = 0, ticks = 0;
+  var timer = setInterval(function () {{
+    ticks++;
+    if (ticks > 1200) {{ clearInterval(timer); return; }}   // 10 分钟兜底
+    var p = location.pathname;
+    // 已登录:不在 /auth 下,也不在登录页
+    if (p.indexOf("/auth") !== 0 && p.indexOf("/login") !== 0) {{
+      if (window.__zflowReport) window.__zflowReport("__zaiSessionReady", true);
+      clearInterval(timer);
+      return;
+    }}
+    // 邮箱验证页:/auth/verify* 交给 verify_script,这里不抢按钮
+    if (p.indexOf("/auth/verify") === 0) return;
+    // 注册表单页:交给 signup_script
+    if (location.search.indexOf("action=signup") >= 0) return;
+    var now = Date.now();
+    // ── 授权确认页:勾协议 → 点继续 ──
+    var agreeBtn = null;
+    document.querySelectorAll("button").forEach(function (b) {{
+      var t = (b.textContent || "").trim();
+      if (!agreeBtn && t && t.length <= 6 &&
+          (t === "继续" || t === "Continue" || t === "授权" || t === "Allow" ||
+           t === "允许" || t === "同意")) agreeBtn = b;
+    }});
+    if (agreeBtn) {{
+      document.querySelectorAll("input[type=checkbox]").forEach(function (c) {{
+        if (!c.checked) {{
+          c.click();
+          var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "checked").set;
+          setter.call(c, true);
+          c.dispatchEvent(new Event("change", {{ bubbles: true }}));
+          c.dispatchEvent(new Event("input", {{ bubbles: true }}));
+        }}
+      }});
+      if (!agreed && !agreeBtn.disabled && now - lastAgreeClick > 2000) {{
+        lastAgreeClick = now;
+        agreed = true;
+        agreeBtn.click();
+      }}
+      return;
+    }}
+    // ── 登录页:填账密 → 过验证 → 点登录 ──
+    var email = null, pass = null;
+    document.querySelectorAll("input").forEach(function (el) {{
+      var t = (el.getAttribute("type") || "").toLowerCase();
+      var ph = el.placeholder || "";
+      if (t === "password") {{ if (!pass) pass = el; }}
+      else if (!email && (t === "email" || ph.indexOf("邮箱") >= 0 || ph.indexOf("Email") >= 0)) email = el;
+    }});
+    if (email && pass && !filled) {{
+      setValue(email, EMAIL);
+      setValue(pass, PASSWORD);
+      filled = true;
+    }}
+    if (!filled) return;
+    var capBtn = null;
+    document.querySelectorAll("button, [role=button]").forEach(function (b) {{
+      var t = (b.textContent || "").trim();
+      if (!capBtn && t && t.length <= 16 && t.indexOf("开始验证") >= 0) capBtn = b;
+    }});
+    if (capBtn) {{
+      if (now - lastCapClick > 5000) {{ lastCapClick = now; capBtn.click(); }}
+      return;
+    }}
+    if (loginTries >= 10) return;
+    if (now - lastLoginClick > 3000) {{
+      var login = null;
+      document.querySelectorAll("button").forEach(function (b) {{
+        var t = (b.textContent || "").trim();
+        if (!login && !b.disabled && (t === "登录" || t === "登 录" || t === "Sign in" || t === "Sign In")) login = b;
+      }});
+      if (login) {{ lastLoginClick = now; loginTries++; login.click(); }}
+    }}
+  }}, 500);
+}})();"#
+    )
+}
+
 /// OAuth 授权确认页脚本:勾协议 → 点继续(与 batch.rs 授权段同款)。
+/// 保留给「页面已在授权态、只需点继续」的场景;注册流水线现在统一用
+/// [`login_script`](它同时覆盖登录页与授权页),故此处允许未引用。
+#[allow(dead_code)]
 pub fn authorize_script() -> String {
     r#"(function () {
   var agreed = false, lastAgreeClick = 0, ticks = 0;

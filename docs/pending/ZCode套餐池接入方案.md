@@ -272,3 +272,74 @@ balances[]                  = []（未到点，还没有可用桶）
    要彻底消掉这次无效往返，需要把 per-entitlement 的 remaining 也放进
    `PlanGate`（`models → remaining` 映射），并按模型判定 `plan_gate_ok`。
    当前不做：15 个账号规模下收益小于复杂度，等池子变大再说。
+
+---
+
+## 八、转向：夜间/周末批处理（2026-10-23 下午）
+
+### 8.1 为什么放弃「在线网关」
+
+用户没有 Coding Plan API key，诉求变为「在工具内用上免费套餐」。追加实测后结论：
+
+1. **套餐额度没有对外 API**。`zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages`
+   对非客户端请求返回 `405 + code:3012`。**这不是 TLS 指纹**：同域
+   `GET /billing/balance` 用同一个 curl 返回 200，且不存在路径返回的是
+   `404 page not found` —— 405 是应用层挑的状态码。补 Electron UA /
+   `x-zcode-app-version` / `x-device-mid` / `X-Coding-Plan-Api-Key` 全部无效。
+2. **`api.z.ai/api/anthropic` 报 1113 是正确的**：`coding-plan-cache.json` 写明
+   `builtin:zai-coding-plan: unavailable, coding_plan_not_entitled` —— 这批号
+   没订 GLM Coding Plan，那条端点是开放平台资源包入口。
+3. **desktop 能用、CLI 不能**：
+   | | `account:zai-start-plan` 使用次数 | 机制 |
+   |---|---|---|
+   | desktop（Electron） | 今日 70 次、昨日 87 次（真实推理） | 有 "provider runtime headers" 动态头 |
+   | CLI (`zcode.cjs`) | 0 次，恒回退 `aiwork-*` | 日志里 0 次 runtime headers，无此机制 |
+   
+   CLI 的模型选择不是"配置里写什么就用什么"：实测改 `builtin:zai-start-plan.enabled`、
+   换全新 workspace、把 `providerOrder` 里的 `aiwork-trae` 挪到队尾，三次都静默
+   回退（分别落到 aiwork-trae / aiwork-trae / aiwork-buddy）。
+4. **成本量级决定不能当网关**：单次 agent 回合 `inputTokens ≈ 263K`
+   （系统提示 + skills + mcp 全量塞入），id30 日额度 3M ÷ 263K ≈ **11 次/天**；
+   延迟 36–112s/次。
+
+**但夜间档不一样**：id17 / id30 各有 1e8 夜间额度（23:00→次日 09:00），
+÷263K ≈ **380 次/夜/号**。这个量级撑得起批处理，撑不起在线网关。
+
+### 8.2 落地：队列 + 时间窗 + provider 归因
+
+| 层 | 文件 | 内容 |
+|---|---|---|
+| 迁移 | `zcode/migrations/0013_batch_tasks.sql` | `batch_tasks` 表（prompt/status/**provider_used**/model_used/tokens/duration/window_tag/attempts） |
+| 业务 | `zcode/batch.rs`（新增） | `find_cli_entry()` 探测 `zcode.cjs`；`ensure_provider_dir()` 补齐 CLI 缺的 `provider/zcode-builtin.json`；`window_open()`/`next_window_at()` 窗口判定；`run_task_blocking()` 执行（每任务独立 workspace、5min 超时、`--mode plan` 不落盘）；`attribute_from_log()` 归因；`start_loop()` 串行消费 |
+| 命令 | `zcode/modules/batch_cmds.rs`（新增） | enqueue / list / status / cancel / requeue / clear / run_now / start / stop |
+| 启动 | `main.rs` setup | `batch::start_loop()` 随应用启动挂上，用户无需手动开 |
+| UI | `pages/zcode/BatchPanel.tsx`（新增）+ Sidebar 新增「夜间批处理」 | 窗口状态/容量四卡、归因警示条、多行入队、队列详情（结果/错误/归因/用量） |
+
+### 8.3 设计要点（都是踩过的坑）
+
+1. **执行串行**：CLI 对 Built-in Endpoint 有跨进程租约锁（`ZCodeBuiltinRemoteSynchronizer`
+   的 `nextEligibleAt` 退避，日志表现为 `ZCode Built-in skipped (not-due)`），
+   并发只会互相顶掉并把退避推得更远。
+2. **每任务独立 workspace**：CLI 按 workspace 记忆上次模型，复用目录会把上一个
+   任务的模型选择继承过来，直接污染归因。
+3. **归因是硬要求**：由于 CLI 会静默回退，**不能靠配置推断烧了谁的额度**。每次执行后
+   读 `~/.zcode/cli/log/zcode-YYYY-MM-DD.jsonl` 尾部 2MB，按时间戳过滤本次窗口，
+   取真实 `providerId` 落库。UI 用绿/黄两色区分「免费套餐」与「自有池」。
+4. **`run_now` 不等执行**：单条 1–2 分钟，命令若同步等待会让前端转圈两分钟。
+   改成只置强制唤醒标志立即返回，前端 5s 轮询看 `running → done/failed`。
+5. **不去改用户客户端配置来"凑"模型**：改 `config.json` / `providerOrder` 会改变
+   用户 ZCode 客户端的默认模型，副作用超出本工具职责。模型一律以归因为准。
+
+### 8.4 今晚的验证设计
+
+用户入队后，调度器在 23:00 自动开始消费。**关键观察点是每条任务的「归因」列**：
+- 若为 `account:zai-start-plan` → CLI 在夜间档确实走套餐，全自动方案成立；
+- 若仍是 `aiwork-*` → CLI 无法使用套餐，只剩 desktop 通道，
+  下一步要决定是否用 CDP 驱动 desktop（能复用其 runtime headers，但客户端升级即失效）。
+
+### 8.5 周末档
+
+当前窗口判定只按夜间档（23:00→09:00，实测自 `effective_at`/`ends_at`）。
+周末档若是不同时段，不需要改代码：画像层已按 `PlanGrant.effective_at / ends_at`
+逐权益判定，`plan_profile::servable_now()` 会自动跟随上游下发的时间窗。
+需要时可把 `batch::window_open()` 扩展成"任一权益窗口打开"。

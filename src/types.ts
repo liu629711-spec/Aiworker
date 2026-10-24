@@ -37,6 +37,7 @@ export type ViewKey =
   | 'zcode-register'
   | 'zcode-invite'
   | 'zcode-masks'
+  | 'zcode-batch'
   // Agent 接入中心（2026-10-23：全局页，侧边栏底部入口）
   | 'agent-integration';
 
@@ -928,6 +929,27 @@ export interface ProvisionedModel {
   region?: 'cn' | 'global' | '';
 }
 
+/** PoolAvailability：各池各区域的可用账号数（Agent 接入中心置灰依据） */
+export interface PoolAvailability {
+  /** trae | buddy | qoder | zcode */
+  pool: string;
+  /** 国内账号数（zcode 无区域概念，计在此） */
+  cn: number;
+  /** 海外账号数（仅 buddy/qoder 有） */
+  global: number;
+}
+
+/** 弹框里的一个可选模型 */
+export interface PoolModelOption {
+  /** 带池前缀与区域后缀的网关模型 id，如 qoder/GLM-5.3@cn */
+  id: string;
+  pool: string;
+  /** 'cn' | 'global' | ''（无后缀 = 该区独有或无区域概念） */
+  region: 'cn' | 'global' | '';
+  /** 该池该区是否有账号；false = 置灰不可勾（写了也必 no_healthy） */
+  enabled: boolean;
+}
+
 /** agent_integration_apply 返回（各 agent 形状略有差异，取并集为可选字段） */
 export interface AgentApplyResult {
   ok: boolean;
@@ -940,6 +962,11 @@ export interface AgentApplyResult {
   cn_count?: number;
   global_count?: number;
   models?: ProvisionedModel[];
+  /**
+   * 因「该池/该区无可用账号」被跳过的池（`qoder（未配置账号池）` 这类文案）。
+   * 空数组 = 没有剪枝。UI 必须展示：静默少写几个模型比多写更让人困惑。
+   */
+  skipped_pools?: string[];
   /** ZCode 批量：成功数 / 总数 / 每 Key 明细 */
   applied?: number;
   total?: number;
@@ -1884,4 +1911,42 @@ export interface QoderCreditsSnapshot {
   /** 当日获得（签到奖励合计；无签到数据 null） */
   earned?: number | null;
   accounts: { user_id: string; total: number | null }[];
+}
+
+/** ZCode 夜间/周末批处理任务（后端 zcode::batch::BatchTask） */
+export interface BatchTask {
+  id: number;
+  batch_id: string | null;
+  prompt: string;
+  model: string;
+  /** pending | running | done | failed | canceled */
+  status: string;
+  result: string | null;
+  error: string | null;
+  /** 归因：真实 providerId（account:zai-start-plan = 免费套餐 / aiwork-* = 自有中转池） */
+  provider_used: string | null;
+  model_used: string | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  duration_ms: number | null;
+  /** night | forced | off */
+  window_tag: string | null;
+  attempts: number;
+  created_at: number;
+  started_at: number | null;
+  finished_at: number | null;
+}
+
+/** 批处理调度状态 */
+export interface BatchStatus {
+  running: boolean;
+  /** 是否处于夜间档窗口（23:00→次日 09:00） */
+  window_open: boolean;
+  next_window_at: number | null;
+  pending: number;
+  done_today: number;
+  failed_today: number;
+  last_provider: string | null;
+  /** CLI 入口路径；null = 没探到，批处理不可用 */
+  cli_entry: string | null;
 }

@@ -73,19 +73,12 @@ fn plan_gate_of(a: &Account) -> Option<PlanGate> {
     })
 }
 
-/// 同步上下文 → 异步查询的安全桥接：
-/// - 已在 tokio runtime 内（网关 identity 回调跑在网关 runtime worker、
-///   apply_pool_snapshot 跑在 tauri 主 runtime worker）→ 先 `block_in_place`
-///   把当前 worker 转为阻塞线程，再 `block_on`，否则直接嵌套 block_on 会
-///   panic "Cannot start a runtime from within a runtime"（panic.log 2026-10-21 有案底）；
-/// - current_thread runtime 或普通 OS 线程 → 直接 `block_on`（合法）。
+/// 同步上下文 → 异步查询的安全桥接（block_in_place 保护，防嵌套 block_on
+/// panic "Cannot start a runtime from within a runtime"）。实现共享化后
+/// 统一走 zcode::util——与 relay.rs / agent_integration.rs 同一入口，
+/// 此地曾维护过一份重复副本（panic.log 2026-10-21 有案底的防线分叉维护）。
 fn bridge_block_on<F: std::future::Future>(fut: F) -> F::Output {
-    match tokio::runtime::Handle::try_current() {
-        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(|| tauri::async_runtime::block_on(fut))
-        }
-        _ => tauri::async_runtime::block_on(fut),
-    }
+    crate::zcode::util::bridge_block_on(fut)
 }
 
 /// 全量列出可入池账号（token 非空才入池——空 token 账号入池也只会每请求

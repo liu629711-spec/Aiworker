@@ -365,10 +365,17 @@ async fn run_inner(
         .parse()
         .map_err(|e| AppError::Other(format!("非法注册页地址: {e}")))?;
     let blank: tauri::Url = "about:blank".parse().unwrap();
-    // 初始化脚本 = flag 上报助手 + 注册表单脚本。
+    // 初始化脚本 = flag 上报助手 + 注册表单脚本 + 登录脚本。
     // 助手必须先注入:它提供 window.__zflowReport,后续各段脚本靠它把阶段完成信号
     // 写进 location.hash(Rust 侧读 win.url() 的 fragment)。
-    let init_script = format!("{}\n{}", super::flow_script::FLAG_REPORT_HELPER, script);
+    // 登录脚本一起注入是必要的:验证链接点完后官方会要求重新登录,
+    // 那一刻页面已经跳走,事后 eval 的脚本不会在新文档里执行。
+    let init_script = format!(
+        "{}\n{}\n{}",
+        super::flow_script::FLAG_REPORT_HELPER,
+        script,
+        super::flow_script::login_script(&req.email, &req.password)
+    );
     let win = tauri::WebviewWindowBuilder::new(
         app,
         "login-flow",
@@ -430,7 +437,16 @@ async fn run_inner(
     {
         Ok(m) => m,
         Err(e) => {
-            let msg = format!("收验证邮件失败: {e}");
+            // 关键提示(2026-10-23 19:04 用户实测「注册完无法往下、账号管理看不到」复现):
+            // 此刻账号在 z.ai 服务端**已经创建成功**(第2步已提交),只是收信失败。
+            // 若不说清,用户会再点一次「发起注册」——同一邮箱在服务端要么报
+            // 「已存在」要么造出第二个号,而本地库里始终看不到号,循环踩坑。
+            let msg = format!(
+                "{e}。注意:账号已在 z.ai 服务端创建成功(只是验证邮件没收到/没点开),\
+                 切勿用同一邮箱重复注册。恢复:先在 Gmail 里手动点开该邮箱的验证链接,\
+                 然后到「账密库」对这条马甲邮箱点「批量登录」即可导入入池(验证邮件本身\
+                 已发出,IMAP 连不上多为代理/网络问题——本次是 imap.gmail.com:993 超时)"
+            );
             app_log(&format!("[register:{tag}] 第3步收信失败: {e}"));
             emit_progress(app, "mail", "failed", &tag, msg.clone());
             let _ = win.close();
@@ -469,20 +485,46 @@ async fn run_inner(
     // 兜底:少数形态会在页面里要 6 位码(导航后页面可能也留着这个输入框)
     let verify_script = super::flow_script::verify_script(&mail.token);
     let _ = win.eval(&verify_script);
-    let verified = wait_for_flag(app, &win, "__zaiSignupVerified", 120).await;
+    // 判据放宽:验证链接生效后页面可能停在同一路径(只把邮箱标成已验证),
+    // 也可能跳登录页/首页。三者都算这一步成功;超时也不再中止流水线——
+    // 下一步会用账密重新登录,把验证后必须重新登录的官方要求接住。
+    let verified = wait_for_any_flag_or_leave(
+        app,
+        &win,
+        &["__zaiSignupVerified", "__zaiSessionReady"],
+        120,
+        "/auth/verify",
+    )
+    .await;
     if verified.is_none() {
-        // 不关窗口:留给用户手动救场(可能是页面要求手动设密码)
-        let msg = "邮箱验证未在 2 分钟内完成:窗口保持打开,请手动在窗口内完成剩余步骤".to_string();
-        app_log(&format!("[register:{tag}] 第4步验证超时(窗口未关,待人工)"));
-        emit_progress(app, "verify", "failed", &tag, msg.clone());
-        let _ = win.close();
-        return Err(AppError::Other(msg));
+        app_log(&format!(
+            "[register:{tag}] 第4步未等到验证标志(不中止):继续用账密登录并授权"
+        ));
+        emit_progress(
+            app,
+            "verify",
+            "running",
+            tag,
+            "验证链接已打开但未回传标志,继续用账密登录并授权".into(),
+        );
     }
-    emit_progress(app, "verify", "success", &tag, "邮箱验证完成".into());
-    app_log(&format!("[register:{tag}] 第4步邮箱验证完成"));
+    emit_progress(app, "verify", "success", &tag, "邮箱验证链接已生效".into());
+    app_log(&format!("[register:{tag}] 第4步邮箱验证链接处理完成"));
 
-    // ── 5. 同一窗口走 OAuth 授权(注册态已在 cookie 里) ──────────
+    // ── 5. 新建带登录脚本的窗口走 OAuth 授权(注册态已在 cookie 里) ──────
+    // 实测(2026-10-23 16:27):验证完官方要求重新登录,而 authorize 页在未登录时
+    // 会被踢到 /auth/login。旧实现只在当前文档 eval 一次 authorize_script,
+    // 跳转即丢失 → 授权按钮永远等不到 → 第 4 步超时、账号永不入池。
+    // 改为重建窗口并把 login_script 放进 initialization_script(每个文档都跑),
+    // 登录页/授权页各自自动完成。
     emit_progress(app, "oauth", "running", tag, "正在授权并导入账号".into());
+    let _ = win.close();
+    for _ in 0..40 {
+        if app.get_webview_window("login-flow").is_none() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     let poll_token = format!(
         "{}{}",
         uuid::Uuid::new_v4().simple(),
@@ -490,7 +532,6 @@ async fn run_inner(
     );
     let init = http.init_oauth_polling(&poll_token).await?;
     if init["code"].as_i64() != Some(0) {
-        let _ = win.close();
         return Err(AppError::Other(
             init["msg"].as_str().unwrap_or("OAuth 会话初始化失败").to_string(),
         ));
@@ -509,14 +550,32 @@ async fn run_inner(
     let authorize: tauri::Url = authorize_url
         .parse()
         .map_err(|e| AppError::Other(format!("非法 authorize_url: {e}")))?;
-    if let Err(e) = win.navigate(authorize) {
-        let _ = win.close();
+    // 登录脚本 + flag 助手:同源多文档生效,登录页与授权页都能自动过关
+    let login_init = format!(
+        "{}\n{}",
+        super::flow_script::FLAG_REPORT_HELPER,
+        super::flow_script::login_script(&req.email, &req.password)
+    );
+    let blank: tauri::Url = "about:blank".parse().unwrap();
+    let auth_win = tauri::WebviewWindowBuilder::new(
+        app,
+        "login-flow",
+        tauri::WebviewUrl::External(blank),
+    )
+    .title("z.ai 授权(自动进行中,请勿关闭)")
+    .inner_size(520.0, 700.0)
+    .center()
+    .initialization_script(&login_init)
+    .build()
+    .map_err(|e| AppError::Other(format!("创建授权窗口失败: {e}")))?;
+    let _ = auth_win.set_focus();
+    if let Err(e) = auth_win.navigate(authorize) {
+        let _ = auth_win.close();
         return Err(AppError::Other(format!("导航到授权页失败: {e}")));
     }
-
-    // 授权页脚本:勾协议 + 点继续(与批量登录同款逻辑)
-    let auth_script = super::flow_script::authorize_script();
-    let _ = win.eval(&auth_script);
+    app_log(&format!(
+        "[register:{tag}] 第5步已打开授权页(带自动登录脚本),等待会话建立"
+    ));
 
     // 复用账号服务的轮询入库逻辑(中止条件:取消 / 窗口被关)
     let account = super::super::accounts::service::poll_and_save_account_public(
@@ -537,7 +596,7 @@ async fn run_inner(
         },
     )
     .await;
-    let _ = win.close();
+    let _ = auth_win.close();
     let account = match account {
         Ok(a) => a,
         Err(e) => {
@@ -650,7 +709,12 @@ async fn run_inner(
 /// (早期版本把 flag 写进 document.title 再读 win.title(),但 Tauri 的 title() 读的是
 /// OS 窗口标题栏——tao 的 GetWindowTextW——收不到 WebView 里的 document.title,
 /// 通道必然失效;hash 是 win.url() 能真实读回的。)
-/// 返回 Some(elapsed) 表示等到;None 表示超时或窗口被关。
+///
+/// 存活判定:窗口从 manager 里消失要**连续多次**才认定被关。
+/// 实测(2026-10-23 16:24)`clear_all_browsing_data()` 会让 WebView2 短暂重建,
+/// 期间 `get_webview_window()` 有瞬时空窗,旧实现只看一次就返回 None,
+/// 表现为「打开 4 秒后就报填表超时」。
+/// 返回 Some(elapsed) 表示等到;None 表示超时或窗口真的被关。
 async fn wait_for_flag(
     app: &AppHandle,
     win: &tauri::WebviewWindow,
@@ -660,13 +724,84 @@ async fn wait_for_flag(
     let started = std::time::Instant::now();
     // hash 形如 "#zflow=__zaiSignupSubmitted:1"
     let want = format!("zflow={flag}:1");
+    let mut missing = 0u32;
     loop {
         if app.get_webview_window("login-flow").is_none() {
-            return None;
+            missing += 1;
+            // 连续 3 秒都不在(6 次 × 500ms)才算被关
+            if missing >= 6 {
+                return None;
+            }
+        } else {
+            missing = 0;
         }
         if let Ok(url) = win.url() {
             if url.fragment().is_some_and(|f| f == want) {
                 return Some(started.elapsed().as_secs());
+            }
+        }
+        if started.elapsed().as_secs() >= timeout_sec {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+/// 轮询等待**任一**页面脚本标志位命中(多判据场景:一条路径可能只落其中一个)。
+/// 与 [`wait_for_flag`] 同机制,只是接受一组 flag。
+async fn wait_for_any_flag(
+    app: &AppHandle,
+    win: &tauri::WebviewWindow,
+    flags: &[&str],
+    timeout_sec: u64,
+) -> Option<u64> {
+    wait_any_flag_impl(app, win, flags, timeout_sec, None).await
+}
+
+/// 同上,并且**页面离开指定路径前缀**也算达成。
+///
+/// 用途(实测 2026-10-23):验证链接被服务端处理后,页面会跳到登录页或首页,
+/// 但脚本的 `__zaiSignupVerified` 只在「离开 /auth」时才写。
+/// 若只等标志位,页面跳到 `/auth/login` 这种合法进展也会被当成失败干等满 120s。
+async fn wait_for_any_flag_or_leave(
+    app: &AppHandle,
+    win: &tauri::WebviewWindow,
+    flags: &[&str],
+    timeout_sec: u64,
+    leave_prefix: &str,
+) -> Option<u64> {
+    wait_any_flag_impl(app, win, flags, timeout_sec, Some(leave_prefix)).await
+}
+
+async fn wait_any_flag_impl(
+    app: &AppHandle,
+    win: &tauri::WebviewWindow,
+    flags: &[&str],
+    timeout_sec: u64,
+    leave_prefix: Option<&str>,
+) -> Option<u64> {
+    let started = std::time::Instant::now();
+    let wants: Vec<String> = flags.iter().map(|f| format!("zflow={f}:1")).collect();
+    let mut missing = 0u32;
+    loop {
+        if app.get_webview_window("login-flow").is_none() {
+            missing += 1;
+            if missing >= 6 {
+                return None;
+            }
+        } else {
+            missing = 0;
+        }
+        if let Ok(url) = win.url() {
+            if let Some(f) = url.fragment() {
+                if wants.iter().any(|w| w == f) {
+                    return Some(started.elapsed().as_secs());
+                }
+            }
+            if let Some(prefix) = leave_prefix {
+                if !url.path().starts_with(prefix) {
+                    return Some(started.elapsed().as_secs());
+                }
             }
         }
         if started.elapsed().as_secs() >= timeout_sec {

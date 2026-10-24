@@ -4,6 +4,21 @@ use crate::zcode::error::{AppError, AppResult};
 use crate::zcode::state::ZcodeState;
 use tauri::Manager;
 
+/// 同步上下文 → 异步查询的安全桥接。
+///
+/// 直接在 async 命令(tokio multi-thread worker)里 `block_on` 会 panic
+/// "Cannot start a runtime from within a runtime"(panic.log 2026-10-23 有案底)。
+/// - 已在 multi-thread runtime 内 → 先 `block_in_place` 把当前 worker 转成阻塞线程;
+/// - current_thread runtime 或普通 OS 线程 → 直接 `block_on`(合法)。
+pub fn bridge_block_on<F: std::future::Future>(fut: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| tauri::async_runtime::block_on(fut))
+        }
+        _ => tauri::async_runtime::block_on(fut),
+    }
+}
+
 pub async fn kv_get(db: &sqlx::SqlitePool, key: &str) -> Option<String> {
     let (v,): (String,) = sqlx::query_as("SELECT value FROM app_kv WHERE key = ?1")
         .bind(key)

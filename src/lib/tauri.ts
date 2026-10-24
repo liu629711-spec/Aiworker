@@ -88,6 +88,8 @@ import type {
   FreeUsageSnapshot,
   DetectedAgent,
   AgentApplyResult,
+  PoolAvailability,
+  PoolModelOption,
   QoderCheckinRecord,
   QoderCliStatus,
   QoderLiveLogins,
@@ -102,6 +104,8 @@ import type {
   QoderResetItem,
   QoderResetResult,
   QoderSettings,
+  BatchTask,
+  BatchStatus,
 } from '../types';
 
 export type { ApiKeyEntry, OverseasAccessInfo, ApiKeyTestResult, KeyScopedModels, FreeUsageSnapshot, QoderAccountView, WorkBuddyAccountView, DetectedAgent, AgentApplyResult };
@@ -838,6 +842,52 @@ export const api = {
       }),
     /** Agent 接入中心：清除该 agent 内本工具写入的配置 */
     agentsClear: (agentId: string) => invoke<AgentApplyResult>('agent_integration_clear', { agentId }),
+    /**
+     * Agent 接入中心：各池各区域的可用账号数（弹框置灰依据）。
+     * cn/global 为 0 的池/区，其模型默认不勾且不可写——避免「没有海外号却
+     * 把 @global 模型写进配置」。
+     */
+    agentPoolAvailability: () =>
+      invoke<{ pools: PoolAvailability[] }>('agent_integration_pool_availability'),
+    /** Agent 接入中心：池可用性 + 各池可选模型（弹框按池分组渲染） */
+    agentPoolCatalog: () =>
+      invoke<{ pools: PoolAvailability[]; models: PoolModelOption[] }>(
+        'agent_integration_pool_catalog',
+      ),
+    /**
+     * Agent 接入中心：按显式勾选的模型写入。
+     * `poolKeys` 为「每池用哪把 Key」映射（多池混选时各池凭证可能不同）；
+     * 缺省由后端按池绑定自动挑。
+     */
+    agentsApplyModels: (
+      agentId: string,
+      models: string[],
+      keyId?: string,
+      poolKeys?: Record<string, string>,
+    ) =>
+      invoke<AgentApplyResult>('agent_integration_apply_models', {
+        agentId,
+        models,
+        keyId: keyId ?? null,
+        poolKeys: poolKeys ?? null,
+      }),
+    // ===== ZCode 夜间/周末批处理（2026-10-23）=====
+    /** 批量入队（多行 prompt 拆条）；返回实际入队条数 */
+    zcodeBatchEnqueue: (prompts: string[], model?: string, batchId?: string) =>
+      invoke<number>('zcode_batch_enqueue', {
+        prompts,
+        model: model ?? null,
+        batchId: batchId ?? null,
+      }),
+    zcodeBatchList: (limit?: number) => invoke<BatchTask[]>('zcode_batch_list', { limit: limit ?? null }),
+    zcodeBatchStatus: () => invoke<BatchStatus>('zcode_batch_status'),
+    zcodeBatchCancel: (id: number) => invoke<void>('zcode_batch_cancel', { id }),
+    zcodeBatchRequeue: (id: number) => invoke<void>('zcode_batch_requeue', { id }),
+    zcodeBatchClear: () => invoke<number>('zcode_batch_clear'),
+    /** 立即跑一条（忽略时间窗；白天验通道用） */
+    zcodeBatchRunNow: () => invoke<boolean>('zcode_batch_run_now'),
+    zcodeBatchStart: () => invoke<boolean>('zcode_batch_start'),
+    zcodeBatchStop: () => invoke<boolean>('zcode_batch_stop'),
     /** ② 免费模型用量计数快照（额度中心） */
     freeUsageSnapshot: () => invoke<FreeUsageSnapshot>('free_usage_snapshot'),
     logsList: () => invoke<string[]>('api_logs_list'),
