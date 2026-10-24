@@ -222,6 +222,16 @@ impl StickyStore {
         }
     }
 
+    /// 按会话键解绑单条粘性绑定（断流漂移）：上游 EOF 掐流后调用，让该会话
+    /// 下一次请求按调度策略重新取号。只动本会话——单次 EOF 可能只是上游
+    /// 抖动，其余会话的绑定不动，各自在自己的首次断流时再漂移（自愈式）。
+    pub fn unbind_key(&self, key: &SessionKey) {
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if map.remove(&self.full_key(key)).is_some() {
+            *self.last_save.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
     /// 清理全部过期绑定，返回清理条数（save 落库前调用，控制绑定表无界增长）。
     /// 显式模式 TTL 读运行时配置值（per-pool 可配后固定 1800 会在用户调大 TTL 时
     /// 提前删除仍有效的绑定，F-76② per-pool 版修正）

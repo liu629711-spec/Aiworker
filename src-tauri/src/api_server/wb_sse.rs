@@ -223,11 +223,14 @@ fn responses_object(id: &str, model: &str, status: &str, output: Vec<Value>, usa
 
 /// 流式转发：WB SSE → 客户端协议帧（扩展返回）
 ///
-/// 返回 (流内错误, 是否已发送过数据, 流内失败已就地下发, usage)：
+/// 返回 (流内错误, 是否已发送过数据, 流内失败已就地下发, EOF 断流, usage)：
 /// - error_info：尚未向下游发送任何数据时捕获的流内错误（调用方据此换号重试）；
 /// - failed_inline：流内失败事件（response.failed / error 帧）已就地透传客户端——
 ///   调用方不得再按成功收尾（不记成功、不清冷却、不绑定粘性），也不应重试
 ///   （错误已原样给到客户端，重试会造成重复流）。
+/// - eof_truncated：上游未发 Done/Error 即断流（EOF），已按协议补齐终止帧——
+///   客户端视角是"正常完成"，但内容半截。调用方据此解绑该会话粘性（断流
+///   漂移）：账号正在劣化，下一次请求应落到健康账号而非反复被掐。
 /// - 行源须为可中断行源：上游停滞期间每 LINE_POLL 检查一次客户端断连
 ///   （tx.is_closed()），断连即终止转发（上游连接与账号并发槽随 Drop 释放）
 // 宏内末次赋值（text_block_open）在收尾路径后不再读取，属预期行为（对齐 sse.rs）
@@ -239,10 +242,11 @@ pub fn stream_forward_ex(
     chat_id: &str,
     model: &str,
     encoded: &HashSet<String>,
-) -> (Option<(i64, String)>, bool, bool, Option<Value>) {
+) -> (Option<(i64, String)>, bool, bool, bool, Option<Value>) {
     let mut parser = WbSseParser::new(lines);
     let mut sent_any = false;
     let mut failed_inline = false;
+    let mut eof_truncated = false;
     // 真实内容标记（正文/思考链/工具调用任一非空）：空完成（影子风控）检测依据
     // （issue #57）；占位帧（Responses created / 空 delta chunk）不计入
     let mut has_content = false;
@@ -800,10 +804,13 @@ pub fn stream_forward_ex(
     // 上游断流（EOF 未收到 Done/Error 事件）优雅收尾（审查 P1-5，对齐
     // sse.rs SOLO finish_stream 语义）：已有内容 → 按协议补齐终止帧，避免
     // 严格客户端因未闭合的 content_block / message 项挂起；零内容不伪装
-    // 成功，走下方空完成哨兵换号重试
+    // 成功，走下方空完成哨兵换号重试。补帧同时置 eof_truncated——客户端
+    // 看到的"正常完成"实为半截流，调用方据此做断流漂移（解绑粘性）。
+    // 客户端已断连（tx.is_closed()）不置标记：会话已消失，漂移无对象。
     if error_info.is_none() && !finished && !failed_inline && has_content && !tx.is_closed() {
         finish_stream!();
         sent_any = true;
+        eof_truncated = true;
     }
 
     // 空完成兜底（issue #57）：EOF 且零内容零错误 → 哨兵上抛；判定与客户端
@@ -816,10 +823,10 @@ pub fn stream_forward_ex(
         ));
     }
 
-    (error_info, sent_any, failed_inline, usage)
+    (error_info, sent_any, failed_inline, eof_truncated, usage)
 }
 
-/// 兼容封装：旧三元组返回（既有调用方不感知流内失败标记；
+/// 兼容封装：旧三元组返回（既有调用方不感知流内失败标记与 EOF 断流标记；
 /// 新调用方请用 stream_forward_ex）
 pub fn stream_forward(
     lines: InterruptibleLines,
@@ -829,7 +836,7 @@ pub fn stream_forward(
     model: &str,
     encoded: &HashSet<String>,
 ) -> (Option<(i64, String)>, bool, Option<Value>) {
-    let (error_info, sent_any, _failed_inline, usage) =
+    let (error_info, sent_any, _failed_inline, _eof_truncated, usage) =
         stream_forward_ex(lines, tx, proto, chat_id, model, encoded);
     (error_info, sent_any, usage)
 }
@@ -1176,7 +1183,7 @@ mod tests {
             .collect();
         let src = InterruptibleLines::from_iterator(Box::new(data.into_iter()));
         let start = std::time::Instant::now();
-        let (_err, sent_any, _fi, _u) = stream_forward_ex(
+        let (_err, sent_any, _fi, _eof, _u) = stream_forward_ex(
             src, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m", &HashSet::new(),
         );
         assert!(!sent_any, "断连后不得有任何事件下发");
@@ -1215,11 +1222,12 @@ mod tests {
         data.push("data: [DONE]".to_string());
         data.push(String::new());
         let src = InterruptibleLines::from_iterator(Box::new(data.into_iter()));
-        let (err, sent_any, _fi, usage) = stream_forward_ex(
+        let (err, sent_any, _fi, eof, usage) = stream_forward_ex(
             src, &tx, crate::api_server::routes::Protocol::OpenAi, "chat_96", "step-5-preview", &HashSet::new(),
         );
         assert!(err.is_none());
         assert!(sent_any);
+        assert!(!eof, "带 [DONE] 的正常完成不得置 EOF 断流标记");
         assert!(usage.is_some());
         drop(tx);
 
@@ -1246,6 +1254,31 @@ mod tests {
         assert!(body.ends_with("data: [DONE]\n\n"), "流必须以 [DONE] 收尾");
         // 纯噪声帧整帧跳过：4 个有效帧（首思考/续思考/正文/finish）+ [DONE]
         assert_eq!(body.matches("data: ").count(), 5, "纯噪声帧应整帧跳过");
+    }
+
+    /// EOF 断流（补帧收尾 + 断流漂移标记）：上游未发 [DONE]/错误即断流且已有
+    /// 内容 → 补齐终止帧（客户端视角仍是正常完成，不挂起），同时置
+    /// eof_truncated 供调用方解绑粘性、让会话下一轮漂移到健康账号。
+    #[test]
+    fn stream_forward_marks_eof_truncation_without_done() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let src = lines(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"半截\"}}]}",
+            "",
+        ]);
+        let (_err, sent_any, _fi, eof_truncated, _u) = stream_forward_ex(
+            src, &tx, crate::api_server::routes::Protocol::OpenAi, "chat_eof", "step-5-preview", &HashSet::new(),
+        );
+        assert!(sent_any);
+        assert!(eof_truncated, "EOF 断流必须置标记");
+        drop(tx);
+
+        let mut body = String::new();
+        while let Ok(frame) = rx.try_recv() {
+            body.push_str(&String::from_utf8_lossy(&frame.unwrap()));
+        }
+        assert!(body.contains("半截"), "已流出的内容必须完整下发");
+        assert!(body.ends_with("data: [DONE]\n\n"), "EOF 断流必须补齐终止帧");
     }
 
     #[test]
@@ -1431,7 +1464,7 @@ mod tests {
             "data: {\"error\":{\"message\":\"中途失败\",\"code\":1001}}",
             "",
         ]);
-        let (err, sent_any, failed_inline, _usage) = stream_forward_ex(
+        let (err, sent_any, failed_inline, _eof, _usage) = stream_forward_ex(
             lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_9", "m", &HashSet::new(),
         );
         assert!(err.is_none(), "流内错误已就地下发，不得上抛触发换号重试");
@@ -1457,7 +1490,7 @@ mod tests {
             "data: [DONE]",
             "",
         ]);
-        let (err, sent_any, failed_inline, usage) = stream_forward_ex(
+        let (err, sent_any, failed_inline, _eof, usage) = stream_forward_ex(
             lines, &tx, crate::api_server::routes::Protocol::Responses, "resp_2", "m", &HashSet::new(),
         );
         assert!(err.is_none());
@@ -1476,7 +1509,7 @@ mod tests {
             "data: {\"error\":{\"message\":\"中途失败\",\"code\":7}}",
             "",
         ]);
-        let (err, _sent_any, failed_inline, _usage) = stream_forward_ex(
+        let (err, _sent_any, failed_inline, _eof, _usage) = stream_forward_ex(
             lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_3", "m", &HashSet::new(),
         );
         assert!(err.is_none());
@@ -1494,7 +1527,7 @@ mod tests {
     fn stream_forward_error_before_stream_uplifts() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(256);
         let lines = lines(&["data: {\"error\":{\"message\":\"boom\",\"code\":9}}", ""]);
-        let (err, sent_any, failed_inline, _usage) = stream_forward_ex(
+        let (err, sent_any, failed_inline, _eof, _usage) = stream_forward_ex(
             lines, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m", &HashSet::new(),
         );
         assert_eq!(err.unwrap(), (9, "boom".to_string()));
@@ -1514,7 +1547,7 @@ mod tests {
             "data: [DONE]",
             "",
         ]);
-        let (err, sent_any, failed_inline, _u) = stream_forward_ex(
+        let (err, sent_any, failed_inline, _eof, _u) = stream_forward_ex(
             lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_4", "m", &HashSet::new(),
         );
         assert!(err.is_none() && sent_any && !failed_inline);
@@ -1635,7 +1668,7 @@ mod tests {
             "data: [DONE]",
             "",
         ]);
-        let (err, sent_any, failed_inline, _u) = stream_forward_ex(
+        let (err, sent_any, failed_inline, _eof, _u) = stream_forward_ex(
             lines, &tx, crate::api_server::routes::Protocol::Anthropic, "msg_6", "m", &HashSet::new(),
         );
         assert!(err.is_none() && sent_any && !failed_inline);

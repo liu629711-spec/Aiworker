@@ -1007,7 +1007,7 @@ fn run_wb_stream(
                     let win_lines = super::wb_upstream::InterruptibleLines::from_iterator(
                         Box::new(win.lines) as Box<dyn Iterator<Item = String> + Send>,
                     );
-                    let (error_info, sent_any, failed_inline, usage) =
+                    let (error_info, sent_any, failed_inline, eof_truncated, usage) =
                         wb_sse::stream_forward_ex(win_lines, tx, proto, chat_id, model, encoded);
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     {
@@ -1097,6 +1097,22 @@ fn run_wb_stream(
                                     "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
                                     duration_ms, Some(ttfb_ms), &key_name,
                                     &state.wb_pool.name_of(win_uid), Some("流内失败已透传客户端"),
+                                );
+                                return;
+                            }
+                            if eof_truncated {
+                                // EOF 断流（补帧收尾已下发，客户端视角是"正常完成"）：
+                                // 上游中途掐流 = 该账号正在劣化（实测形态：TTFB 渐涨 →
+                                // 断流 → 反复被掐 → 撞 429 硬冷却）。不记成功、不重绑
+                                // 粘性，并解绑本会话旧绑定——下一次请求按调度策略漂移
+                                // 到健康账号，而不是在劣化号上继续磨。
+                                state.wb_sticky.unbind_key(&sticky_key);
+                                state.wb_sticky.save(&state.data_dir);
+                                state.logger.log_request_ttfb(
+                                    "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
+                                    duration_ms, Some(ttfb_ms), &key_name,
+                                    &state.wb_pool.name_of(win_uid),
+                                    Some("EOF 断流 → 补帧收尾，解绑粘性（下轮漂移换号）"),
                                 );
                                 return;
                             }

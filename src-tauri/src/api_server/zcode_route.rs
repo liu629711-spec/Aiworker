@@ -781,7 +781,7 @@ fn run_stream(
                 };
                 // 上游 SSE（OpenAI 兼容 chunk）→ 客户端协议转发（含 keep-alive 15s
                 // + 客户端断连三层检测 + Anthropic/Responses 协议转换）
-                let (error_info, _sent_any, _failed_inline, usage) = wb_sse::stream_forward_ex(
+                let (error_info, _sent_any, _failed_inline, _eof_truncated, usage) = wb_sse::stream_forward_ex(
                     ilines, tx, proto, &chat_id, model, &HashSet::new(),
                 );
                 let duration_ms = start_ts.elapsed().as_millis() as u64;
