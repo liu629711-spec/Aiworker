@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use crate::zcode::api::ZaiClient;
 use crate::zcode::error::{AppError, AppResult};
-use crate::zcode::batch::BatchRuntime;
 use crate::zcode::modules::accounts::batch::BatchLoginHandle;
 use crate::zcode::modules::accounts::oauth::OAuthCancel;
 use crate::zcode::modules::claim::service::ClaimRuntime;
@@ -38,8 +37,6 @@ pub struct ZcodeState {
     pub batch: Arc<BatchLoginHandle>,
     /// 马甲邮箱全自动注册流水线(取消/运行标志)
     pub register: Arc<RegisterHandle>,
-    /// 夜间/周末批处理调度(2026-10-23)：队列消费 + CLI 执行 + provider 归因
-    pub batch_rt: Arc<BatchRuntime>,
 }
 
 impl ZcodeState {
@@ -80,7 +77,6 @@ impl ZcodeState {
             oauth: Arc::new(OAuthCancel::default()),
             batch: Arc::new(BatchLoginHandle::default()),
             register: Arc::new(RegisterHandle::default()),
-            batch_rt: Arc::new(BatchRuntime::default()),
         })
     }
 }

@@ -104,8 +104,6 @@ import type {
   QoderResetItem,
   QoderResetResult,
   QoderSettings,
-  BatchTask,
-  BatchStatus,
 } from '../types';
 
 export type { ApiKeyEntry, OverseasAccessInfo, ApiKeyTestResult, KeyScopedModels, FreeUsageSnapshot, QoderAccountView, WorkBuddyAccountView, DetectedAgent, AgentApplyResult };
@@ -871,24 +869,7 @@ export const api = {
         keyId: keyId ?? null,
         poolKeys: poolKeys ?? null,
       }),
-    // ===== ZCode 夜间/周末批处理（2026-10-23）=====
-    /** 批量入队（多行 prompt 拆条）；返回实际入队条数 */
-    zcodeBatchEnqueue: (prompts: string[], model?: string, batchId?: string) =>
-      invoke<number>('zcode_batch_enqueue', {
-        prompts,
-        model: model ?? null,
-        batchId: batchId ?? null,
-      }),
-    zcodeBatchList: (limit?: number) => invoke<BatchTask[]>('zcode_batch_list', { limit: limit ?? null }),
-    zcodeBatchStatus: () => invoke<BatchStatus>('zcode_batch_status'),
-    zcodeBatchCancel: (id: number) => invoke<void>('zcode_batch_cancel', { id }),
-    zcodeBatchRequeue: (id: number) => invoke<void>('zcode_batch_requeue', { id }),
-    zcodeBatchClear: () => invoke<number>('zcode_batch_clear'),
-    /** 立即跑一条（忽略时间窗；白天验通道用） */
-    zcodeBatchRunNow: () => invoke<boolean>('zcode_batch_run_now'),
     apiRecentEvents: (limit?: number) => invoke<string[]>('api_recent_events', { limit: limit ?? 120 }),
-    zcodeBatchStart: () => invoke<boolean>('zcode_batch_start'),
-    zcodeBatchStop: () => invoke<boolean>('zcode_batch_stop'),
     /** ② 免费模型用量计数快照（额度中心） */
     freeUsageSnapshot: () => invoke<FreeUsageSnapshot>('free_usage_snapshot'),
     logsList: () => invoke<string[]>('api_logs_list'),

@@ -449,16 +449,6 @@ fn main() {
             commands::qoder::qoder_env_reset,
             tasks::scheduler::scheduler_status,
             // ===== zcode 域命令(移植自 zai-claim)=====
-            // ===== ZCode 夜间/周末批处理 =====
-            zcode::modules::batch_cmds::zcode_batch_enqueue,
-            zcode::modules::batch_cmds::zcode_batch_list,
-            zcode::modules::batch_cmds::zcode_batch_status,
-            zcode::modules::batch_cmds::zcode_batch_cancel,
-            zcode::modules::batch_cmds::zcode_batch_requeue,
-            zcode::modules::batch_cmds::zcode_batch_clear,
-            zcode::modules::batch_cmds::zcode_batch_run_now,
-            zcode::modules::batch_cmds::zcode_batch_start,
-            zcode::modules::batch_cmds::zcode_batch_stop,
             zcode::modules::accounts::commands::zcode_accounts_list,
             zcode::modules::accounts::commands::zcode_accounts_add_oauth,
             zcode::modules::accounts::commands::zcode_accounts_cancel_oauth,
@@ -521,13 +511,6 @@ fn main() {
                 use zcode::state::ZcodeState;
                 let monitor = app.state::<ZcodeState>().monitor.clone();
                 monitor.start(app.handle());
-            }
-            // ZCode 夜间/周末批处理调度（2026-10-23）：只在夜间窗口内消费队列，
-            // 窗口外只睡。启动即挂上，用户入队后无需再手动开启。
-            {
-                use zcode::state::ZcodeState;
-                let zs = app.state::<ZcodeState>();
-                zcode::batch::start_loop(zs.db.clone(), zs.batch_rt.clone());
             }
 
             let state = app.state::<AppState>();

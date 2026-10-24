@@ -37,7 +37,6 @@ export type ViewKey =
   | 'zcode-register'
   | 'zcode-invite'
   | 'zcode-masks'
-  | 'zcode-batch'
   // Agent 接入中心（2026-10-23：全局页，侧边栏底部入口）
   | 'agent-integration';
 
@@ -1911,44 +1910,4 @@ export interface QoderCreditsSnapshot {
   /** 当日获得（签到奖励合计；无签到数据 null） */
   earned?: number | null;
   accounts: { user_id: string; total: number | null }[];
-}
-
-/** ZCode 夜间/周末批处理任务（后端 zcode::batch::BatchTask） */
-export interface BatchTask {
-  id: number;
-  batch_id: string | null;
-  prompt: string;
-  model: string;
-  /** pending | running | done | failed | canceled */
-  status: string;
-  result: string | null;
-  error: string | null;
-  /** 归因：真实 providerId（account:zai-start-plan = 免费套餐 / aiwork-* = 自有中转池） */
-  provider_used: string | null;
-  model_used: string | null;
-  input_tokens: number | null;
-  output_tokens: number | null;
-  duration_ms: number | null;
-  /** night | forced | off */
-  window_tag: string | null;
-  attempts: number;
-  created_at: number;
-  started_at: number | null;
-  finished_at: number | null;
-}
-
-/** 批处理调度状态 */
-export interface BatchStatus {
-  running: boolean;
-  /** 是否处于夜间档窗口（23:00→次日 09:00） */
-  window_open: boolean;
-  next_window_at: number | null;
-  pending: number;
-  done_today: number;
-  failed_today: number;
-  last_provider: string | null;
-  /** CLI 入口路径；null = 没探到，批处理不可用 */
-  cli_entry: string | null;
-  /** 运行中/请求取消的任务（显示已运行时长 + 「完成后取消」提示） */
-  running_task: { id: number; started_at: number; cancel_requested: boolean } | null;
 }
