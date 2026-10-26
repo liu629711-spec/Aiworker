@@ -8,7 +8,7 @@
 
 ## 功能全景
 
-### AI Work 助手原有能力（全部保留）
+### AI Work 助手
 - **五应用管理**：Trae / WorkBuddy / CodeBuddy / 豆包 / Qoder 多账号签到、登录态切换、积分看板
 - **API 网关**：OpenAI / Anthropic / Codex 三协议兼容，trae / buddy / qoder / custom 四池调度
 - **成长中心自动化**、设备指纹隔离、凭证加密保管（vault）
