@@ -6,10 +6,6 @@
 
 </div>
 
-> 本项目基于开源项目 [TraeWorkAssistant / AI Work 助手](https://github.com/smart-open/TraeWorkAssistant)（MIT License, Copyright (c) 2026 朱天伟）整合改造，遵循 MIT 协议保留原版权声明（原文见 docs/README-upstream.md 与 LICENSE）。
->
-> 在原版基础上新增 **ZCode 生态域**（移植自 zai-claim v0.2.0）：ZCode 多账号管理、余额监控、一键切换、邀请关系分组、批量登录、领取系统，以及 WorkBuddy 多账号捕获/切换/海外登录向导。
-
 ## 功能全景
 
 ### AI Work 助手原有能力（全部保留）
